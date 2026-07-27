@@ -1,0 +1,4 @@
+# Development convenience file. Package dependencies and version constraints
+# are maintained in pyproject.toml as the single source of truth.
+-e .[dev]
+

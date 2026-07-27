@@ -1,0 +1,52 @@
+# Python bytecode and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test, coverage, type-check, and lint caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Virtual environments and local secrets
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+.python-version
+
+# VS Code and other IDE state
+.vscode/
+.idea/
+*.code-workspace
+
+# Jupyter state and generated notebook files
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+.jupyter/
+
+# Local market data and generated research artifacts
+data/*
+!data/raw/
+data/raw/*
+!data/raw/.gitkeep
+reports/*
+!reports/.gitkeep
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+

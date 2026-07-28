@@ -1,0 +1,43 @@
+data:
+  start: "2018-01-01"
+  end: null
+  interval: "1d"
+  min_coverage: 0.95
+  max_forward_fill: 3
+  cache_dir: "data/raw"
+
+universe:
+  Financials: [JPM, BAC, C, WFC, GS, MS]
+  Technology: [MSFT, AAPL, ORCL, IBM, CSCO, INTC]
+  Energy: [XOM, CVX, COP, EOG, SLB, OXY]
+  Consumer: [KO, PEP, PG, CL, WMT, COST]
+
+screening:
+  formation_days: 504
+  min_correlation: 0.60
+  coint_pvalue: 0.05
+  adf_pvalue: 0.05
+  min_half_life: 2
+  max_half_life: 90
+  max_pairs_per_sector: 3
+
+strategy:
+  hedge_lookback: 120
+  zscore_lookback: 60
+  entry_z: 2.0
+  exit_z: 0.5
+  stop_z: 4.0
+  max_holding_days: 60
+  target_annual_vol: 0.10
+  max_gross_leverage: 1.5
+
+costs:
+  commission_bps: 1.0
+  slippage_bps: 2.0
+  annual_borrow_rate: 0.02
+
+walk_forward:
+  trading_days: 63
+  min_selected_pairs: 1
+
+random_seed: 42

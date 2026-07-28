@@ -10,6 +10,7 @@ dist/
 
 # Test, coverage, type-check, and lint caches
 .pytest_cache/
+.pytest_tmp/
 .coverage
 .coverage.*
 htmlcov/
@@ -50,3 +51,5 @@ reports/*
 Thumbs.db
 Desktop.ini
 
+.pytest_runs/
+.pytest_tmp/

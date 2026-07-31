@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError, fields
+
 import numpy as np
 import pandas as pd
 import pytest
+from statsmodels.tsa.stattools import adfuller
 
-from pairs_trading.stats import kalman_ols_spread, ols_spread, rolling_ols_spread
+from pairs_trading.stats import (
+    ADFTestResult,
+    SpreadDiagnostics,
+    adf_test,
+    diagnose_spread,
+    estimate_half_life,
+    estimate_hurst,
+    kalman_ols_spread,
+    ols_spread,
+    rolling_ols_spread,
+)
 
 
 def known_relationship(
@@ -55,6 +68,20 @@ def dynamic_relationship(
         pd.Series(np.exp(log_x), index=index, name="x_price"),
         pd.Series(true_beta, index=index, name="true_beta"),
     )
+
+
+def ar1_process(
+    phi: float,
+    periods: int = 1_000,
+    seed: int = 101,
+) -> pd.Series:
+    """Create a deterministic AR(1) process with unit innovation variance."""
+    rng = np.random.default_rng(seed)
+    values = np.zeros(periods)
+    innovations = rng.normal(size=periods)
+    for position in range(1, periods):
+        values[position] = phi * values[position - 1] + innovations[position]
+    return pd.Series(values, name="spread")
 
 
 def test_static_ols_recovers_known_alpha_and_beta() -> None:
@@ -387,3 +414,209 @@ def test_kalman_missing_observations_use_shared_complete_index() -> None:
     ).dropna().index
 
     assert result.index.equals(expected_index)
+
+
+def test_adf_strongly_rejects_seeded_stationary_ar1() -> None:
+    result = adf_test(ar1_process(phi=0.55, periods=1_000, seed=12))
+
+    assert result.statistic < result.critical_values["1%"]
+    assert result.pvalue < 0.01
+
+
+def test_adf_does_not_strongly_reject_seeded_random_walk() -> None:
+    rng = np.random.default_rng(7)
+    random_walk = pd.Series(np.cumsum(rng.normal(size=800)))
+
+    result = adf_test(random_walk)
+
+    assert result.pvalue > 0.10
+
+
+def test_adf_result_fields_match_explicit_statsmodels_specification() -> None:
+    spread = ar1_process(phi=0.7, periods=500, seed=22)
+
+    result = adf_test(spread)
+    expected = adfuller(
+        spread.to_numpy(),
+        regression="c",
+        autolag="AIC",
+    )
+
+    assert isinstance(result, ADFTestResult)
+    assert result.statistic == pytest.approx(expected[0])
+    assert result.pvalue == pytest.approx(expected[1])
+    assert result.lags == expected[2]
+    assert result.observations == expected[3]
+    assert dict(result.critical_values) == pytest.approx(expected[4])
+
+
+def test_half_life_is_close_to_seeded_ar1_theory() -> None:
+    phi = 0.8
+    spread = ar1_process(phi=phi, periods=5_000, seed=42)
+    theoretical = -np.log(2.0) / (phi - 1.0)
+
+    estimated = estimate_half_life(spread)
+
+    assert estimated == pytest.approx(theoretical, rel=0.15)
+
+
+def test_non_negative_half_life_coefficient_returns_infinity() -> None:
+    explosive = pd.Series(1.01 ** np.arange(300), name="spread")
+
+    result = estimate_half_life(explosive)
+
+    assert result == float("inf")
+
+
+def test_hurst_is_lower_for_mean_reversion_than_persistence() -> None:
+    mean_reverting = ar1_process(phi=-0.45, periods=2_000, seed=8)
+    persistent_increments = ar1_process(phi=0.8, periods=2_000, seed=9)
+    persistent = persistent_increments.cumsum()
+
+    mean_reverting_hurst = estimate_hurst(mean_reverting)
+    persistent_hurst = estimate_hurst(persistent)
+
+    assert np.isfinite(mean_reverting_hurst)
+    assert np.isfinite(persistent_hurst)
+    assert mean_reverting_hurst < 0.5
+    assert persistent_hurst > 0.5
+    assert mean_reverting_hurst < persistent_hurst
+
+
+def test_spread_diagnostics_contains_every_required_field() -> None:
+    result = diagnose_spread(ar1_process(phi=0.65, periods=800, seed=31))
+
+    assert isinstance(result, SpreadDiagnostics)
+    assert [field.name for field in fields(SpreadDiagnostics)] == [
+        "adf_statistic",
+        "adf_pvalue",
+        "adf_lags",
+        "adf_observations",
+        "adf_critical_values",
+        "half_life",
+        "hurst",
+    ]
+
+
+def test_spread_diagnostics_and_critical_values_are_immutable() -> None:
+    result = diagnose_spread(ar1_process(phi=0.6, periods=600, seed=32))
+
+    with pytest.raises(FrozenInstanceError):
+        result.hurst = 0.5  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        result.adf_critical_values["5%"] = -999.0  # type: ignore[index]
+
+
+def test_diagnostic_functions_do_not_mutate_input() -> None:
+    spread = ar1_process(phi=0.7, periods=500, seed=33)
+    before = spread.copy(deep=True)
+
+    adf_test(spread)
+    estimate_half_life(spread)
+    estimate_hurst(spread)
+    diagnose_spread(spread)
+
+    pd.testing.assert_series_equal(spread, before)
+
+
+def test_missing_spread_values_are_dropped_consistently() -> None:
+    spread = ar1_process(phi=0.65, periods=500, seed=34)
+    expanded = pd.Series(
+        np.nan,
+        index=np.arange(0, len(spread) * 2),
+        name="spread",
+    )
+    expanded.iloc[::2] = spread.to_numpy()
+
+    expected = diagnose_spread(spread)
+    actual = diagnose_spread(expanded)
+
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        pd.DataFrame({"spread": np.arange(100, dtype=float)}),
+        np.arange(100, dtype=float),
+        np.arange(100, dtype=float).reshape(20, 5),
+        pd.Series(["bad"] * 100),
+        pd.Series([*np.arange(99, dtype=float), np.inf]),
+        pd.Series([True, False] * 50),
+    ],
+)
+@pytest.mark.parametrize(
+    "diagnostic",
+    [adf_test, estimate_half_life, estimate_hurst, diagnose_spread],
+)
+def test_diagnostics_reject_invalid_types_and_values(
+    invalid: object,
+    diagnostic,
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        diagnostic(invalid)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        pd.Series(np.ones(100)),
+        pd.Series(1.0 + np.linspace(0.0, 1e-14, 100)),
+        pd.Series(np.arange(10, dtype=float)),
+    ],
+)
+@pytest.mark.parametrize(
+    "diagnostic",
+    [adf_test, estimate_half_life, estimate_hurst, diagnose_spread],
+)
+def test_diagnostics_reject_constant_near_degenerate_and_short_inputs(
+    invalid: pd.Series,
+    diagnostic,
+) -> None:
+    with pytest.raises(ValueError):
+        diagnostic(invalid)
+
+
+@pytest.mark.parametrize(
+    "min_lag, max_lag",
+    [
+        (True, 20),
+        (2, True),
+        (2.0, 20),
+        (2, 20.0),
+        ("2", 20),
+        (2, "20"),
+        (0, 20),
+        (-1, 20),
+        (2, 2),
+        (4, 3),
+    ],
+)
+def test_hurst_rejects_invalid_lag_types_and_ranges(
+    min_lag: object,
+    max_lag: object,
+) -> None:
+    spread = ar1_process(phi=0.6, periods=200, seed=35)
+
+    with pytest.raises(ValueError):
+        estimate_hurst(  # type: ignore[arg-type]
+            spread,
+            min_lag=min_lag,
+            max_lag=max_lag,
+        )
+
+
+def test_hurst_rejects_insufficient_observations_for_lag_range() -> None:
+    spread = ar1_process(phi=0.6, periods=100, seed=36)
+
+    with pytest.raises(ValueError, match="at least 122"):
+        estimate_hurst(spread, min_lag=2, max_lag=120)
+
+
+def test_repeated_diagnostic_calls_are_identical() -> None:
+    spread = ar1_process(phi=0.7, periods=700, seed=37)
+
+    first = diagnose_spread(spread)
+    second = diagnose_spread(spread)
+
+    assert first == second

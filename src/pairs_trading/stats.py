@@ -1,12 +1,62 @@
-"""Static and causal rolling OLS spread estimation."""
+"""Hedge-ratio estimation and diagnostics for an already-created spread."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 from numbers import Real
+from types import MappingProxyType
 
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+from statsmodels.tsa.stattools import adfuller
+
+
+ADF_MIN_OBSERVATIONS = 50
+HALF_LIFE_MIN_OBSERVATIONS = 30
+DEFAULT_HURST_MIN_LAG = 2
+DEFAULT_HURST_MAX_LAG = 20
+_NEAR_DEGENERATE_RELATIVE_RANGE = 1e-12
+
+
+@dataclass(frozen=True)
+class ADFTestResult:
+    """Immutable Augmented Dickey-Fuller test output."""
+
+    statistic: float
+    pvalue: float
+    lags: int
+    observations: int
+    critical_values: Mapping[str, float]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "critical_values",
+            MappingProxyType(dict(self.critical_values)),
+        )
+
+
+@dataclass(frozen=True)
+class SpreadDiagnostics:
+    """Immutable stationarity and mean-reversion diagnostic summary."""
+
+    adf_statistic: float
+    adf_pvalue: float
+    adf_lags: int
+    adf_observations: int
+    adf_critical_values: Mapping[str, float]
+    half_life: float
+    hurst: float
+
+    def __post_init__(self) -> None:
+        # frozen=True is shallow; copy and wrap the mapping for deep immutability.
+        object.__setattr__(
+            self,
+            "adf_critical_values",
+            MappingProxyType(dict(self.adf_critical_values)),
+        )
 
 
 def _align_and_validate_prices(y: pd.Series, x: pd.Series) -> pd.DataFrame:
@@ -214,4 +264,169 @@ def kalman_ols_spread(
             "innovation",
             "innovation_variance",
         ],
+    )
+
+
+def _validate_spread(
+    spread: pd.Series,
+    *,
+    minimum_observations: int,
+    diagnostic_name: str,
+) -> pd.Series:
+    """Return complete float observations after strict spread validation."""
+    if not isinstance(spread, pd.Series):
+        raise TypeError("spread must be exactly a one-dimensional pandas Series.")
+
+    values = spread.copy(deep=True).dropna()
+    if len(values) < minimum_observations:
+        raise ValueError(
+            f"{diagnostic_name} requires at least "
+            f"{minimum_observations} complete observations."
+        )
+
+    numeric = values.map(
+        lambda value: isinstance(value, Real) and not isinstance(value, bool)
+    )
+    if not bool(numeric.all()):
+        raise ValueError("spread observations must be numeric.")
+
+    values = values.astype(float)
+    array = values.to_numpy()
+    if not np.isfinite(array).all():
+        raise ValueError("spread observations must be finite.")
+
+    value_range = float(np.ptp(array))
+    scale = max(float(np.max(np.abs(array))), 1.0)
+    if value_range <= _NEAR_DEGENERATE_RELATIVE_RANGE * scale:
+        raise ValueError("spread must not be constant or near-degenerate.")
+    return values
+
+
+def adf_test(spread: pd.Series) -> ADFTestResult:
+    """Run an ADF stationarity test on at least 50 complete observations.
+
+    The fixed specification is ``regression='c'`` and ``autolag='AIC'``.
+    Statsmodels estimation errors are intentionally allowed to propagate.
+    """
+    values = _validate_spread(
+        spread,
+        minimum_observations=ADF_MIN_OBSERVATIONS,
+        diagnostic_name="ADF",
+    )
+    statistic, pvalue, lags, observations, critical_values, _ = adfuller(
+        values.to_numpy(),
+        regression="c",
+        autolag="AIC",
+    )
+    return ADFTestResult(
+        statistic=float(statistic),
+        pvalue=float(pvalue),
+        lags=int(lags),
+        observations=int(observations),
+        critical_values={
+            str(level): float(value) for level, value in critical_values.items()
+        },
+    )
+
+
+def estimate_half_life(spread: pd.Series) -> float:
+    """Estimate mean-reversion half-life from a lagged-level regression.
+
+    Fits ``delta_t = intercept + lambda * spread_(t-1) + error_t`` using at
+    least 30 complete observations. ``lambda >= 0`` is classified as not
+    mean-reverting and returns positive infinity.
+    """
+    values = _validate_spread(
+        spread,
+        minimum_observations=HALF_LIFE_MIN_OBSERVATIONS,
+        diagnostic_name="Half-life",
+    )
+    regression = pd.concat(
+        [
+            values.diff().rename("delta_spread"),
+            values.shift(1).rename("lagged_spread"),
+        ],
+        axis=1,
+    ).dropna()
+    design = pd.DataFrame(
+        {
+            "const": 1.0,
+            "lagged_spread": regression["lagged_spread"],
+        },
+        index=regression.index,
+    )
+    fitted = sm.OLS(regression["delta_spread"], design, missing="raise").fit()
+    mean_reversion_coefficient = float(fitted.params["lagged_spread"])
+    if mean_reversion_coefficient >= 0:
+        return float("inf")
+    return float(-np.log(2.0) / mean_reversion_coefficient)
+
+
+def estimate_hurst(
+    spread: pd.Series,
+    min_lag: int = DEFAULT_HURST_MIN_LAG,
+    max_lag: int = DEFAULT_HURST_MAX_LAG,
+) -> float:
+    """Estimate Hurst scaling from lagged-difference dispersion.
+
+    For every integer lag in the inclusive range ``[min_lag, max_lag]``, this
+    computes ``std(spread[t] - spread[t-lag])``. The Hurst estimate is the
+    fitted slope in ``log(std difference) = const + H * log(lag)``.
+
+    ``H < 0.5`` suggests mean reversion, approximately ``0.5`` suggests
+    random-walk-like behaviour, and ``H > 0.5`` suggests persistence.
+    """
+    if type(min_lag) is not int or type(max_lag) is not int:
+        raise ValueError("min_lag and max_lag must be non-boolean integers.")
+    if min_lag < 1:
+        raise ValueError("min_lag must be at least 1.")
+    if max_lag <= min_lag:
+        raise ValueError("max_lag must be greater than min_lag.")
+
+    minimum_observations = max_lag + 2
+    values = _validate_spread(
+        spread,
+        minimum_observations=minimum_observations,
+        diagnostic_name="Hurst estimation",
+    ).to_numpy()
+    lags = np.arange(min_lag, max_lag + 1, dtype=int)
+    dispersions = np.array(
+        [
+            np.std(values[lag:] - values[:-lag], ddof=1)
+            for lag in lags
+        ],
+        dtype=float,
+    )
+    if not np.isfinite(dispersions).all() or np.any(dispersions <= 0):
+        raise ValueError("Hurst lagged-difference dispersions are degenerate.")
+
+    design = pd.DataFrame(
+        {
+            "const": 1.0,
+            "log_lag": np.log(lags.astype(float)),
+        }
+    )
+    response = pd.Series(np.log(dispersions), name="log_dispersion")
+    fitted = sm.OLS(response, design, missing="raise").fit()
+    hurst = float(fitted.params["log_lag"])
+    if not np.isfinite(hurst):
+        raise ValueError("Hurst estimation produced a non-finite result.")
+    return hurst
+
+
+def diagnose_spread(
+    spread: pd.Series,
+    min_lag: int = DEFAULT_HURST_MIN_LAG,
+    max_lag: int = DEFAULT_HURST_MAX_LAG,
+) -> SpreadDiagnostics:
+    """Compute ADF, half-life, and Hurst diagnostics for one spread."""
+    adf = adf_test(spread)
+    return SpreadDiagnostics(
+        adf_statistic=adf.statistic,
+        adf_pvalue=adf.pvalue,
+        adf_lags=adf.lags,
+        adf_observations=adf.observations,
+        adf_critical_values=adf.critical_values,
+        half_life=estimate_half_life(spread),
+        hurst=estimate_hurst(spread, min_lag=min_lag, max_lag=max_lag),
     )

@@ -9,6 +9,7 @@ description = "A research platform for walk-forward statistical-arbitrage pairs 
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+  "duckdb>=1.0,<2",
   "matplotlib>=3.7,<4",
   "numpy>=1.24,<3",
   "pandas>=2.0,<3",
@@ -42,6 +43,9 @@ package-dir = {"" = "src"}
 where = ["src"]
 include = ["pairs_trading*"]
 
+[tool.setuptools.package-data]
+pairs_trading = ["sql/*.sql"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
@@ -53,4 +57,3 @@ source = ["pairs_trading"]
 [tool.coverage.report]
 show_missing = true
 skip_covered = true
-

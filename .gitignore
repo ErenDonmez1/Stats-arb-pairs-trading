@@ -39,6 +39,8 @@ env/
 .jupyter/
 
 # Local market data and generated research artifacts
+*.duckdb
+*.duckdb.wal
 data/*
 !data/raw/
 data/raw/*

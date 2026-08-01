@@ -1,4 +1,5 @@
 # Development convenience file. Package dependencies and version constraints
-# are maintained in pyproject.toml as the single source of truth.
+# are maintained in pyproject.toml; DuckDB is repeated explicitly for tooling
+# that consumes requirements.txt without resolving the editable project first.
+duckdb>=1.0,<2
 -e .[dev]
-

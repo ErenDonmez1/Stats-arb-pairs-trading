@@ -1,8 +1,11 @@
-"""Offline tests for the Milestone 4E-A DuckDB persistence boundary."""
+"""Offline tests for DuckDB research persistence and SQL analysis."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
+from importlib import resources
+import json
 from pathlib import Path
 from typing import Any
 
@@ -14,14 +17,21 @@ import pytest
 import pairs_trading.database as database_module
 from pairs_trading.database import (
     QUALITY_COLUMNS,
+    SCREENING_RESULT_COLUMNS,
+    SCREENING_SUMMARY_COLUMNS,
     connect_database,
     initialise_database,
     load_data_quality_report,
+    load_pair_screening_results,
     load_prices,
+    load_selected_pairs,
     store_data_quality_report,
+    store_pair_screening_results,
     store_prices,
+    summarise_screening_runs,
 )
 from pairs_trading.data import MarketDataLoader
+from pairs_trading.screening import PairScreeningResult
 
 
 PRICE_COLUMNS = ["ZZZ", "AAA"]
@@ -84,6 +94,110 @@ def _assert_connection_closed(connection: duckdb.DuckDBPyConnection) -> None:
         connection.execute("SELECT 1")
 
 
+def _screening_result(
+    symbol_y: str = "AAA",
+    symbol_x: str = "BBB",
+    *,
+    selected: bool = True,
+    rank: int | None = 1,
+    corrected_pvalue: float | None = 0.01,
+    half_life: float | None = 10.0,
+    hurst: float | None = 0.25,
+    rejection_reasons: tuple[str, ...] = (),
+    group: str | None = "Technology",
+) -> PairScreeningResult:
+    return PairScreeningResult(
+        symbol_y=symbol_y,
+        symbol_x=symbol_x,
+        group=group,
+        observations=250,
+        alpha=0.2,
+        beta=1.1,
+        spread_standard_deviation=0.03,
+        cointegration_statistic=-4.2,
+        cointegration_pvalue=0.004,
+        corrected_pvalue=corrected_pvalue,
+        cointegration_critical_values={"1%": -3.9, "5%": -3.3, "10%": -3.0},
+        adf_statistic=-4.0,
+        adf_pvalue=0.006,
+        half_life=half_life,
+        hurst=hurst,
+        selected=selected,
+        rank=rank,
+        rejection_reasons=rejection_reasons,
+    )
+
+
+def _screening_batch() -> tuple[PairScreeningResult, ...]:
+    return (
+        _screening_result(
+            "AAA", "CCC", rank=2, corrected_pvalue=0.03, half_life=20.0, hurst=0.35
+        ),
+        _screening_result(
+            "AAA", "BBB", rank=1, corrected_pvalue=0.01, half_life=10.0, hurst=0.25
+        ),
+        _screening_result(
+            "BBB",
+            "DDD",
+            selected=False,
+            rank=None,
+            corrected_pvalue=0.20,
+            half_life=35.0,
+            hurst=0.55,
+            rejection_reasons=(
+                "corrected_cointegration_pvalue_above_threshold",
+                "hurst_not_below_threshold",
+            ),
+        ),
+        _screening_result(
+            "CCC",
+            "DDD",
+            selected=False,
+            rank=None,
+            corrected_pvalue=None,
+            half_life=float("inf"),
+            hurst=None,
+            rejection_reasons=("half_life_not_finite_positive",),
+            group=None,
+        ),
+    )
+
+
+def _replace_screening_table_with_observation_limit(
+    connection: duckdb.DuckDBPyConnection,
+) -> None:
+    connection.execute("DROP TABLE pair_screening_results")
+    connection.execute(
+        """
+        CREATE TABLE pair_screening_results (
+            run_id VARCHAR NOT NULL,
+            formation_start DATE NOT NULL,
+            formation_end DATE NOT NULL,
+            symbol_y VARCHAR NOT NULL,
+            symbol_x VARCHAR NOT NULL,
+            group_name VARCHAR,
+            observations BIGINT NOT NULL CHECK (observations < 500),
+            alpha DOUBLE,
+            beta DOUBLE,
+            spread_standard_deviation DOUBLE,
+            cointegration_statistic DOUBLE,
+            cointegration_pvalue DOUBLE,
+            corrected_pvalue DOUBLE,
+            adf_statistic DOUBLE,
+            adf_pvalue DOUBLE,
+            half_life DOUBLE,
+            half_life_was_infinite BOOLEAN NOT NULL DEFAULT FALSE,
+            hurst DOUBLE,
+            selected BOOLEAN NOT NULL,
+            rank BIGINT,
+            rejection_reasons VARCHAR,
+            loaded_at TIMESTAMP NOT NULL,
+            UNIQUE (run_id, symbol_y, symbol_x)
+        )
+        """
+    )
+
+
 def test_schema_creation_is_idempotent_and_preserves_existing_data() -> None:
     connection = duckdb.connect(":memory:")
     try:
@@ -108,7 +222,7 @@ def test_schema_has_required_tables_columns_and_unique_keys() -> None:
         initialise_database(connection)
         assert {
             row[0] for row in connection.execute("SHOW TABLES").fetchall()
-        } == {"prices", "data_quality_reports"}
+        } == {"prices", "data_quality_reports", "pair_screening_results"}
 
         price_info = connection.execute("PRAGMA table_info('prices')").fetchall()
         quality_info = connection.execute(
@@ -834,6 +948,1046 @@ def test_sql_values_are_parameterised(tmp_path: Path) -> None:
     try:
         assert {
             row[0] for row in connection.execute("SHOW TABLES").fetchall()
-        } == {"prices", "data_quality_reports"}
+        } == {"prices", "data_quality_reports", "pair_screening_results"}
     finally:
         connection.close()
+
+
+def test_screening_schema_is_idempotent_and_preserves_4ea_data() -> None:
+    connection = duckdb.connect(":memory:")
+    try:
+        initialise_database(connection)
+        store_prices(
+            connection,
+            _prices().iloc[[0], [0]],
+            "test",
+            loaded_at="2024-02-01",
+        )
+        store_data_quality_report(
+            connection,
+            _quality_report().iloc[[0]],
+            "quality-run",
+            loaded_at="2024-02-01",
+        )
+        store_pair_screening_results(
+            connection,
+            [_screening_result()],
+            "screen-run",
+            "2023-01-01",
+            "2023-12-31",
+            loaded_at="2024-02-01",
+        )
+
+        initialise_database(connection)
+
+        assert connection.execute("SELECT COUNT(*) FROM prices").fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM data_quality_reports"
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM pair_screening_results"
+        ).fetchone() == (1,)
+    finally:
+        connection.close()
+
+
+def test_screening_schema_has_required_columns_and_unique_key() -> None:
+    connection = duckdb.connect(":memory:")
+    try:
+        initialise_database(connection)
+        table_info = connection.execute(
+            "PRAGMA table_info('pair_screening_results')"
+        ).fetchall()
+        assert [(row[1], row[2], bool(row[3])) for row in table_info] == [
+            ("run_id", "VARCHAR", True),
+            ("formation_start", "DATE", True),
+            ("formation_end", "DATE", True),
+            ("symbol_y", "VARCHAR", True),
+            ("symbol_x", "VARCHAR", True),
+            ("group_name", "VARCHAR", False),
+            ("observations", "BIGINT", True),
+            ("alpha", "DOUBLE", False),
+            ("beta", "DOUBLE", False),
+            ("spread_standard_deviation", "DOUBLE", False),
+            ("cointegration_statistic", "DOUBLE", False),
+            ("cointegration_pvalue", "DOUBLE", False),
+            ("corrected_pvalue", "DOUBLE", False),
+            ("adf_statistic", "DOUBLE", False),
+            ("adf_pvalue", "DOUBLE", False),
+            ("half_life", "DOUBLE", False),
+            ("hurst", "DOUBLE", False),
+            ("selected", "BOOLEAN", True),
+            ("rank", "BIGINT", False),
+            ("rejection_reasons", "VARCHAR", False),
+            ("loaded_at", "TIMESTAMP", True),
+            ("half_life_was_infinite", "BOOLEAN", True),
+        ]
+        store_pair_screening_results(
+            connection,
+            [_screening_result()],
+            "run",
+            "2023-01-01",
+            "2023-12-31",
+        )
+
+        with pytest.raises(duckdb.ConstraintException):
+            connection.execute(
+                """
+                INSERT INTO pair_screening_results
+                SELECT * FROM pair_screening_results WHERE run_id = 'run'
+                """
+            )
+    finally:
+        connection.close()
+
+
+def test_pair_screening_results_round_trip_with_selected_and_rejected_fields(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "screening-roundtrip.duckdb"
+    results = _screening_batch()
+
+    assert store_pair_screening_results(
+        path,
+        results,
+        "run-001",
+        "2023-01-01",
+        "2023-12-31",
+        loaded_at="2024-01-15 12:00:00",
+    ) == len(results)
+    loaded = load_pair_screening_results(path, "run-001")
+
+    assert loaded.columns.tolist() == list(SCREENING_RESULT_COLUMNS)
+    assert loaded[["symbol_y", "symbol_x"]].apply(tuple, axis=1).tolist() == [
+        ("AAA", "BBB"),
+        ("AAA", "CCC"),
+        ("BBB", "DDD"),
+        ("CCC", "DDD"),
+    ]
+    selected = loaded.iloc[0]
+    assert selected["run_id"] == "run-001"
+    assert selected["group_name"] == "Technology"
+    assert selected["observations"] == 250
+    assert selected["alpha"] == pytest.approx(0.2)
+    assert selected["beta"] == pytest.approx(1.1)
+    assert selected["spread_standard_deviation"] == pytest.approx(0.03)
+    assert selected["cointegration_statistic"] == pytest.approx(-4.2)
+    assert selected["cointegration_pvalue"] == pytest.approx(0.004)
+    assert selected["adf_statistic"] == pytest.approx(-4.0)
+    assert selected["adf_pvalue"] == pytest.approx(0.006)
+    assert bool(selected["selected"]) is True
+    assert selected["rank"] == 1
+    assert selected["rejection_reasons"] == ()
+
+    rejected = loaded.loc[
+        (loaded["symbol_y"] == "BBB") & (loaded["symbol_x"] == "DDD")
+    ].iloc[0]
+    assert bool(rejected["selected"]) is False
+    assert pd.isna(rejected["rank"])
+    assert rejected["rejection_reasons"] == (
+        "corrected_cointegration_pvalue_above_threshold",
+        "hurst_not_below_threshold",
+    )
+    assert loaded["formation_start"].eq(pd.Timestamp("2023-01-01")).all()
+    assert loaded["formation_end"].eq(pd.Timestamp("2023-12-31")).all()
+    assert loaded["loaded_at"].eq(pd.Timestamp("2024-01-15 12:00:00")).all()
+
+
+def test_rejection_reasons_use_compact_ordered_json_and_round_trip(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "reasons.duckdb"
+    reasons = ('reason with "quotes"', "second:reason", "Unicode £")
+    result = _screening_result(
+        selected=False,
+        rank=None,
+        rejection_reasons=reasons,
+    )
+    store_pair_screening_results(
+        path, [result], "run", "2023-01-01", "2023-12-31"
+    )
+
+    connection = duckdb.connect(str(path), read_only=True)
+    try:
+        encoded = connection.execute(
+            "SELECT rejection_reasons FROM pair_screening_results"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    assert encoded == json.dumps(list(reasons), ensure_ascii=False, separators=(",", ":"))
+    assert load_pair_screening_results(path, "run").iloc[0][
+        "rejection_reasons"
+    ] == reasons
+
+
+def test_infinite_and_unavailable_half_life_have_distinct_null_policies(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "half-life-policy.duckdb"
+    infinite = _screening_result(
+        "AAA",
+        "BBB",
+        selected=False,
+        rank=None,
+        half_life=float("inf"),
+        rejection_reasons=("half_life_not_finite_positive",),
+    )
+    unavailable = replace(
+        infinite,
+        symbol_y="CCC",
+        symbol_x="DDD",
+        half_life=None,
+        rejection_reasons=("insufficient_observations",),
+    )
+    store_pair_screening_results(
+        path, [infinite, unavailable], "run", "2023-01-01", "2023-12-31"
+    )
+
+    connection = duckdb.connect(str(path), read_only=True)
+    try:
+        stored = connection.execute(
+            """
+            SELECT symbol_y, half_life, half_life_was_infinite
+            FROM pair_screening_results ORDER BY symbol_y
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+    assert stored == [("AAA", None, True), ("CCC", None, False)]
+
+    loaded = load_pair_screening_results(path, "run").set_index("symbol_y")
+    assert np.isposinf(loaded.loc["AAA", "half_life"])
+    assert pd.isna(loaded.loc["CCC", "half_life"])
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("alpha", np.nan),
+        ("alpha", np.inf),
+        ("beta", -np.inf),
+        ("cointegration_statistic", np.inf),
+        ("cointegration_pvalue", np.nan),
+        ("corrected_pvalue", -0.1),
+        ("adf_pvalue", 1.1),
+        ("half_life", np.nan),
+        ("half_life", -np.inf),
+        ("hurst", np.inf),
+    ],
+)
+def test_invalid_screening_numbers_and_infinities_are_rejected(
+    tmp_path: Path, field: str, value: Any
+) -> None:
+    result = replace(_screening_result(), **{field: value})
+
+    with pytest.raises((TypeError, ValueError)):
+        store_pair_screening_results(
+            tmp_path / "invalid-numeric.duckdb",
+            [result],
+            "run",
+            "2023-01-01",
+            "2023-12-31",
+        )
+
+
+@pytest.mark.parametrize("observations", [True, 1.5, "10", -1])
+def test_invalid_screening_observation_counts_are_rejected(
+    tmp_path: Path, observations: Any
+) -> None:
+    result = replace(_screening_result(), observations=observations)
+
+    with pytest.raises((TypeError, ValueError)):
+        store_pair_screening_results(
+            tmp_path / "invalid-observations.duckdb",
+            [result],
+            "run",
+            "2023-01-01",
+            "2023-12-31",
+        )
+
+
+@pytest.mark.parametrize("invalid", [None, np.nan, np.inf])
+def test_invalid_cointegration_critical_values_are_rejected(
+    tmp_path: Path, invalid: Any
+) -> None:
+    result = replace(
+        _screening_result(), cointegration_critical_values={"5%": invalid}
+    )
+
+    with pytest.raises((TypeError, ValueError), match="critical"):
+        store_pair_screening_results(
+            tmp_path / "invalid-critical.duckdb",
+            [result],
+            "run",
+            "2023-01-01",
+            "2023-12-31",
+        )
+
+
+def test_screening_persistence_preserves_existing_symbol_and_group_text(
+    tmp_path: Path,
+) -> None:
+    result = replace(
+        _screening_result(),
+        symbol_y=" AAA ",
+        symbol_x="BBB",
+        group=" Technology ",
+    )
+    path = tmp_path / "preserved-text.duckdb"
+
+    store_pair_screening_results(
+        path, [result], "run", "2023-01-01", "2023-12-31"
+    )
+    loaded = load_pair_screening_results(path, "run")
+
+    assert loaded.iloc[0]["symbol_y"] == " AAA "
+    assert loaded.iloc[0]["symbol_x"] == "BBB"
+    assert loaded.iloc[0]["group_name"] == " Technology "
+
+
+def test_repeated_screening_writes_update_pair_fields_without_duplicates(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "screening-upsert.duckdb"
+    original = _screening_result()
+    store_pair_screening_results(
+        path,
+        [original],
+        "run",
+        "2023-01-01",
+        "2023-12-31",
+        loaded_at="2024-01-01",
+    )
+    replacement = replace(
+        original,
+        group="Updated",
+        observations=300,
+        alpha=0.8,
+        corrected_pvalue=0.40,
+        half_life=float("inf"),
+        hurst=0.70,
+        selected=False,
+        rank=None,
+        rejection_reasons=("updated_reason",),
+    )
+    store_pair_screening_results(
+        path,
+        [replacement],
+        "run",
+        "2023-01-01",
+        "2023-12-31",
+        loaded_at="2024-07-01",
+    )
+
+    loaded = load_pair_screening_results(path, "run")
+    assert len(loaded) == 1
+    row = loaded.iloc[0]
+    assert row["formation_start"] == pd.Timestamp("2023-01-01")
+    assert row["formation_end"] == pd.Timestamp("2023-12-31")
+    assert row["group_name"] == "Updated"
+    assert row["observations"] == 300
+    assert row["alpha"] == pytest.approx(0.8)
+    assert row["corrected_pvalue"] == pytest.approx(0.40)
+    assert np.isposinf(row["half_life"])
+    assert row["hurst"] == pytest.approx(0.70)
+    assert bool(row["selected"]) is False
+    assert pd.isna(row["rank"])
+    assert row["rejection_reasons"] == ("updated_reason",)
+    assert row["loaded_at"] == pd.Timestamp("2024-07-01")
+
+
+def test_different_screening_run_ids_remain_independent(tmp_path: Path) -> None:
+    path = tmp_path / "independent-runs.duckdb"
+    result = _screening_result()
+    store_pair_screening_results(
+        path, [result], "run-a", "2023-01-01", "2023-12-31"
+    )
+    store_pair_screening_results(
+        path,
+        [replace(result, alpha=0.9)],
+        "run-b",
+        "2024-01-01",
+        "2024-12-31",
+    )
+
+    assert load_pair_screening_results(path, "run-a").iloc[0]["alpha"] == 0.2
+    assert load_pair_screening_results(path, "run-b").iloc[0]["alpha"] == 0.9
+
+
+def test_duplicate_pairs_in_one_screening_batch_are_rejected(tmp_path: Path) -> None:
+    result = _screening_result()
+
+    with pytest.raises(ValueError, match="Duplicate"):
+        store_pair_screening_results(
+            tmp_path / "duplicate.duckdb",
+            [result, result],
+            "run",
+            "2023-01-01",
+            "2023-12-31",
+        )
+
+
+def test_reversed_duplicate_pairs_in_one_batch_are_rejected(tmp_path: Path) -> None:
+    result = _screening_result()
+    reversed_result = replace(result, symbol_y="BBB", symbol_x="AAA")
+
+    with pytest.raises(ValueError, match="Reversed"):
+        store_pair_screening_results(
+            tmp_path / "reversed.duckdb",
+            [result, reversed_result],
+            "run",
+            "2023-01-01",
+            "2023-12-31",
+        )
+
+
+def test_noncanonical_and_identical_screening_pairs_are_rejected(
+    tmp_path: Path,
+) -> None:
+    noncanonical = replace(_screening_result(), symbol_y="BBB", symbol_x="AAA")
+    identical = replace(_screening_result(), symbol_y="AAA", symbol_x="AAA")
+
+    with pytest.raises(ValueError, match="canonical"):
+        store_pair_screening_results(
+            tmp_path / "noncanonical.duckdb",
+            [noncanonical],
+            "run",
+            "2023-01-01",
+            "2023-12-31",
+        )
+    with pytest.raises(ValueError, match="different"):
+        store_pair_screening_results(
+            tmp_path / "identical.duckdb",
+            [identical],
+            "run",
+            "2023-01-01",
+            "2023-12-31",
+        )
+
+
+@pytest.mark.parametrize("run_id", [None, "", "   ", 4, False])
+def test_invalid_screening_run_ids_are_rejected(tmp_path: Path, run_id: Any) -> None:
+    path = tmp_path / "invalid-screening-run.duckdb"
+    with pytest.raises((TypeError, ValueError)):
+        store_pair_screening_results(
+            path,
+            [_screening_result()],
+            run_id,
+            "2023-01-01",
+            "2023-12-31",
+        )
+    with pytest.raises((TypeError, ValueError)):
+        load_pair_screening_results(path, run_id)
+    with pytest.raises((TypeError, ValueError)):
+        load_selected_pairs(path, run_id)
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        ("2024-01-02", "2024-01-01"),
+        ("not-a-date", "2024-01-01"),
+        ("2024-01-01", "not-a-date"),
+        (True, "2024-01-01"),
+        ("2024-01-01", False),
+        (None, "2024-01-01"),
+    ],
+)
+def test_invalid_screening_formation_windows_are_rejected(
+    tmp_path: Path, start: Any, end: Any
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        store_pair_screening_results(
+            tmp_path / "invalid-window.duckdb",
+            [_screening_result()],
+            "run",
+            start,
+            end,
+        )
+
+
+def test_conflicting_formation_windows_within_new_run_are_rejected(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "conflicting-appended-window.duckdb"
+    store_pair_screening_results(
+        path,
+        [_screening_result()],
+        "run",
+        "2023-01-01",
+        "2023-12-31",
+        loaded_at="2024-01-01",
+    )
+    before = load_pair_screening_results(path, "run").copy(deep=True)
+    additional_pair = _screening_result("AAA", "CCC", rank=2)
+
+    with pytest.raises(ValueError, match="formation window"):
+        store_pair_screening_results(
+            path,
+            [additional_pair],
+            "run",
+            "2024-01-01",
+            "2024-12-31",
+            loaded_at="2025-01-01",
+        )
+
+    pd.testing.assert_frame_equal(load_pair_screening_results(path, "run"), before)
+
+
+def test_upsert_with_different_existing_formation_window_is_rejected(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "conflicting-upsert-window.duckdb"
+    baseline = _screening_result()
+    store_pair_screening_results(
+        path,
+        [baseline],
+        "run",
+        "2023-01-01",
+        "2023-12-31",
+        loaded_at="2024-01-01",
+    )
+    before = load_pair_screening_results(path, "run").copy(deep=True)
+
+    with pytest.raises(ValueError, match="formation window"):
+        store_pair_screening_results(
+            path,
+            [replace(baseline, alpha=0.9)],
+            "run",
+            "2024-01-01",
+            "2024-12-31",
+            loaded_at="2025-01-01",
+        )
+
+    pd.testing.assert_frame_equal(load_pair_screening_results(path, "run"), before)
+
+
+@pytest.mark.parametrize("rank", [None, 0, -1, 1.5, True, "1"])
+def test_selected_screening_results_require_positive_integer_rank(
+    tmp_path: Path, rank: Any
+) -> None:
+    result = replace(_screening_result(), rank=rank)
+
+    with pytest.raises((TypeError, ValueError)):
+        store_pair_screening_results(
+            tmp_path / "invalid-selected-rank.duckdb",
+            [result],
+            "run",
+            "2023-01-01",
+            "2023-12-31",
+        )
+
+
+def test_duplicate_selected_ranks_are_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate-selected-ranks.duckdb"
+    initialise_database(path)
+    results = (
+        _screening_result("AAA", "BBB", rank=1),
+        _screening_result("AAA", "CCC", rank=1),
+    )
+
+    with pytest.raises(ValueError, match="unique consecutive"):
+        store_pair_screening_results(
+            path, results, "run", "2023-01-01", "2023-12-31"
+        )
+
+    assert load_pair_screening_results(path, "run").empty
+
+
+def test_gapped_selected_ranks_are_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "gapped-selected-ranks.duckdb"
+    initialise_database(path)
+    results = (
+        _screening_result("AAA", "BBB", rank=1),
+        _screening_result("AAA", "CCC", rank=3),
+    )
+
+    with pytest.raises(ValueError, match="consecutive integers beginning at 1"):
+        store_pair_screening_results(
+            path, results, "run", "2023-01-01", "2023-12-31"
+        )
+
+    assert load_pair_screening_results(path, "run").empty
+
+
+def test_valid_consecutive_selected_rank_sequence_passes(tmp_path: Path) -> None:
+    path = tmp_path / "valid-selected-ranks.duckdb"
+    results = (
+        _screening_result("AAA", "CCC", rank=2),
+        _screening_result("AAA", "BBB", rank=1),
+    )
+
+    assert (
+        store_pair_screening_results(
+            path, results, "run", "2023-01-01", "2023-12-31"
+        )
+        == 2
+    )
+
+    assert load_selected_pairs(path, "run")["rank"].tolist() == [1, 2]
+
+
+def test_upsert_that_creates_selected_rank_collision_is_rejected(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "upsert-rank-collision.duckdb"
+    baseline = (
+        _screening_result("AAA", "BBB", rank=1),
+        _screening_result("AAA", "CCC", rank=2),
+    )
+    store_pair_screening_results(
+        path,
+        baseline,
+        "run",
+        "2023-01-01",
+        "2023-12-31",
+        loaded_at="2024-01-01",
+    )
+    before = load_pair_screening_results(path, "run").copy(deep=True)
+
+    with pytest.raises(ValueError, match="unique consecutive"):
+        store_pair_screening_results(
+            path,
+            [replace(baseline[1], rank=1, alpha=0.9)],
+            "run",
+            "2023-01-01",
+            "2023-12-31",
+            loaded_at="2025-01-01",
+        )
+
+    pd.testing.assert_frame_equal(load_pair_screening_results(path, "run"), before)
+
+
+def test_upsert_that_leaves_selected_rank_gap_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "upsert-rank-gap.duckdb"
+    baseline = (
+        _screening_result("AAA", "BBB", rank=1),
+        _screening_result("AAA", "CCC", rank=2),
+    )
+    store_pair_screening_results(
+        path,
+        baseline,
+        "run",
+        "2023-01-01",
+        "2023-12-31",
+        loaded_at="2024-01-01",
+    )
+    before = load_pair_screening_results(path, "run").copy(deep=True)
+    rejected = replace(
+        baseline[0],
+        selected=False,
+        rank=None,
+        rejection_reasons=("no_longer_selected",),
+    )
+
+    with pytest.raises(ValueError, match="consecutive integers beginning at 1"):
+        store_pair_screening_results(
+            path,
+            [rejected],
+            "run",
+            "2023-01-01",
+            "2023-12-31",
+            loaded_at="2025-01-01",
+        )
+
+    pd.testing.assert_frame_equal(load_pair_screening_results(path, "run"), before)
+
+
+def test_rejected_screening_results_require_rank_none(tmp_path: Path) -> None:
+    result = _screening_result(selected=False, rank=1, rejection_reasons=("reason",))
+
+    with pytest.raises(ValueError, match="rank None"):
+        store_pair_screening_results(
+            tmp_path / "invalid-rejected-rank.duckdb",
+            [result],
+            "run",
+            "2023-01-01",
+            "2023-12-31",
+        )
+
+
+def test_screening_inputs_and_generator_contents_are_not_mutated(
+    tmp_path: Path,
+) -> None:
+    results = list(_screening_batch())
+    before = tuple(results)
+
+    store_pair_screening_results(
+        tmp_path / "immutable-screening.duckdb",
+        (result for result in results),
+        "run",
+        "2023-01-01",
+        "2023-12-31",
+    )
+
+    assert tuple(results) == before
+
+
+def test_failed_screening_batch_rolls_back_without_partial_updates() -> None:
+    connection = duckdb.connect(":memory:")
+    try:
+        initialise_database(connection)
+        _replace_screening_table_with_observation_limit(connection)
+        baseline = _screening_result()
+        store_pair_screening_results(
+            connection,
+            [baseline],
+            "run",
+            "2023-01-01",
+            "2023-12-31",
+            loaded_at="2024-01-01",
+        )
+        updated = replace(baseline, observations=300, alpha=0.9)
+        invalid_at_sql = replace(
+            baseline,
+            symbol_y="CCC",
+            symbol_x="DDD",
+            observations=600,
+            selected=False,
+            rank=None,
+            rejection_reasons=("reason",),
+        )
+
+        with pytest.raises(duckdb.ConstraintException):
+            store_pair_screening_results(
+                connection,
+                [updated, invalid_at_sql],
+                "run",
+                "2023-01-01",
+                "2023-12-31",
+                loaded_at="2025-01-01",
+            )
+
+        assert connection.execute(
+            """
+            SELECT symbol_y, symbol_x, observations, alpha, formation_start
+            FROM pair_screening_results
+            """
+        ).fetchall() == [
+            ("AAA", "BBB", 250, 0.2, datetime(2023, 1, 1).date())
+        ]
+        assert connection.execute("SELECT 1").fetchone() == (1,)
+    finally:
+        connection.close()
+
+
+def test_unknown_screening_run_returns_typed_empty_frame(tmp_path: Path) -> None:
+    path = tmp_path / "unknown-screening-run.duckdb"
+    initialise_database(path)
+
+    loaded = load_pair_screening_results(path, "unknown")
+
+    assert loaded.empty
+    assert loaded.columns.tolist() == list(SCREENING_RESULT_COLUMNS)
+    assert loaded["observations"].dtype == "int64"
+    assert loaded["rank"].dtype == "Int64"
+    assert loaded["selected"].dtype == "bool"
+    assert loaded["formation_start"].dtype == "datetime64[ns]"
+
+
+def test_screening_load_order_is_deterministic(tmp_path: Path) -> None:
+    path = tmp_path / "screening-order.duckdb"
+    results = (
+        _screening_result(
+            "CCC",
+            "DDD",
+            selected=False,
+            rank=None,
+            corrected_pvalue=None,
+            rejection_reasons=("reason",),
+        ),
+        _screening_result("AAA", "CCC", rank=2, corrected_pvalue=0.001),
+        _screening_result(
+            "BBB",
+            "CCC",
+            selected=False,
+            rank=None,
+            corrected_pvalue=0.30,
+            rejection_reasons=("reason",),
+        ),
+        _screening_result("AAA", "BBB", rank=1, corrected_pvalue=0.05),
+        _screening_result(
+            "AAA",
+            "DDD",
+            selected=False,
+            rank=None,
+            corrected_pvalue=0.10,
+            rejection_reasons=("reason",),
+        ),
+    )
+    store_pair_screening_results(
+        path, results, "run", "2023-01-01", "2023-12-31"
+    )
+
+    loaded = load_pair_screening_results(path, "run")
+
+    assert loaded[["symbol_y", "symbol_x"]].apply(tuple, axis=1).tolist() == [
+        ("AAA", "BBB"),
+        ("AAA", "CCC"),
+        ("AAA", "DDD"),
+        ("BBB", "CCC"),
+        ("CCC", "DDD"),
+    ]
+
+
+def test_load_selected_pairs_supports_limit_and_maximum_rank(tmp_path: Path) -> None:
+    path = tmp_path / "selected-filters.duckdb"
+    store_pair_screening_results(
+        path, _screening_batch(), "run", "2023-01-01", "2023-12-31"
+    )
+
+    selected = load_selected_pairs(path, "run")
+    limited = load_selected_pairs(path, "run", limit=1)
+    maximum_rank = load_selected_pairs(path, "run", max_rank=1)
+
+    assert selected["rank"].tolist() == [1, 2]
+    assert selected["selected"].all()
+    assert limited["rank"].tolist() == [1]
+    assert maximum_rank["rank"].tolist() == [1]
+
+
+@pytest.mark.parametrize("field", ["limit", "max_rank"])
+@pytest.mark.parametrize("value", [True, 0, -1, 1.5, "1", np.nan])
+def test_invalid_selected_pair_limits_are_rejected(
+    tmp_path: Path, field: str, value: Any
+) -> None:
+    arguments = {field: value}
+
+    with pytest.raises((TypeError, ValueError)):
+        load_selected_pairs(
+            tmp_path / "invalid-limits.duckdb", "run", **arguments
+        )
+
+
+def test_screening_run_summaries_use_all_counts_and_selected_diagnostics(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "screening-summary.duckdb"
+    store_pair_screening_results(
+        path,
+        _screening_batch(),
+        "older-run",
+        "2022-01-01",
+        "2022-12-31",
+        loaded_at="2023-01-01",
+    )
+    newer = (
+        _screening_result(
+            "AAA", "BBB", rank=1, corrected_pvalue=0.04, half_life=8.0, hurst=0.2
+        ),
+        _screening_result(
+            "AAA",
+            "CCC",
+            rank=2,
+            corrected_pvalue=0.06,
+            half_life=float("inf"),
+            hurst=0.4,
+        ),
+        _screening_result(
+            "BBB",
+            "CCC",
+            selected=False,
+            rank=None,
+            corrected_pvalue=0.001,
+            half_life=1.0,
+            hurst=0.01,
+            rejection_reasons=("reason",),
+        ),
+    )
+    store_pair_screening_results(
+        path,
+        newer,
+        "newer-run",
+        "2023-01-01",
+        "2023-12-31",
+        loaded_at="2024-01-02",
+    )
+
+    summary = summarise_screening_runs(path)
+
+    assert summary.columns.tolist() == list(SCREENING_SUMMARY_COLUMNS)
+    assert summary["run_id"].tolist() == ["newer-run", "older-run"]
+    newer_summary = summary.iloc[0]
+    assert newer_summary["formation_start"] == pd.Timestamp("2023-01-01")
+    assert newer_summary["formation_end"] == pd.Timestamp("2023-12-31")
+    assert newer_summary["total_pairs"] == 3
+    assert newer_summary["selected_pairs"] == 2
+    assert newer_summary["selection_rate"] == pytest.approx(2 / 3)
+    assert newer_summary["mean_corrected_pvalue"] == pytest.approx(0.05)
+    assert newer_summary["median_half_life"] == pytest.approx(8.0)
+    assert newer_summary["mean_hurst"] == pytest.approx(0.30)
+    assert newer_summary["latest_loaded_at"] == pd.Timestamp("2024-01-02")
+
+    older_summary = summary.iloc[1]
+    assert older_summary["formation_start"] == pd.Timestamp("2022-01-01")
+    assert older_summary["formation_end"] == pd.Timestamp("2022-12-31")
+    assert older_summary["total_pairs"] == 4
+    assert older_summary["selected_pairs"] == 2
+    assert older_summary["selection_rate"] == pytest.approx(0.5)
+    assert older_summary["mean_corrected_pvalue"] == pytest.approx(0.02)
+    assert older_summary["median_half_life"] == pytest.approx(15.0)
+    assert older_summary["mean_hurst"] == pytest.approx(0.30)
+
+
+def test_empty_screening_summary_returns_typed_frame(tmp_path: Path) -> None:
+    path = tmp_path / "empty-summary.duckdb"
+    initialise_database(path)
+
+    summary = summarise_screening_runs(path)
+
+    assert summary.empty
+    assert summary.columns.tolist() == list(SCREENING_SUMMARY_COLUMNS)
+    assert summary["total_pairs"].dtype == "int64"
+    assert summary["selection_rate"].dtype == "float64"
+    assert summary["latest_loaded_at"].dtype == "datetime64[ns]"
+
+
+def test_every_screening_analysis_query_executes_successfully() -> None:
+    connection = duckdb.connect(":memory:")
+    try:
+        initialise_database(connection)
+        store_pair_screening_results(
+            connection,
+            _screening_batch(),
+            "analysis-run",
+            "2023-01-01",
+            "2023-12-31",
+        )
+        second_run_result = replace(
+            _screening_result(),
+            cointegration_pvalue=0.008,
+            corrected_pvalue=0.03,
+            adf_pvalue=0.010,
+            half_life=20.0,
+            hurst=0.35,
+        )
+        store_pair_screening_results(
+            connection,
+            [second_run_result],
+            "analysis-run-2",
+            "2024-01-01",
+            "2024-12-31",
+        )
+        sql = (
+            resources.files("pairs_trading")
+            .joinpath("sql", "screening_analysis.sql")
+            .read_text(encoding="utf-8")
+        )
+        queries = [query.strip() for query in sql.split(";") if query.strip()]
+
+        assert len(queries) == 5
+        outputs = []
+        for query in queries:
+            if "$run_id" in query:
+                outputs.append(
+                    connection.execute(
+                        query, {"run_id": "analysis-run"}
+                    ).fetchdf()
+                )
+            else:
+                outputs.append(connection.execute(query).fetchdf())
+
+        assert not outputs[0].empty
+        assert not outputs[1].empty
+        assert not outputs[2].empty
+        assert not outputs[3].empty
+        repeated_pair = outputs[3].loc[
+            (outputs[3]["symbol_y"] == "AAA")
+            & (outputs[3]["symbol_x"] == "BBB")
+        ].iloc[0]
+        assert repeated_pair["selected_run_count"] == 2
+        assert repeated_pair["mean_corrected_pvalue"] == pytest.approx(0.02)
+        assert repeated_pair["mean_half_life"] == pytest.approx(15.0)
+        assert set(outputs[4]["rejection_reason"]) == {
+            "corrected_cointegration_pvalue_above_threshold",
+            "hurst_not_below_threshold",
+            "half_life_not_finite_positive",
+        }
+    finally:
+        connection.close()
+
+
+def test_screening_caller_connection_remains_open_after_success_and_failure() -> None:
+    connection = duckdb.connect(":memory:")
+    try:
+        initialise_database(connection)
+        store_pair_screening_results(
+            connection,
+            [_screening_result()],
+            "run",
+            "2023-01-01",
+            "2023-12-31",
+        )
+        assert not load_pair_screening_results(connection, "run").empty
+
+        _replace_screening_table_with_observation_limit(connection)
+        failing = replace(_screening_result(), observations=600)
+        with pytest.raises(duckdb.ConstraintException):
+            store_pair_screening_results(
+                connection,
+                [failing],
+                "run",
+                "2023-01-01",
+                "2023-12-31",
+            )
+        assert connection.execute("SELECT 1").fetchone() == (1,)
+    finally:
+        connection.close()
+
+
+def test_screening_module_owned_connection_closes_after_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    actual_connect = database_module.duckdb.connect
+    opened: list[duckdb.DuckDBPyConnection] = []
+
+    def tracking_connect(*args: Any, **kwargs: Any) -> duckdb.DuckDBPyConnection:
+        connection = actual_connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(database_module.duckdb, "connect", tracking_connect)
+    store_pair_screening_results(
+        tmp_path / "owned-screening.duckdb",
+        [_screening_result()],
+        "run",
+        "2023-01-01",
+        "2023-12-31",
+    )
+
+    assert len(opened) == 1
+    _assert_connection_closed(opened[0])
+
+
+def test_screening_module_owned_connection_closes_after_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "owned-screening-failure.duckdb"
+    setup_connection = duckdb.connect(str(path))
+    try:
+        initialise_database(setup_connection)
+        _replace_screening_table_with_observation_limit(setup_connection)
+    finally:
+        setup_connection.close()
+
+    actual_connect = database_module.duckdb.connect
+    opened: list[duckdb.DuckDBPyConnection] = []
+
+    def tracking_connect(*args: Any, **kwargs: Any) -> duckdb.DuckDBPyConnection:
+        connection = actual_connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(database_module.duckdb, "connect", tracking_connect)
+    with pytest.raises(duckdb.ConstraintException):
+        store_pair_screening_results(
+            path,
+            [replace(_screening_result(), observations=600)],
+            "run",
+            "2023-01-01",
+            "2023-12-31",
+        )
+
+    assert len(opened) == 1
+    _assert_connection_closed(opened[0])

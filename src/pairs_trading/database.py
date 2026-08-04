@@ -1,4 +1,4 @@
-"""DuckDB persistence for validated market prices and data-quality reports.
+"""DuckDB persistence for market data, quality, and pair-screening research.
 
 The public write functions validate complete batches before opening a
 transaction.  Filesystem targets are opened and closed within each operation;
@@ -7,10 +7,11 @@ caller-supplied DuckDB connections are always left open.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import date, datetime
 from importlib import resources
+import json
 import os
 from pathlib import Path
 from typing import Any, TypeAlias
@@ -18,6 +19,8 @@ from typing import Any, TypeAlias
 import duckdb
 import numpy as np
 import pandas as pd
+
+from .screening import PairScreeningResult
 
 
 DatabasePath: TypeAlias = str | os.PathLike[str]
@@ -42,6 +45,53 @@ _COUNT_COLUMNS = (
     "non_positive",
     "forward_filled",
 )
+SCREENING_RESULT_COLUMNS = (
+    "run_id",
+    "formation_start",
+    "formation_end",
+    "symbol_y",
+    "symbol_x",
+    "group_name",
+    "observations",
+    "alpha",
+    "beta",
+    "spread_standard_deviation",
+    "cointegration_statistic",
+    "cointegration_pvalue",
+    "corrected_pvalue",
+    "adf_statistic",
+    "adf_pvalue",
+    "half_life",
+    "hurst",
+    "selected",
+    "rank",
+    "rejection_reasons",
+    "loaded_at",
+)
+SCREENING_SUMMARY_COLUMNS = (
+    "run_id",
+    "formation_start",
+    "formation_end",
+    "total_pairs",
+    "selected_pairs",
+    "selection_rate",
+    "mean_corrected_pvalue",
+    "median_half_life",
+    "mean_hurst",
+    "latest_loaded_at",
+)
+_SCREENING_FLOAT_COLUMNS = (
+    "alpha",
+    "beta",
+    "spread_standard_deviation",
+    "cointegration_statistic",
+    "cointegration_pvalue",
+    "corrected_pvalue",
+    "adf_statistic",
+    "adf_pvalue",
+    "half_life",
+    "hurst",
+)
 
 __all__ = [
     "connect_database",
@@ -50,6 +100,10 @@ __all__ = [
     "load_prices",
     "store_data_quality_report",
     "load_data_quality_report",
+    "store_pair_screening_results",
+    "load_pair_screening_results",
+    "load_selected_pairs",
+    "summarise_screening_runs",
 ]
 
 
@@ -127,17 +181,19 @@ def _ensure_schema(connection: duckdb.DuckDBPyConnection) -> None:
         SELECT COUNT(*)
         FROM information_schema.tables
         WHERE table_schema = current_schema()
-          AND table_name IN ('prices', 'data_quality_reports')
+          AND table_name IN (
+              'prices', 'data_quality_reports', 'pair_screening_results'
+          )
         """
     ).fetchone()[0]
-    if existing_count == 2:
+    if existing_count == 3:
         return
     with _transaction(connection):
         connection.execute(_load_schema())
 
 
 def initialise_database(database: DatabaseTarget) -> None:
-    """Create the Milestone 4E-A schema; repeated calls are harmless."""
+    """Create the current research schema; repeated calls are harmless."""
     with _connection_scope(database) as connection:
         with _transaction(connection):
             connection.execute(_load_schema())
@@ -605,3 +661,546 @@ def load_data_quality_report(
         result[column] = pd.to_datetime(result[column]).astype("datetime64[ns]")
     result["retained"] = result["retained"].astype(bool)
     return result.loc[:, list(QUALITY_COLUMNS)].sort_index()
+
+
+def _screening_symbol(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{field} must be a string.")
+    if not value.strip():
+        raise ValueError(f"{field} must not be empty.")
+    return value
+
+
+def _optional_screening_real(
+    value: Any,
+    field: str,
+    *,
+    allow_positive_infinity: bool = False,
+) -> tuple[float | None, bool]:
+    """Return a nullable finite value and whether +inf was mapped to NULL."""
+    if value is None:
+        return None, False
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError(f"{field} must be a real number or None.")
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{field} must fit a DuckDB DOUBLE.") from exc
+    if np.isnan(number):
+        raise ValueError(f"{field} must not be NaN.")
+    if np.isinf(number):
+        if allow_positive_infinity and number > 0:
+            return None, True
+        raise ValueError(f"{field} contains an unsupported infinity.")
+    return number, False
+
+
+def _strict_positive_integer(value: Any, field: str) -> int:
+    integer = _strict_non_negative_integer(value, field)
+    if integer == 0:
+        raise ValueError(f"{field} must be a positive integer.")
+    return integer
+
+
+def _validate_critical_values(result: PairScreeningResult) -> None:
+    critical_values = result.cointegration_critical_values
+    if not isinstance(critical_values, Mapping):
+        raise TypeError("cointegration_critical_values must be a mapping.")
+    for label, value in critical_values.items():
+        _normalise_non_empty_string(label, "cointegration critical-value label")
+        critical_value, _ = _optional_screening_real(
+            value, f"cointegration critical value {label!r}"
+        )
+        if critical_value is None:
+            raise TypeError("Cointegration critical values must not be nullable.")
+
+
+def _encode_rejection_reasons(reasons: Any) -> str:
+    if not isinstance(reasons, tuple):
+        raise TypeError("rejection_reasons must be a tuple of strings.")
+    for position, reason in enumerate(reasons):
+        if not isinstance(reason, str):
+            raise TypeError(
+                f"rejection reason at position {position} must be a string."
+            )
+        if not reason.strip():
+            raise ValueError(
+                f"rejection reason at position {position} must not be empty."
+            )
+    return json.dumps(list(reasons), ensure_ascii=False, separators=(",", ":"))
+
+
+def _decode_rejection_reasons(encoded: Any) -> tuple[str, ...]:
+    if not isinstance(encoded, str):
+        raise ValueError("Stored rejection_reasons must contain JSON text.")
+    try:
+        decoded = json.loads(encoded)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Stored rejection_reasons contains invalid JSON.") from exc
+    if not isinstance(decoded, list) or any(
+        not isinstance(reason, str) for reason in decoded
+    ):
+        raise ValueError("Stored rejection_reasons must be a JSON string array.")
+    return tuple(decoded)
+
+
+def _normalise_pair_screening_results(
+    results: Iterable[PairScreeningResult],
+    run_id: Any,
+    formation_start: Any,
+    formation_end: Any,
+    loaded_at: Any | None,
+) -> list[tuple[Any, ...]]:
+    if isinstance(results, (str, bytes, bytearray)):
+        raise TypeError("results must be an iterable of PairScreeningResult objects.")
+    try:
+        batch = tuple(results)
+    except TypeError as exc:
+        raise TypeError(
+            "results must be an iterable of PairScreeningResult objects."
+        ) from exc
+    if not batch:
+        raise ValueError("results must contain at least one screening result.")
+
+    normalised_run_id = _normalise_non_empty_string(run_id, "run_id")
+    start_date = _normalise_date_filter(formation_start, "formation_start")
+    end_date = _normalise_date_filter(formation_end, "formation_end")
+    if start_date > end_date:
+        raise ValueError("formation_start must be on or before formation_end.")
+    batch_loaded_at = _normalise_loaded_at(loaded_at)
+
+    records: list[tuple[Any, ...]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for position, result in enumerate(batch):
+        if not isinstance(result, PairScreeningResult):
+            raise TypeError(
+                f"result at position {position} must be a PairScreeningResult."
+            )
+        symbol_y = _screening_symbol(result.symbol_y, "symbol_y")
+        symbol_x = _screening_symbol(result.symbol_x, "symbol_x")
+        pair = (symbol_y, symbol_x)
+        reverse_pair = (symbol_x, symbol_y)
+        if pair in seen_pairs:
+            raise ValueError(f"Duplicate pair in screening batch: {pair}.")
+        if reverse_pair in seen_pairs:
+            raise ValueError(f"Reversed duplicate pair in screening batch: {pair}.")
+        if symbol_y == symbol_x:
+            raise ValueError("symbol_y and symbol_x must identify different symbols.")
+        if symbol_y > symbol_x:
+            raise ValueError(
+                "Pair orientation must be canonical: symbol_y must precede symbol_x."
+            )
+        seen_pairs.add(pair)
+
+        if result.group is None:
+            group_name = None
+        else:
+            if not isinstance(result.group, str):
+                raise TypeError("group must be a string or None.")
+            if not result.group.strip():
+                raise ValueError("group must not be empty.")
+            group_name = result.group
+
+        observations = _strict_non_negative_integer(
+            result.observations, f"observations for {symbol_y}/{symbol_x}"
+        )
+        selected_value = result.selected
+        if not isinstance(selected_value, (bool, np.bool_)):
+            raise TypeError(f"selected for {symbol_y}/{symbol_x} must be Boolean.")
+        selected = bool(selected_value)
+        if selected:
+            rank = _strict_positive_integer(
+                result.rank, f"rank for selected pair {symbol_y}/{symbol_x}"
+            )
+        else:
+            if result.rank is not None:
+                raise ValueError(
+                    f"Rejected pair {symbol_y}/{symbol_x} must have rank None."
+                )
+            rank = None
+
+        numeric_values: dict[str, float | None] = {}
+        for field in (
+            "alpha",
+            "beta",
+            "spread_standard_deviation",
+            "cointegration_statistic",
+            "cointegration_pvalue",
+            "corrected_pvalue",
+            "adf_statistic",
+            "adf_pvalue",
+            "hurst",
+        ):
+            numeric_values[field], _ = _optional_screening_real(
+                getattr(result, field), f"{field} for {symbol_y}/{symbol_x}"
+            )
+        spread_standard_deviation = numeric_values["spread_standard_deviation"]
+        if spread_standard_deviation is not None and spread_standard_deviation < 0:
+            raise ValueError("spread_standard_deviation must be non-negative.")
+        for field in ("cointegration_pvalue", "corrected_pvalue", "adf_pvalue"):
+            probability = numeric_values[field]
+            if probability is not None and not 0 <= probability <= 1:
+                raise ValueError(f"{field} must be in [0, 1].")
+
+        half_life, half_life_was_infinite = _optional_screening_real(
+            result.half_life,
+            f"half_life for {symbol_y}/{symbol_x}",
+            allow_positive_infinity=True,
+        )
+        if half_life is not None and half_life <= 0:
+            raise ValueError("Finite half_life must be positive.")
+        _validate_critical_values(result)
+        encoded_reasons = _encode_rejection_reasons(result.rejection_reasons)
+
+        records.append(
+            (
+                normalised_run_id,
+                start_date,
+                end_date,
+                symbol_y,
+                symbol_x,
+                group_name,
+                observations,
+                numeric_values["alpha"],
+                numeric_values["beta"],
+                spread_standard_deviation,
+                numeric_values["cointegration_statistic"],
+                numeric_values["cointegration_pvalue"],
+                numeric_values["corrected_pvalue"],
+                numeric_values["adf_statistic"],
+                numeric_values["adf_pvalue"],
+                half_life,
+                half_life_was_infinite,
+                numeric_values["hurst"],
+                selected,
+                rank,
+                encoded_reasons,
+                batch_loaded_at,
+            )
+        )
+    return records
+
+
+def _validate_screening_upsert_consistency(
+    connection: duckdb.DuckDBPyConnection,
+    records: list[tuple[Any, ...]],
+) -> None:
+    """Validate run-level invariants against the complete post-upsert state.
+
+    ``records`` is non-empty and already fully normalised.  Existing rows are
+    overlaid in memory so a consistency error is detected before ``executemany``
+    can change any persisted row.
+    """
+    run_id, formation_start, formation_end = records[0][:3]
+    existing_rows = connection.execute(
+        """
+        SELECT
+            formation_start,
+            formation_end,
+            symbol_y,
+            symbol_x,
+            selected,
+            rank
+        FROM pair_screening_results
+        WHERE run_id = ?
+        """,
+        [run_id],
+    ).fetchall()
+
+    existing_windows = {(row[0], row[1]) for row in existing_rows}
+    if len(existing_windows) > 1:
+        raise ValueError(
+            f"Stored screening run {run_id!r} has conflicting formation windows."
+        )
+    requested_window = (formation_start, formation_end)
+    if existing_windows and existing_windows != {requested_window}:
+        raise ValueError(
+            f"Existing screening run {run_id!r} has formation window "
+            f"{next(iter(existing_windows))!r}; incoming records must use it."
+        )
+
+    resulting_pairs: dict[tuple[str, str], tuple[bool, Any]] = {
+        (symbol_y, symbol_x): (bool(selected), rank)
+        for _, _, symbol_y, symbol_x, selected, rank in existing_rows
+    }
+    for record in records:
+        resulting_pairs[(record[3], record[4])] = (record[18], record[19])
+
+    selected_ranks: list[int] = []
+    for pair, (selected, rank) in resulting_pairs.items():
+        if selected:
+            selected_ranks.append(
+                _strict_positive_integer(
+                    rank,
+                    f"stored rank for selected pair {pair[0]}/{pair[1]}",
+                )
+            )
+        elif rank is not None:
+            raise ValueError(
+                f"Stored rejected pair {pair[0]}/{pair[1]} must have rank None."
+            )
+
+    expected_ranks = list(range(1, len(selected_ranks) + 1))
+    if sorted(selected_ranks) != expected_ranks:
+        raise ValueError(
+            f"Selected ranks for screening run {run_id!r} must be unique "
+            "consecutive integers beginning at 1."
+        )
+
+
+def store_pair_screening_results(
+    database: DatabaseTarget,
+    results: Iterable[PairScreeningResult],
+    run_id: str,
+    formation_start: Any,
+    formation_end: Any,
+    *,
+    loaded_at: Any | None = None,
+) -> int:
+    """Transactionally upsert one screening batch and return its row count.
+
+    Positive-infinite half-life represents no estimated mean reversion.  It is
+    stored as SQL NULL plus an internal provenance flag so that loaders restore
+    only those values to Python positive infinity; ordinary nullable half-life
+    values remain missing.
+    """
+    records = _normalise_pair_screening_results(
+        results, run_id, formation_start, formation_end, loaded_at
+    )
+    statement = """
+        INSERT INTO pair_screening_results (
+            run_id, formation_start, formation_end, symbol_y, symbol_x,
+            group_name, observations, alpha, beta,
+            spread_standard_deviation, cointegration_statistic,
+            cointegration_pvalue, corrected_pvalue, adf_statistic, adf_pvalue,
+            half_life, half_life_was_infinite, hurst, selected, rank,
+            rejection_reasons, loaded_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (run_id, symbol_y, symbol_x) DO UPDATE SET
+            formation_start = EXCLUDED.formation_start,
+            formation_end = EXCLUDED.formation_end,
+            group_name = EXCLUDED.group_name,
+            observations = EXCLUDED.observations,
+            alpha = EXCLUDED.alpha,
+            beta = EXCLUDED.beta,
+            spread_standard_deviation = EXCLUDED.spread_standard_deviation,
+            cointegration_statistic = EXCLUDED.cointegration_statistic,
+            cointegration_pvalue = EXCLUDED.cointegration_pvalue,
+            corrected_pvalue = EXCLUDED.corrected_pvalue,
+            adf_statistic = EXCLUDED.adf_statistic,
+            adf_pvalue = EXCLUDED.adf_pvalue,
+            half_life = EXCLUDED.half_life,
+            half_life_was_infinite = EXCLUDED.half_life_was_infinite,
+            hurst = EXCLUDED.hurst,
+            selected = EXCLUDED.selected,
+            rank = EXCLUDED.rank,
+            rejection_reasons = EXCLUDED.rejection_reasons,
+            loaded_at = EXCLUDED.loaded_at
+    """
+    with _connection_scope(database) as connection:
+        _ensure_schema(connection)
+        with _transaction(connection):
+            _validate_screening_upsert_consistency(connection, records)
+            connection.executemany(statement, records)
+    return len(records)
+
+
+def _empty_screening_results() -> pd.DataFrame:
+    frame = pd.DataFrame(
+        {
+            "run_id": pd.Series(dtype="object"),
+            "formation_start": pd.Series(dtype="datetime64[ns]"),
+            "formation_end": pd.Series(dtype="datetime64[ns]"),
+            "symbol_y": pd.Series(dtype="object"),
+            "symbol_x": pd.Series(dtype="object"),
+            "group_name": pd.Series(dtype="object"),
+            "observations": pd.Series(dtype="int64"),
+            "alpha": pd.Series(dtype="float64"),
+            "beta": pd.Series(dtype="float64"),
+            "spread_standard_deviation": pd.Series(dtype="float64"),
+            "cointegration_statistic": pd.Series(dtype="float64"),
+            "cointegration_pvalue": pd.Series(dtype="float64"),
+            "corrected_pvalue": pd.Series(dtype="float64"),
+            "adf_statistic": pd.Series(dtype="float64"),
+            "adf_pvalue": pd.Series(dtype="float64"),
+            "half_life": pd.Series(dtype="float64"),
+            "hurst": pd.Series(dtype="float64"),
+            "selected": pd.Series(dtype="bool"),
+            "rank": pd.Series(dtype="Int64"),
+            "rejection_reasons": pd.Series(dtype="object"),
+            "loaded_at": pd.Series(dtype="datetime64[ns]"),
+        }
+    )
+    return frame.loc[:, list(SCREENING_RESULT_COLUMNS)]
+
+
+def _coerce_screening_results(result: pd.DataFrame) -> pd.DataFrame:
+    if result.empty:
+        return _empty_screening_results()
+    infinite_flags = result.pop("half_life_was_infinite").astype(bool)
+    result["half_life"] = result["half_life"].astype(float)
+    for row_position, was_infinite in enumerate(infinite_flags):
+        half_life = result.iloc[row_position]["half_life"]
+        if was_infinite:
+            if not pd.isna(half_life):
+                raise ValueError(
+                    "Stored half-life infinity marker conflicts with a finite value."
+                )
+            result.iat[
+                row_position, result.columns.get_loc("half_life")
+            ] = float("inf")
+
+    result["rejection_reasons"] = result["rejection_reasons"].map(
+        _decode_rejection_reasons
+    )
+    for column in ("formation_start", "formation_end", "loaded_at"):
+        result[column] = pd.to_datetime(result[column]).astype("datetime64[ns]")
+    result["observations"] = result["observations"].astype("int64")
+    result["selected"] = result["selected"].astype(bool)
+    result["rank"] = result["rank"].astype("Int64")
+    for column in _SCREENING_FLOAT_COLUMNS:
+        result[column] = result[column].astype(float)
+    return result.loc[:, list(SCREENING_RESULT_COLUMNS)]
+
+
+def _load_screening_results(
+    database: DatabaseTarget,
+    run_id: Any,
+    *,
+    selected_only: bool,
+    limit: int | None = None,
+    max_rank: int | None = None,
+) -> pd.DataFrame:
+    normalised_run_id = _normalise_non_empty_string(run_id, "run_id")
+    clauses = ["run_id = ?"]
+    parameters: list[Any] = [normalised_run_id]
+    if selected_only:
+        clauses.append("selected")
+    if max_rank is not None:
+        clauses.append("rank <= ?")
+        parameters.append(max_rank)
+    query = f"""
+        SELECT
+            run_id, formation_start, formation_end, symbol_y, symbol_x,
+            group_name, observations, alpha, beta,
+            spread_standard_deviation, cointegration_statistic,
+            cointegration_pvalue, corrected_pvalue, adf_statistic, adf_pvalue,
+            half_life, half_life_was_infinite, hurst, selected, rank,
+            rejection_reasons, loaded_at
+        FROM pair_screening_results
+        WHERE {' AND '.join(clauses)}
+        ORDER BY
+            selected DESC,
+            CASE WHEN selected THEN rank END ASC NULLS LAST,
+            corrected_pvalue ASC NULLS LAST,
+            symbol_y ASC,
+            symbol_x ASC
+    """
+    if limit is not None:
+        query += " LIMIT ?"
+        parameters.append(limit)
+    with _connection_scope(database) as connection:
+        _ensure_schema(connection)
+        result = connection.execute(query, parameters).fetchdf()
+    return _coerce_screening_results(result)
+
+
+def load_pair_screening_results(
+    database: DatabaseTarget,
+    run_id: str,
+) -> pd.DataFrame:
+    """Load selected and rejected results for one screening run."""
+    return _load_screening_results(database, run_id, selected_only=False)
+
+
+def load_selected_pairs(
+    database: DatabaseTarget,
+    run_id: str,
+    *,
+    limit: int | None = None,
+    max_rank: int | None = None,
+) -> pd.DataFrame:
+    """Load selected pairs in stored rank order without renumbering them."""
+    if limit is not None:
+        limit = _strict_positive_integer(limit, "limit")
+    if max_rank is not None:
+        max_rank = _strict_positive_integer(max_rank, "max_rank")
+    return _load_screening_results(
+        database,
+        run_id,
+        selected_only=True,
+        limit=limit,
+        max_rank=max_rank,
+    )
+
+
+def _empty_screening_summary() -> pd.DataFrame:
+    frame = pd.DataFrame(
+        {
+            "run_id": pd.Series(dtype="object"),
+            "formation_start": pd.Series(dtype="datetime64[ns]"),
+            "formation_end": pd.Series(dtype="datetime64[ns]"),
+            "total_pairs": pd.Series(dtype="int64"),
+            "selected_pairs": pd.Series(dtype="int64"),
+            "selection_rate": pd.Series(dtype="float64"),
+            "mean_corrected_pvalue": pd.Series(dtype="float64"),
+            "median_half_life": pd.Series(dtype="float64"),
+            "mean_hurst": pd.Series(dtype="float64"),
+            "latest_loaded_at": pd.Series(dtype="datetime64[ns]"),
+        }
+    )
+    return frame.loc[:, list(SCREENING_SUMMARY_COLUMNS)]
+
+
+def summarise_screening_runs(database: DatabaseTarget) -> pd.DataFrame:
+    """Aggregate screening counts and selected-only diagnostics by run."""
+    query = """
+        SELECT
+            run_id,
+            formation_start,
+            formation_end,
+            COUNT(*) AS total_pairs,
+            COUNT(*) FILTER (WHERE selected) AS selected_pairs,
+            CAST(COUNT(*) FILTER (WHERE selected) AS DOUBLE)
+                / COUNT(*) AS selection_rate,
+            AVG(corrected_pvalue) FILTER (WHERE selected)
+                AS mean_corrected_pvalue,
+            MEDIAN(half_life) FILTER (WHERE selected) AS median_half_life,
+            AVG(hurst) FILTER (WHERE selected) AS mean_hurst,
+            MAX(loaded_at) AS latest_loaded_at
+        FROM pair_screening_results
+        GROUP BY run_id, formation_start, formation_end
+        ORDER BY
+            formation_end DESC,
+            formation_start DESC,
+            run_id ASC
+    """
+    with _connection_scope(database) as connection:
+        _ensure_schema(connection)
+        result = connection.execute(query).fetchdf()
+    if result.empty:
+        return _empty_screening_summary()
+    conflicting_runs = result.loc[
+        result["run_id"].duplicated(keep=False), "run_id"
+    ].drop_duplicates()
+    if not conflicting_runs.empty:
+        run_ids = ", ".join(repr(value) for value in conflicting_runs.tolist())
+        raise ValueError(
+            "Stored screening runs have conflicting formation windows: "
+            f"{run_ids}."
+        )
+    for column in ("formation_start", "formation_end", "latest_loaded_at"):
+        result[column] = pd.to_datetime(result[column]).astype("datetime64[ns]")
+    for column in ("total_pairs", "selected_pairs"):
+        result[column] = result[column].astype("int64")
+    for column in (
+        "selection_rate",
+        "mean_corrected_pvalue",
+        "median_half_life",
+        "mean_hurst",
+    ):
+        result[column] = result[column].astype(float)
+    return result.loc[:, list(SCREENING_SUMMARY_COLUMNS)]

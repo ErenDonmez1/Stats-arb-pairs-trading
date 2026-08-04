@@ -23,3 +23,38 @@ CREATE TABLE IF NOT EXISTS data_quality_reports (
     loaded_at TIMESTAMP NOT NULL,
     CONSTRAINT data_quality_run_symbol_unique UNIQUE (run_id, symbol)
 );
+
+CREATE TABLE IF NOT EXISTS pair_screening_results (
+    run_id VARCHAR NOT NULL,
+    formation_start DATE NOT NULL,
+    formation_end DATE NOT NULL,
+    symbol_y VARCHAR NOT NULL,
+    symbol_x VARCHAR NOT NULL,
+    group_name VARCHAR,
+    observations BIGINT NOT NULL,
+    alpha DOUBLE,
+    beta DOUBLE,
+    spread_standard_deviation DOUBLE,
+    cointegration_statistic DOUBLE,
+    cointegration_pvalue DOUBLE,
+    corrected_pvalue DOUBLE,
+    adf_statistic DOUBLE,
+    adf_pvalue DOUBLE,
+    half_life DOUBLE,
+    hurst DOUBLE,
+    selected BOOLEAN NOT NULL,
+    rank BIGINT,
+    rejection_reasons VARCHAR,
+    loaded_at TIMESTAMP NOT NULL,
+    half_life_was_infinite BOOLEAN NOT NULL DEFAULT FALSE,
+    CONSTRAINT screening_run_pair_unique UNIQUE (run_id, symbol_y, symbol_x),
+    CONSTRAINT screening_canonical_pair CHECK (symbol_y < symbol_x),
+    CONSTRAINT screening_non_negative_observations CHECK (observations >= 0),
+    CONSTRAINT screening_rank_policy CHECK (
+        (selected AND rank IS NOT NULL AND rank > 0)
+        OR (NOT selected AND rank IS NULL)
+    ),
+    CONSTRAINT screening_infinite_half_life_policy CHECK (
+        NOT half_life_was_infinite OR half_life IS NULL
+    )
+);

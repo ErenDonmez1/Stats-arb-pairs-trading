@@ -1,4 +1,4 @@
-"""Causal spread standardisation without trading-position state.
+"""Causal spread standardisation and deterministic trading-signal state.
 
 Missing rows are preserved in place.  A z-score is defined only when the
 current spread is present and every observation in its fixed-size prior window
@@ -7,6 +7,7 @@ is present.  Values are never filled, interpolated, dropped, or reordered.
 
 from __future__ import annotations
 
+from enum import Enum, IntEnum, unique
 from numbers import Integral, Real
 from typing import Any
 
@@ -19,7 +20,61 @@ import pandas as pd
 # deviation remains visible in standardise_spread(); only division is masked.
 _NEAR_ZERO_STANDARD_DEVIATION = 1e-12
 
-__all__ = ["rolling_zscore", "standardise_spread"]
+__all__ = [
+    "PositionState",
+    "TradeEvent",
+    "ExitReason",
+    "rolling_zscore",
+    "standardise_spread",
+    "generate_trade_signals",
+]
+
+
+@unique
+class PositionState(IntEnum):
+    """Immutable desired pair-trading state and its position encoding."""
+
+    FLAT = 0
+    LONG_SPREAD = 1
+    SHORT_SPREAD = -1
+
+
+@unique
+class TradeEvent(str, Enum):
+    """Deterministic events emitted by the signal state machine."""
+
+    NONE = "NONE"
+    ENTER_LONG = "ENTER_LONG"
+    ENTER_SHORT = "ENTER_SHORT"
+    EXIT_MEAN_REVERSION = "EXIT_MEAN_REVERSION"
+    EXIT_STOP = "EXIT_STOP"
+    EXIT_TIME = "EXIT_TIME"
+
+
+@unique
+class ExitReason(str, Enum):
+    """Deterministic exit classifications for downstream audit trails."""
+
+    NONE = "NONE"
+    MEAN_REVERSION = "MEAN_REVERSION"
+    STOP = "STOP"
+    TIME = "TIME"
+
+
+_TRADE_SIGNAL_COLUMNS = (
+    "zscore",
+    "state",
+    "position",
+    "entry_long",
+    "entry_short",
+    "exit",
+    "stop",
+    "time_exit",
+    "event",
+    "exit_reason",
+    "holding_period",
+    "cooldown_remaining",
+)
 
 
 def _positive_integer(value: Any, name: str) -> int:
@@ -170,3 +225,219 @@ def rolling_zscore(
     )["zscore"].copy()
     result.name = "zscore"
     return result
+
+
+def _finite_real_parameter(value: Any, name: str) -> float:
+    """Return a finite real-valued strategy threshold."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise TypeError(f"{name} must be a non-Boolean real number.")
+    try:
+        normalised = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be representable as a float.") from exc
+    if not np.isfinite(normalised):
+        raise ValueError(f"{name} must be finite.")
+    return normalised
+
+
+def _optional_positive_integer(value: Any, name: str) -> int | None:
+    """Return ``None`` or a positive non-Boolean integer."""
+    if value is None:
+        return None
+    normalised = _positive_integer(value, name)
+    if normalised > np.iinfo(np.int64).max:
+        raise ValueError(f"{name} exceeds the supported int64 range.")
+    return normalised
+
+
+def _validated_zscore(zscore: pd.Series) -> pd.Series:
+    """Return an independent float z-score Series without changing row order."""
+    if not isinstance(zscore, pd.Series):
+        raise TypeError("zscore must be a pandas Series.")
+    if not zscore.index.is_unique:
+        raise ValueError("zscore must have a unique index.")
+
+    copied = zscore.copy(deep=True)
+    non_missing = copied.loc[copied.notna()]
+    numeric = non_missing.map(
+        lambda value: isinstance(value, Real)
+        and not isinstance(value, (bool, np.bool_))
+    )
+    if not bool(numeric.all()):
+        raise ValueError("Non-missing zscore observations must be real numeric values.")
+    try:
+        array = copied.to_numpy(dtype=float, na_value=np.nan)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "Non-missing zscore observations must be representable as floats."
+        ) from exc
+
+    values = pd.Series(array, index=zscore.index, name="zscore", dtype=float)
+    if not np.isfinite(values.dropna().to_numpy(dtype=float)).all():
+        raise ValueError("Non-missing zscore observations must be finite.")
+    return values
+
+
+def _coerce_trade_signal_dtypes(result: pd.DataFrame) -> pd.DataFrame:
+    """Apply stable output dtypes, including for a legitimate empty input."""
+    result["zscore"] = result["zscore"].astype("float64")
+    for column in ("entry_long", "entry_short", "exit", "stop", "time_exit"):
+        result[column] = result[column].astype(bool)
+    result["position"] = result["position"].astype("int8")
+    result["holding_period"] = result["holding_period"].astype("int64")
+    result["cooldown_remaining"] = result["cooldown_remaining"].astype("int64")
+    for column in ("state", "event", "exit_reason"):
+        result[column] = result[column].astype(object)
+    return result.loc[:, list(_TRADE_SIGNAL_COLUMNS)]
+
+
+def generate_trade_signals(
+    zscore: pd.Series,
+    entry_z: float,
+    exit_z: float,
+    stop_z: float,
+    *,
+    max_holding_period: int | None = None,
+    cooldown_period: int | None = None,
+    missing_policy: str = "hold",
+) -> pd.DataFrame:
+    """Generate desired pair-trading states from an existing causal z-score.
+
+    The output is a sequence of order decisions, not executed portfolio
+    holdings.  A decision at row ``t`` may use ``zscore_t``; a later backtester
+    is responsible for applying execution lag and fills.
+
+    The entry row has ``holding_period=0`` because its order has not yet been
+    executed.  Every later row while open advances the counter, including a
+    missing-z-score row.  Reaching ``max_holding_period`` exits on that row.
+    Exit rows report the completed holding period even though their state is
+    flat; only the internal counter used by subsequent rows resets to zero.
+    Exit precedence is stop, time limit, then mean reversion.
+
+    The exit row does not consume cooldown.  An exit reports the configured
+    cooldown, and each of the next ``cooldown_period`` rows is entry-ineligible
+    while reporting the pre-decrement value applying during that row.  A zero
+    value therefore means the current row is eligible for entry.
+
+    ``missing_policy="hold"`` preserves missing values and suppresses threshold
+    entries and exits.  Open states and flat states are retained, holding time
+    and cooldown still advance, and a time exit may occur on a missing row.
+    No values are filled, interpolated, dropped, or reordered.
+
+    Empty Series are accepted and return an empty, fully typed frame.  State,
+    event, and exit-reason values are emitted as stable primitive strings.
+    """
+    values = _validated_zscore(zscore)
+    normalised_entry = _finite_real_parameter(entry_z, "entry_z")
+    normalised_exit = _finite_real_parameter(exit_z, "exit_z")
+    normalised_stop = _finite_real_parameter(stop_z, "stop_z")
+    if normalised_exit < 0:
+        raise ValueError("exit_z must be non-negative.")
+    if normalised_entry <= normalised_exit:
+        raise ValueError("entry_z must be greater than exit_z.")
+    if normalised_stop <= normalised_entry:
+        raise ValueError("stop_z must be greater than entry_z.")
+
+    maximum_holding = _optional_positive_integer(
+        max_holding_period,
+        "max_holding_period",
+    )
+    configured_cooldown = _optional_positive_integer(
+        cooldown_period,
+        "cooldown_period",
+    )
+    if not isinstance(missing_policy, str) or missing_policy != "hold":
+        raise ValueError("missing_policy must be 'hold'.")
+
+    state = PositionState.FLAT
+    holding_period = 0
+    cooldown_remaining = 0
+    rows: list[tuple[Any, ...]] = []
+
+    for current_zscore in values.to_numpy(dtype=float):
+        entry_long = False
+        entry_short = False
+        exited = False
+        stopped = False
+        timed_out = False
+        event = TradeEvent.NONE
+        exit_reason = ExitReason.NONE
+        is_missing = bool(np.isnan(current_zscore))
+        row_holding_period = 0
+        row_cooldown_remaining = cooldown_remaining
+
+        if state is PositionState.FLAT:
+            holding_period = 0
+            if cooldown_remaining > 0:
+                # Consume this whole row before another entry becomes eligible.
+                cooldown_remaining -= 1
+            elif not is_missing:
+                if current_zscore <= -normalised_entry:
+                    state = PositionState.LONG_SPREAD
+                    entry_long = True
+                    event = TradeEvent.ENTER_LONG
+                elif current_zscore >= normalised_entry:
+                    state = PositionState.SHORT_SPREAD
+                    entry_short = True
+                    event = TradeEvent.ENTER_SHORT
+        else:
+            holding_period += 1
+            row_holding_period = holding_period
+            stop_triggered = False
+            mean_reversion_triggered = False
+            if not is_missing:
+                if state is PositionState.LONG_SPREAD:
+                    stop_triggered = current_zscore <= -normalised_stop
+                    mean_reversion_triggered = current_zscore >= -normalised_exit
+                else:
+                    stop_triggered = current_zscore >= normalised_stop
+                    mean_reversion_triggered = current_zscore <= normalised_exit
+            time_triggered = (
+                maximum_holding is not None
+                and holding_period >= maximum_holding
+            )
+
+            if stop_triggered:
+                exited = True
+                stopped = True
+                event = TradeEvent.EXIT_STOP
+                exit_reason = ExitReason.STOP
+            elif time_triggered:
+                exited = True
+                timed_out = True
+                event = TradeEvent.EXIT_TIME
+                exit_reason = ExitReason.TIME
+            elif mean_reversion_triggered:
+                exited = True
+                event = TradeEvent.EXIT_MEAN_REVERSION
+                exit_reason = ExitReason.MEAN_REVERSION
+
+            if exited:
+                state = PositionState.FLAT
+                holding_period = 0
+                cooldown_remaining = configured_cooldown or 0
+                row_cooldown_remaining = cooldown_remaining
+
+        rows.append(
+            (
+                current_zscore,
+                state.name,
+                int(state),
+                entry_long,
+                entry_short,
+                exited,
+                stopped,
+                timed_out,
+                event.value,
+                exit_reason.value,
+                row_holding_period,
+                row_cooldown_remaining,
+            )
+        )
+
+    result = pd.DataFrame.from_records(
+        rows,
+        columns=list(_TRADE_SIGNAL_COLUMNS),
+    )
+    result.index = zscore.index
+    return _coerce_trade_signal_dtypes(result)

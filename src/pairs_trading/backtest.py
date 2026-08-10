@@ -18,7 +18,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import pandas as pd
 
-from .signals import PositionState, TradeEvent
+from .signals import PositionState, TradeEvent, generate_trade_signals
 
 
 __all__ = [
@@ -39,9 +39,12 @@ __all__ = [
     "TradeExitReason",
     "TradeRecord",
     "LedgerReconciliation",
+    "BacktestResult",
     "force_liquidate_open_position",
     "build_trade_ledger",
     "reconcile_trade_ledger",
+    "validate_backtest_invariants",
+    "run_pair_backtest",
 ]
 
 
@@ -250,6 +253,26 @@ class LedgerReconciliation:
     open_trade_carry_cost: float
     open_trade_net_pnl: float
     final_cumulative_net_pnl_after_carry: float
+
+
+@dataclass(frozen=True)
+class BacktestResult:
+    """Independently owned outputs from one integrated pair backtest.
+
+    The frozen wrapper prevents field replacement.  Its DataFrames are fresh
+    defensive copies with no shared storage with caller inputs or other runs;
+    callers may therefore mutate their returned frames without affecting the
+    pipeline or a separately produced result.
+    """
+
+    signals: pd.DataFrame
+    positions: pd.DataFrame
+    accounting: pd.DataFrame
+    ledger: pd.DataFrame
+    reconciliation: LedgerReconciliation
+    forced_liquidation_requested: bool
+    forced_liquidation_applied: bool
+    execution_lag: int
 
 
 class PairUnits(NamedTuple):
@@ -2879,3 +2902,455 @@ def reconcile_trade_ledger(
         open_trade_net_pnl=open_net,
         final_cumulative_net_pnl_after_carry=final_cumulative,
     )
+
+
+def _assert_accounting_identity(
+    actual: pd.Series,
+    expected: pd.Series,
+    name: str,
+    *,
+    rtol: float,
+    atol: float,
+) -> None:
+    """Raise when an accounting identity differs, including its NaN mask."""
+    actual_values = actual.to_numpy(dtype=float)
+    expected_values = expected.to_numpy(dtype=float)
+    if not np.array_equal(np.isnan(actual_values), np.isnan(expected_values)):
+        raise ValueError(f"Backtest invariant failed: {name} has inconsistent NaNs.")
+    known = np.isfinite(actual_values) & np.isfinite(expected_values)
+    if not np.allclose(
+        actual_values[known],
+        expected_values[known],
+        rtol=rtol,
+        atol=atol,
+    ):
+        raise ValueError(f"Backtest invariant failed: {name}.")
+
+
+def _assert_cumulative_cost(
+    values: pd.Series,
+    name: str,
+    *,
+    atol: float,
+) -> None:
+    """Require a non-decreasing cumulative cost with causal NaN propagation."""
+    array = values.to_numpy(dtype=float)
+    missing = np.flatnonzero(np.isnan(array))
+    known_stop = int(missing[0]) if len(missing) else len(array)
+    if len(missing) and not np.isnan(array[known_stop:]).all():
+        raise ValueError(
+            f"Backtest invariant failed: {name} resumed after becoming unknown."
+        )
+    if known_stop > 1 and bool((np.diff(array[:known_stop]) < -atol).any()):
+        raise ValueError(f"Backtest invariant failed: {name} decreased.")
+
+
+def validate_backtest_invariants(
+    result: BacktestResult,
+    *,
+    rtol: float = 1e-9,
+    atol: float = 1e-12,
+) -> None:
+    """Validate cross-stage accounting, state, timing, and ledger invariants.
+
+    The function reports the first violated contract and never repairs output.
+    Unknown accounting is accepted only when the corresponding identity also
+    remains unknown under the conservative missing-data policy.
+    """
+    if not isinstance(result, BacktestResult):
+        raise TypeError("result must be a BacktestResult.")
+    relative_tolerance = _finite_nonnegative_scalar(rtol, "rtol")
+    absolute_tolerance = _finite_nonnegative_scalar(atol, "atol")
+    lag = _positive_integer(result.execution_lag, "execution_lag")
+    if type(result.forced_liquidation_requested) is not bool:
+        raise TypeError("forced_liquidation_requested must be a bool.")
+    if type(result.forced_liquidation_applied) is not bool:
+        raise TypeError("forced_liquidation_applied must be a bool.")
+
+    signals = result.signals
+    positions = result.positions
+    accounting = result.accounting
+    ledger = result.ledger
+    for frame, name in (
+        (signals, "signals"),
+        (positions, "positions"),
+        (accounting, "accounting"),
+        (ledger, "ledger"),
+    ):
+        if not isinstance(frame, pd.DataFrame):
+            raise TypeError(f"result.{name} must be a pandas DataFrame.")
+        if not frame.index.is_unique:
+            raise ValueError(f"result.{name} must have a unique index.")
+    _require_matching_index(positions.index, signals.index, "signals")
+    _require_matching_index(positions.index, accounting.index, "accounting")
+
+    required_accounting = {
+        "pnl_y",
+        "pnl_x",
+        "gross_pnl",
+        "commission_cost",
+        "slippage_cost",
+        "transaction_cost",
+        "cumulative_transaction_cost",
+        "borrow_cost",
+        "financing_cost",
+        "carry_cost",
+        "cumulative_carry_cost",
+        "net_pnl_after_carry",
+        "gross_exposure",
+        "long_exposure",
+        "short_exposure",
+    }
+    missing = required_accounting.difference(accounting.columns)
+    if missing:
+        raise ValueError(
+            f"result.accounting is missing invariant columns: {sorted(missing)}."
+        )
+    required_positions = {
+        "executed_state",
+        "execution_event",
+        "decision_event",
+        "units_y",
+        "units_x",
+        "rebalance",
+    }
+    missing_positions = required_positions.difference(positions.columns)
+    if missing_positions:
+        raise ValueError(
+            f"result.positions is missing invariant columns: {sorted(missing_positions)}."
+        )
+    if "event" not in signals.columns:
+        raise ValueError("result.signals is missing required column: event.")
+
+    _assert_accounting_identity(
+        accounting["gross_pnl"],
+        accounting["pnl_y"] + accounting["pnl_x"],
+        "gross_pnl = pnl_y + pnl_x",
+        rtol=relative_tolerance,
+        atol=absolute_tolerance,
+    )
+    _assert_accounting_identity(
+        accounting["transaction_cost"],
+        accounting["commission_cost"] + accounting["slippage_cost"],
+        "transaction_cost = commission_cost + slippage_cost",
+        rtol=relative_tolerance,
+        atol=absolute_tolerance,
+    )
+    _assert_accounting_identity(
+        accounting["carry_cost"],
+        accounting["borrow_cost"] + accounting["financing_cost"],
+        "carry_cost = borrow_cost + financing_cost",
+        rtol=relative_tolerance,
+        atol=absolute_tolerance,
+    )
+    _assert_accounting_identity(
+        accounting["net_pnl_after_carry"],
+        (
+            accounting["gross_pnl"]
+            - accounting["transaction_cost"]
+            - accounting["carry_cost"]
+        ),
+        "net_pnl_after_carry = gross_pnl - transaction_cost - carry_cost",
+        rtol=relative_tolerance,
+        atol=absolute_tolerance,
+    )
+    _assert_cumulative_cost(
+        accounting["cumulative_transaction_cost"],
+        "cumulative_transaction_cost",
+        atol=absolute_tolerance,
+    )
+    _assert_cumulative_cost(
+        accounting["cumulative_carry_cost"],
+        "cumulative_carry_cost",
+        atol=absolute_tolerance,
+    )
+
+    actual_schedule = _validated_position_schedule(
+        positions[
+            [
+                "executed_state",
+                "execution_event",
+                "units_y",
+                "units_x",
+                "rebalance",
+            ]
+        ]
+    )
+    flat = actual_schedule["executed_state"].eq(PositionState.FLAT.name)
+    if not bool(
+        actual_schedule.loc[flat, ["units_y", "units_x"]].eq(0.0).all().all()
+    ):
+        raise ValueError("Backtest invariant failed: flat positions have nonzero units.")
+    for column in ("gross_exposure", "long_exposure", "short_exposure"):
+        if bool((accounting[column].dropna() < -absolute_tolerance).any()):
+            raise ValueError(
+                f"Backtest invariant failed: {column} contains negative values."
+            )
+
+    if result.forced_liquidation_requested and not positions.empty:
+        final_units = positions[["units_y", "units_x"]].iloc[-1].to_numpy(
+            dtype=float
+        )
+        if not np.allclose(final_units, 0.0, rtol=0.0, atol=absolute_tolerance):
+            raise ValueError(
+                "Backtest invariant failed: forced liquidation left open units."
+            )
+
+    for row in ledger.itertuples(index=False):
+        known = np.isfinite(
+            [row.gross_pnl, row.total_cost, row.net_pnl]
+        ).all()
+        if known and not np.isclose(
+            row.net_pnl,
+            row.gross_pnl - row.total_cost,
+            rtol=relative_tolerance,
+            atol=absolute_tolerance,
+        ):
+            raise ValueError(
+                f"Backtest invariant failed: ledger trade {row.trade_id} net P&L."
+            )
+
+    final_is_flat = bool(
+        positions.empty
+        or positions["executed_state"].iat[-1] == PositionState.FLAT.name
+    )
+    if final_is_flat:
+        expected_status = (
+            "RECONCILED"
+            if result.reconciliation.fully_reconcilable
+            else "UNKNOWN_ACCOUNTING"
+        )
+        if result.reconciliation.status != expected_status:
+            raise ValueError(
+                "Backtest invariant failed: closed-ledger reconciliation status."
+            )
+    elif result.reconciliation.status != "OPEN_TRADE":
+        raise ValueError(
+            "Backtest invariant failed: open trade was not reported explicitly."
+        )
+
+    signal_events = signals["event"].astype(object).to_numpy()
+    execution_events = positions["execution_event"].astype(object).to_numpy()
+    for event in (
+        TradeEvent.ENTER_LONG.value,
+        TradeEvent.ENTER_SHORT.value,
+        TradeEvent.EXIT_MEAN_REVERSION.value,
+        TradeEvent.EXIT_STOP.value,
+        TradeEvent.EXIT_TIME.value,
+    ):
+        executed_count = 0
+        for row_number, executed_event in enumerate(execution_events):
+            if executed_event != event:
+                continue
+            executed_count += 1
+            if row_number < lag:
+                raise ValueError(
+                    "Backtest invariant failed: trade executed before its lag."
+                )
+            due_decisions = int(
+                np.count_nonzero(signal_events[: row_number - lag + 1] == event)
+            )
+            if executed_count > due_decisions:
+                raise ValueError(
+                    "Backtest invariant failed: execution has no lagged decision."
+                )
+
+    previous_state = PositionState.FLAT.name
+    for row_number, state in enumerate(actual_schedule["executed_state"]):
+        if (
+            previous_state != PositionState.FLAT.name
+            and state != PositionState.FLAT.name
+            and state != previous_state
+        ):
+            raise ValueError(
+                "Backtest invariant failed: same-row position reversal at row "
+                f"{row_number}."
+            )
+        previous_state = state
+
+
+def run_pair_backtest(
+    price_y: pd.Series,
+    price_x: pd.Series,
+    hedge_ratio: float | pd.Series,
+    target_gross_notional: float,
+    *,
+    zscore: pd.Series | None = None,
+    signals: pd.DataFrame | None = None,
+    initial_capital: float = 1_000_000.0,
+    entry_z: float = 2.0,
+    exit_z: float = 0.5,
+    stop_z: float = 3.5,
+    max_holding_period: int | None = None,
+    cooldown_period: int | None = None,
+    missing_policy: str = "hold",
+    execution_lag: int = 1,
+    commission_bps: float = 0.0,
+    fixed_commission_per_leg: float = 0.0,
+    slippage_bps: float = 0.0,
+    borrow_rate_y: float | pd.Series = 0.0,
+    borrow_rate_x: float | pd.Series = 0.0,
+    financing_rate: float = 0.0,
+    periods_per_year: int = 252,
+    rebalance: bool = False,
+    rebalance_threshold: float = 0.0,
+    force_liquidation: bool = False,
+) -> BacktestResult:
+    """Run the complete causal one-pair workflow through ledger reconciliation.
+
+    Exactly one of ``zscore`` and ``signals`` is required.  The implementation
+    delegates every stage to the existing signal, execution, P&L, cost,
+    liquidation, and ledger helpers.  Exposure detail is obtained from
+    :func:`build_pnl_schedule`; no accounting formula is duplicated here.
+    """
+    if (zscore is None) == (signals is None):
+        raise ValueError("Exactly one of zscore or signals must be supplied.")
+    lag = _positive_integer(execution_lag, "execution_lag")
+    if zscore is not None:
+        generated_signals = generate_trade_signals(
+            zscore,
+            entry_z,
+            exit_z,
+            stop_z,
+            max_holding_period=max_holding_period,
+            cooldown_period=cooldown_period,
+            missing_policy=missing_policy,
+        )
+        signal_frame = generated_signals.copy(deep=True)
+    else:
+        if not isinstance(signals, pd.DataFrame):
+            raise TypeError("signals must be a pandas DataFrame.")
+        signal_frame = signals.copy(deep=True)
+
+    base_positions = build_position_schedule(
+        price_y,
+        price_x,
+        signal_frame,
+        hedge_ratio,
+        target_gross_notional,
+        execution_lag=lag,
+    )
+
+    accounting_kwargs = {
+        "initial_capital": initial_capital,
+        "commission_bps": commission_bps,
+        "slippage_bps": slippage_bps,
+        "fixed_commission_per_leg": fixed_commission_per_leg,
+        "borrow_rate_y": borrow_rate_y,
+        "borrow_rate_x": borrow_rate_x,
+        "financing_rate": financing_rate,
+        "periods_per_year": periods_per_year,
+        "rebalance": rebalance,
+        "hedge_ratio": hedge_ratio,
+        "target_gross_notional": target_gross_notional,
+        "rebalance_threshold": rebalance_threshold,
+    }
+    accounting = build_financed_pnl_schedule(
+        base_positions,
+        price_y,
+        price_x,
+        **accounting_kwargs,
+    )
+
+    final_positions = force_liquidate_open_position(
+        base_positions,
+        price_y,
+        price_x,
+        hedge_ratio,
+        force_liquidation=force_liquidation,
+    )
+    forced_applied = bool(
+        not final_positions.empty
+        and final_positions["execution_event"].iat[-1] == _FORCED_EXIT_EVENT
+        and base_positions["execution_event"].iat[-1] != _FORCED_EXIT_EVENT
+    )
+    if forced_applied:
+        accounting = build_financed_pnl_schedule(
+            final_positions,
+            price_y,
+            price_x,
+            **accounting_kwargs,
+        )
+
+    rebalanced = calculate_rebalancing_costs(
+        final_positions,
+        price_y,
+        price_x,
+        hedge_ratio,
+        target_gross_notional,
+        rebalance=rebalance,
+        rebalance_threshold=rebalance_threshold,
+        commission_bps=commission_bps,
+        slippage_bps=slippage_bps,
+        fixed_commission_per_leg=fixed_commission_per_leg,
+    )
+    actual_schedule = rebalanced[
+        [
+            "executed_state",
+            "execution_event",
+            "units_y",
+            "units_x",
+            "rebalance",
+        ]
+    ].copy()
+    gross_detail = build_pnl_schedule(
+        actual_schedule,
+        price_y,
+        price_x,
+        initial_capital,
+    )
+
+    integrated_positions = final_positions.copy(deep=True)
+    integrated_positions["units_y"] = rebalanced["units_y"]
+    integrated_positions["units_x"] = rebalanced["units_x"]
+    integrated_positions["notional_y"] = gross_detail["market_value_y"]
+    integrated_positions["notional_x"] = gross_detail["market_value_x"]
+    integrated_positions["gross_exposure"] = gross_detail["gross_exposure"]
+    integrated_positions["net_exposure"] = gross_detail["net_exposure"]
+    for column in (
+        "rebalance",
+        "rebalance_beta",
+        "rebalance_delta_units_y",
+        "rebalance_delta_units_x",
+    ):
+        integrated_positions[column] = rebalanced[column]
+    integrated_positions.index = price_y.index
+
+    detail_columns = [
+        "market_value_y",
+        "market_value_x",
+        "gross_exposure",
+        "net_exposure",
+        "long_exposure",
+        "short_exposure",
+        "pnl_y",
+        "pnl_x",
+        "realised_pnl",
+        "unrealised_pnl",
+        "cumulative_realised_pnl",
+    ]
+    integrated_accounting = pd.concat(
+        [accounting.copy(deep=True), gross_detail[detail_columns]],
+        axis=1,
+        copy=False,
+    )
+    integrated_accounting.index = price_y.index
+
+    ledger = build_trade_ledger(integrated_accounting, integrated_positions)
+    reconciliation = reconcile_trade_ledger(
+        ledger,
+        integrated_accounting,
+        integrated_positions,
+    )
+    result = BacktestResult(
+        signals=signal_frame.copy(deep=True),
+        positions=integrated_positions.copy(deep=True),
+        accounting=integrated_accounting.copy(deep=True),
+        ledger=ledger.copy(deep=True),
+        reconciliation=reconciliation,
+        forced_liquidation_requested=force_liquidation,
+        forced_liquidation_applied=forced_applied,
+        execution_lag=lag,
+    )
+    validate_backtest_invariants(result)
+    return result

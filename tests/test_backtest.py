@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from typing import Any
 
 import numpy as np
@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from pairs_trading.backtest import (
+    BacktestResult,
     LedgerReconciliation,
     PairUnits,
     TradeRecord,
@@ -30,6 +31,8 @@ from pairs_trading.backtest import (
     force_liquidate_open_position,
     lag_trade_decisions,
     reconcile_trade_ledger,
+    run_pair_backtest,
+    validate_backtest_invariants,
 )
 
 
@@ -2924,3 +2927,483 @@ def test_future_rows_do_not_change_an_already_completed_trade_record() -> None:
         changed_ledger.iloc[0],
         check_names=False,
     )
+
+
+def _integrated_case(
+    *,
+    side: str = "LONG",
+    complete: bool = True,
+    force_liquidation: bool = False,
+    rebalance: bool = False,
+    index: pd.Index | None = None,
+    missing_price_row: int | None = None,
+) -> tuple[dict[str, Any], BacktestResult]:
+    """Run a compact deterministic end-to-end pair backtest."""
+    count = 6 if complete else 5
+    if index is None:
+        index = pd.RangeIndex(count, name="integrated_row")
+    price_y = pd.Series(
+        [100.0, 100.0, 101.0, 103.0, 105.0, 106.0][:count],
+        index=index,
+        name="Y",
+    )
+    price_x = pd.Series(
+        [50.0, 50.0, 49.0, 48.0, 47.0, 46.0][:count],
+        index=index,
+        name="X",
+    )
+    if missing_price_row is not None:
+        price_y.iat[missing_price_row] = np.nan
+    if side == "LONG":
+        z_values = [0.0, -2.5, -1.0, -0.2, 0.0, 0.0][:count]
+    else:
+        z_values = [0.0, 2.5, 1.0, 0.2, 0.0, 0.0][:count]
+    if not complete:
+        z_values = [0.0, -2.5, -1.0, -1.0, -1.0]
+    zscore = pd.Series(z_values, index=index, name="zscore")
+    if rebalance:
+        beta_values = [1.0, 1.0, 1.0, 2.0, 2.0, 2.0][:count]
+    else:
+        beta_values = [1.0] * count
+    beta = pd.Series(beta_values, index=index, name="beta")
+    borrow_rate_y = pd.Series(0.252, index=index, name="borrow_y")
+    borrow_rate_x = pd.Series(0.504, index=index, name="borrow_x")
+    inputs: dict[str, Any] = {
+        "price_y": price_y,
+        "price_x": price_x,
+        "zscore": zscore,
+        "hedge_ratio": beta,
+        "borrow_rate_y": borrow_rate_y,
+        "borrow_rate_x": borrow_rate_x,
+    }
+    result = run_pair_backtest(
+        price_y,
+        price_x,
+        beta,
+        2_000.0,
+        zscore=zscore,
+        initial_capital=10_000.0,
+        entry_z=2.0,
+        exit_z=0.5,
+        stop_z=3.5,
+        execution_lag=1,
+        commission_bps=10.0,
+        slippage_bps=5.0,
+        fixed_commission_per_leg=0.25,
+        borrow_rate_y=borrow_rate_y,
+        borrow_rate_x=borrow_rate_x,
+        financing_rate=0.126,
+        periods_per_year=252,
+        rebalance=rebalance,
+        rebalance_threshold=0.5,
+        force_liquidation=force_liquidation,
+    )
+    return inputs, result
+
+
+def test_integrated_long_trade_obeys_lag_pnl_and_cost_timing() -> None:
+    _, result = _integrated_case()
+
+    assert result.signals["event"].tolist() == [
+        "NONE",
+        "ENTER_LONG",
+        "NONE",
+        "EXIT_MEAN_REVERSION",
+        "NONE",
+        "NONE",
+    ]
+    assert result.positions["execution_event"].tolist() == [
+        "NONE",
+        "NONE",
+        "ENTER_LONG",
+        "NONE",
+        "EXIT_MEAN_REVERSION",
+        "NONE",
+    ]
+    assert result.accounting["gross_pnl"].iat[2] == 0.0
+    expected_exit_pnl = (
+        result.positions["units_y"].iat[3]
+        * (
+            result.accounting["price_y"].iat[4]
+            - result.accounting["price_y"].iat[3]
+        )
+        + result.positions["units_x"].iat[3]
+        * (
+            result.accounting["price_x"].iat[4]
+            - result.accounting["price_x"].iat[3]
+        )
+    )
+    assert result.accounting["gross_pnl"].iat[4] == pytest.approx(
+        expected_exit_pnl
+    )
+    assert np.flatnonzero(
+        result.accounting["transaction_cost"].to_numpy() > 0.0
+    ).tolist() == [2, 4]
+    assert result.accounting["borrow_cost_y"].eq(0.0).all()
+    assert result.accounting["borrow_cost_x"].iloc[[3, 4]].gt(0.0).all()
+    assert result.accounting["financing_cost"].iat[2] == 0.0
+    assert result.accounting["financing_cost"].iloc[[3, 4]].gt(0.0).all()
+    assert len(result.ledger) == 1
+    assert result.ledger.loc[0, "side"] == "LONG_SPREAD"
+    assert result.reconciliation.status == "RECONCILED"
+
+
+def test_integrated_short_trade_charges_only_short_y_borrow() -> None:
+    _, result = _integrated_case(side="SHORT")
+
+    assert result.positions["execution_event"].iat[2] == "ENTER_SHORT"
+    assert result.positions["execution_event"].iat[4] == "EXIT_MEAN_REVERSION"
+    assert result.accounting["borrow_cost_x"].eq(0.0).all()
+    assert result.accounting["borrow_cost_y"].iloc[[3, 4]].gt(0.0).all()
+    assert len(result.ledger) == 1
+    assert result.ledger.loc[0, "side"] == "SHORT_SPREAD"
+    assert result.reconciliation.status == "RECONCILED"
+
+
+def test_precomputed_signals_and_generated_signals_compose_identically() -> None:
+    inputs, generated = _integrated_case()
+
+    precomputed = run_pair_backtest(
+        inputs["price_y"],
+        inputs["price_x"],
+        inputs["hedge_ratio"],
+        2_000.0,
+        signals=generated.signals,
+        initial_capital=10_000.0,
+        execution_lag=1,
+        commission_bps=10.0,
+        slippage_bps=5.0,
+        fixed_commission_per_leg=0.25,
+        borrow_rate_y=inputs["borrow_rate_y"],
+        borrow_rate_x=inputs["borrow_rate_x"],
+        financing_rate=0.126,
+        periods_per_year=252,
+    )
+
+    pd.testing.assert_frame_equal(precomputed.signals, generated.signals)
+    pd.testing.assert_frame_equal(precomputed.positions, generated.positions)
+    pd.testing.assert_frame_equal(precomputed.accounting, generated.accounting)
+    pd.testing.assert_frame_equal(precomputed.ledger, generated.ledger)
+    assert precomputed.reconciliation == generated.reconciliation
+
+
+def test_integrated_rebalance_stays_in_trade_and_uses_existing_costs() -> None:
+    _, result = _integrated_case(rebalance=True)
+
+    assert result.positions["rebalance"].sum() == 1
+    rebalance_row = int(
+        np.flatnonzero(result.positions["rebalance"].to_numpy())[0]
+    )
+    assert rebalance_row == 3
+    assert result.positions["execution_event"].iat[rebalance_row] == "NONE"
+    assert result.positions["executed_state"].iat[rebalance_row] == "LONG_SPREAD"
+    assert result.accounting["transaction_cost"].iat[rebalance_row] > 0.0
+    assert len(result.ledger) == 1
+    assert result.ledger.loc[0, "transaction_cost"] == pytest.approx(
+        result.accounting["transaction_cost"].iloc[2:5].sum()
+    )
+
+
+def test_integrated_forced_liquidation_changes_only_final_row_and_equity() -> None:
+    _, open_result = _integrated_case(complete=False, force_liquidation=False)
+    _, forced_result = _integrated_case(complete=False, force_liquidation=True)
+
+    pd.testing.assert_frame_equal(
+        forced_result.positions.iloc[:-1],
+        open_result.positions.iloc[:-1],
+    )
+    pd.testing.assert_frame_equal(
+        forced_result.accounting.iloc[:-1],
+        open_result.accounting.iloc[:-1],
+    )
+    assert open_result.positions["executed_state"].iat[-1] == "LONG_SPREAD"
+    assert open_result.reconciliation.status == "OPEN_TRADE"
+    assert not open_result.forced_liquidation_applied
+    assert forced_result.positions["executed_state"].iat[-1] == "FLAT"
+    assert forced_result.positions["execution_event"].iat[-1] == "FORCED_EXIT"
+    assert forced_result.positions[["units_y", "units_x"]].iloc[-1].eq(0.0).all()
+    assert forced_result.forced_liquidation_applied
+    assert forced_result.accounting["gross_pnl"].iat[-1] == pytest.approx(
+        open_result.accounting["gross_pnl"].iat[-1]
+    )
+    closing_cost = forced_result.accounting["transaction_cost"].iat[-1]
+    assert closing_cost > 0.0
+    assert forced_result.accounting["net_equity_after_carry"].iat[-1] == pytest.approx(
+        open_result.accounting["net_equity_after_carry"].iat[-1] - closing_cost
+    )
+    assert forced_result.reconciliation.status == "RECONCILED"
+    assert bool(forced_result.ledger.loc[0, "forced_exit"])
+
+
+def test_integrated_missing_held_mark_reports_unknown_accounting() -> None:
+    _, result = _integrated_case(missing_price_row=3)
+
+    assert np.isnan(result.accounting["gross_pnl"].iat[3])
+    assert np.isnan(result.accounting["net_pnl_after_carry"].iat[3])
+    assert np.isnan(result.ledger.loc[0, "gross_pnl"])
+    assert np.isnan(result.ledger.loc[0, "net_pnl"])
+    assert result.reconciliation.status == "UNKNOWN_ACCOUNTING"
+
+
+def test_integrated_accounting_and_exposure_invariants_hold() -> None:
+    _, result = _integrated_case(rebalance=True)
+    accounting = result.accounting
+
+    np.testing.assert_allclose(
+        accounting["gross_pnl"],
+        accounting["pnl_y"] + accounting["pnl_x"],
+    )
+    np.testing.assert_allclose(
+        accounting["transaction_cost"],
+        accounting["commission_cost"] + accounting["slippage_cost"],
+    )
+    np.testing.assert_allclose(
+        accounting["carry_cost"],
+        accounting["borrow_cost"] + accounting["financing_cost"],
+    )
+    np.testing.assert_allclose(
+        accounting["net_pnl_after_carry"],
+        accounting["gross_pnl"]
+        - accounting["transaction_cost"]
+        - accounting["carry_cost"],
+    )
+    assert accounting["cumulative_transaction_cost"].diff().dropna().ge(0.0).all()
+    assert accounting["cumulative_carry_cost"].diff().dropna().ge(0.0).all()
+    flat = result.positions["executed_state"].eq("FLAT")
+    assert result.positions.loc[flat, ["units_y", "units_x"]].eq(0.0).all().all()
+    assert accounting[
+        ["gross_exposure", "long_exposure", "short_exposure"]
+    ].dropna().ge(0.0).all().all()
+    validate_backtest_invariants(result)
+
+
+@pytest.mark.parametrize(
+    "column",
+    ["gross_pnl", "transaction_cost", "carry_cost", "net_pnl_after_carry"],
+)
+def test_invariant_validator_rejects_corrupted_accounting_identity(
+    column: str,
+) -> None:
+    _, result = _integrated_case()
+    corrupted = result.accounting.copy(deep=True)
+    corrupted.iat[3, corrupted.columns.get_loc(column)] += 1.0
+
+    with pytest.raises(ValueError, match="invariant failed"):
+        validate_backtest_invariants(replace(result, accounting=corrupted))
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["decreasing_cost", "negative_exposure", "flat_units", "ledger_net"],
+)
+def test_invariant_validator_rejects_state_cost_and_ledger_corruption(
+    corruption: str,
+) -> None:
+    _, result = _integrated_case()
+    changed = result
+    if corruption == "decreasing_cost":
+        accounting = result.accounting.copy(deep=True)
+        accounting.iat[
+            4, accounting.columns.get_loc("cumulative_transaction_cost")
+        ] = -1.0
+        changed = replace(result, accounting=accounting)
+    elif corruption == "negative_exposure":
+        accounting = result.accounting.copy(deep=True)
+        accounting.iat[2, accounting.columns.get_loc("gross_exposure")] = -1.0
+        changed = replace(result, accounting=accounting)
+    elif corruption == "flat_units":
+        positions = result.positions.copy(deep=True)
+        positions.iat[0, positions.columns.get_loc("units_y")] = 1.0
+        changed = replace(result, positions=positions)
+    else:
+        ledger = result.ledger.copy(deep=True)
+        ledger.iat[0, ledger.columns.get_loc("net_pnl")] += 1.0
+        changed = replace(result, ledger=ledger)
+
+    with pytest.raises(ValueError, match="invariant|first position-schedule"):
+        validate_backtest_invariants(changed)
+
+
+@pytest.mark.parametrize("future_change", ["prices", "zscore", "beta", "rates"])
+def test_integrated_outputs_are_invariant_to_strictly_future_changes(
+    future_change: str,
+) -> None:
+    index = pd.RangeIndex(8, name="causal_row")
+    price_y = pd.Series(
+        [100.0, 100.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0],
+        index=index,
+    )
+    price_x = pd.Series(
+        [50.0, 50.0, 49.0, 48.0, 47.0, 46.0, 45.0, 44.0],
+        index=index,
+    )
+    zscore = pd.Series([-2.5, -1.0, -0.2, 0.0, 0.0, 0.0, 0.0, 0.0], index=index)
+    beta = pd.Series(1.0, index=index)
+    borrow_y = pd.Series(0.2, index=index)
+    borrow_x = pd.Series(0.3, index=index)
+    changed_y = price_y.copy(deep=True)
+    changed_x = price_x.copy(deep=True)
+    changed_z = zscore.copy(deep=True)
+    changed_beta = beta.copy(deep=True)
+    changed_borrow_y = borrow_y.copy(deep=True)
+    changed_borrow_x = borrow_x.copy(deep=True)
+    cutoff = 3
+    if future_change == "prices":
+        changed_y.iloc[cutoff + 1 :] *= 10.0
+        changed_x.iloc[cutoff + 1 :] *= 0.1
+    elif future_change == "zscore":
+        changed_z.iloc[cutoff + 1 :] = [2.5, 1.0, 0.2, 0.0]
+    elif future_change == "beta":
+        changed_beta.iloc[cutoff + 1 :] = 5.0
+    else:
+        changed_borrow_y.iloc[cutoff + 1 :] = 4.0
+        changed_borrow_x.iloc[cutoff + 1 :] = 6.0
+
+    common = {
+        "target_gross_notional": 2_000.0,
+        "initial_capital": 10_000.0,
+        "commission_bps": 5.0,
+        "slippage_bps": 2.0,
+        "financing_rate": 0.05,
+        "rebalance": True,
+        "rebalance_threshold": 0.5,
+    }
+    original = run_pair_backtest(
+        price_y,
+        price_x,
+        beta,
+        zscore=zscore,
+        borrow_rate_y=borrow_y,
+        borrow_rate_x=borrow_x,
+        **common,
+    )
+    changed = run_pair_backtest(
+        changed_y,
+        changed_x,
+        changed_beta,
+        zscore=changed_z,
+        borrow_rate_y=changed_borrow_y,
+        borrow_rate_x=changed_borrow_x,
+        **common,
+    )
+
+    pd.testing.assert_frame_equal(
+        original.signals.iloc[: cutoff + 1],
+        changed.signals.iloc[: cutoff + 1],
+    )
+    pd.testing.assert_frame_equal(
+        original.positions.iloc[: cutoff + 1],
+        changed.positions.iloc[: cutoff + 1],
+    )
+    pd.testing.assert_frame_equal(
+        original.accounting.iloc[: cutoff + 1],
+        changed.accounting.iloc[: cutoff + 1],
+    )
+    completed_original = original.ledger.loc[original.ledger["exit_row"] <= cutoff]
+    completed_changed = changed.ledger.loc[changed.ledger["exit_row"] <= cutoff]
+    pd.testing.assert_frame_equal(
+        completed_original.reset_index(drop=True),
+        completed_changed.reset_index(drop=True),
+    )
+
+
+def test_integrated_runs_are_deterministic_defensive_and_input_immutable() -> None:
+    inputs, first = _integrated_case(rebalance=True)
+    before = {
+        name: value.copy(deep=True)
+        for name, value in inputs.items()
+        if isinstance(value, (pd.Series, pd.DataFrame))
+    }
+    second = run_pair_backtest(
+        inputs["price_y"],
+        inputs["price_x"],
+        inputs["hedge_ratio"],
+        2_000.0,
+        zscore=inputs["zscore"],
+        initial_capital=10_000.0,
+        commission_bps=10.0,
+        slippage_bps=5.0,
+        fixed_commission_per_leg=0.25,
+        borrow_rate_y=inputs["borrow_rate_y"],
+        borrow_rate_x=inputs["borrow_rate_x"],
+        financing_rate=0.126,
+        periods_per_year=252,
+        rebalance=True,
+        rebalance_threshold=0.5,
+    )
+
+    pd.testing.assert_frame_equal(first.signals, second.signals)
+    pd.testing.assert_frame_equal(first.positions, second.positions)
+    pd.testing.assert_frame_equal(first.accounting, second.accounting)
+    pd.testing.assert_frame_equal(first.ledger, second.ledger)
+    assert first.reconciliation == second.reconciliation
+    for name, expected in before.items():
+        pd.testing.assert_series_equal(inputs[name], expected)
+
+    first.positions.iat[0, first.positions.columns.get_loc("units_y")] = 99.0
+    assert second.positions["units_y"].iat[0] == 0.0
+    with pytest.raises(FrozenInstanceError):
+        first.execution_lag = 2  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "invalid_mode",
+    ["both_sources", "neither_source", "malformed_signals", "misaligned_beta", "duplicate_index"],
+)
+def test_integrated_input_contract_rejects_invalid_sources_and_indices(
+    invalid_mode: str,
+) -> None:
+    index = pd.RangeIndex(5)
+    price_y = pd.Series(100.0, index=index)
+    price_x = pd.Series(50.0, index=index)
+    zscore = pd.Series([0.0, -2.5, -1.0, -0.2, 0.0], index=index)
+    beta = pd.Series(1.0, index=index)
+    kwargs: dict[str, Any] = {"zscore": zscore}
+    if invalid_mode == "both_sources":
+        kwargs["signals"] = _signals_from_events(["NONE"] * 5, index)
+    elif invalid_mode == "neither_source":
+        kwargs = {}
+    elif invalid_mode == "malformed_signals":
+        kwargs = {"signals": pd.DataFrame({"event": ["NONE"] * 5}, index=index)}
+    elif invalid_mode == "misaligned_beta":
+        beta = beta.iloc[::-1]
+    else:
+        duplicate = pd.Index([0, 0, 1, 2, 3])
+        price_y.index = duplicate
+        price_x.index = duplicate
+        zscore.index = duplicate
+        beta.index = duplicate
+
+    with pytest.raises((TypeError, ValueError), match="Exactly one|missing|index|unique"):
+        run_pair_backtest(
+            price_y,
+            price_x,
+            beta,
+            2_000.0,
+            **kwargs,
+        )
+
+
+@pytest.mark.parametrize(
+    "index",
+    [
+        pd.Index(["z", "a", "m", "b", "q", "x"], name="integrated_order"),
+        pd.date_range(
+            "2026-10-25",
+            periods=6,
+            freq="h",
+            tz="Europe/London",
+            name="integrated_time",
+        ),
+    ],
+)
+def test_integrated_output_preserves_arbitrary_index_and_timezone(
+    index: pd.Index,
+) -> None:
+    _, result = _integrated_case(index=index)
+
+    pd.testing.assert_index_equal(result.signals.index, index, exact=True)
+    pd.testing.assert_index_equal(result.positions.index, index, exact=True)
+    pd.testing.assert_index_equal(result.accounting.index, index, exact=True)
+    assert result.ledger.loc[0, "entry_index"] == index[2]
+    assert result.ledger.loc[0, "exit_index"] == index[4]

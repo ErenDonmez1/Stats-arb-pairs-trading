@@ -1,9 +1,9 @@
-"""Causal execution scheduling and gross-normalized pair unit sizing.
+"""Causal pair execution, unit sizing, and marked-to-market accounting.
 
-This milestone deliberately stops before portfolio accounting.  It converts
-state-changing signal decisions into lagged executions, sizes the two legs on
-the actual execution row, and carries raw units forward without calculating
-P&L, returns, costs, or a trade ledger.
+The module converts state-changing decisions into lagged executions, sizes the
+two legs on the actual execution row, and accounts for exposure and gross P&L.
+Transaction costs, financing, trade ledgers, and performance metrics remain
+outside this milestone.
 """
 
 from __future__ import annotations
@@ -23,6 +23,9 @@ __all__ = [
     "lag_trade_decisions",
     "calculate_pair_units",
     "build_position_schedule",
+    "calculate_position_pnl",
+    "calculate_strategy_returns",
+    "build_pnl_schedule",
 ]
 
 
@@ -47,6 +50,28 @@ _EXIT_EVENTS = {
     TradeEvent.EXIT_STOP.value,
     TradeEvent.EXIT_TIME.value,
 }
+
+_PNL_OUTPUT_COLUMNS = (
+    "price_y",
+    "price_x",
+    "units_y",
+    "units_x",
+    "market_value_y",
+    "market_value_x",
+    "gross_exposure",
+    "net_exposure",
+    "long_exposure",
+    "short_exposure",
+    "pnl_y",
+    "pnl_x",
+    "gross_pnl",
+    "realised_pnl",
+    "unrealised_pnl",
+    "cumulative_realised_pnl",
+    "cumulative_gross_pnl",
+    "portfolio_equity",
+    "strategy_return",
+)
 
 
 class PairUnits(NamedTuple):
@@ -482,3 +507,506 @@ def build_position_schedule(
     ):
         result[column] = result[column].astype(object)
     return result.loc[:, list(_OUTPUT_COLUMNS)]
+
+
+def _validated_position_schedule(schedule: pd.DataFrame) -> pd.DataFrame:
+    """Copy and validate the state and unit contract from Milestone 6A."""
+    if not isinstance(schedule, pd.DataFrame):
+        raise TypeError("position_schedule must be a pandas DataFrame.")
+    if not schedule.index.is_unique:
+        raise ValueError("position_schedule must have a unique index.")
+
+    required = {"executed_state", "execution_event", "units_y", "units_x"}
+    missing = required.difference(schedule.columns)
+    if missing:
+        raise ValueError(
+            "position_schedule is missing required columns: "
+            f"{sorted(missing)}."
+        )
+
+    states = [
+        _normalise_state(value, name="position_schedule['executed_state']")
+        for value in schedule["executed_state"]
+    ]
+    events = [_normalise_event(value) for value in schedule["execution_event"]]
+    units_y = _validated_market_series(
+        schedule["units_y"],
+        "position_schedule['units_y']",
+        strictly_positive=False,
+    )
+    units_x = _validated_market_series(
+        schedule["units_x"],
+        "position_schedule['units_x']",
+        strictly_positive=False,
+    )
+    if units_y.isna().any() or units_x.isna().any():
+        raise ValueError("Position units must not contain missing values.")
+
+    previous_state = PositionState.FLAT.name
+    previous_y = 0.0
+    previous_x = 0.0
+    for row_number, (state, event, current_y, current_x) in enumerate(
+        zip(states, events, units_y, units_x, strict=True)
+    ):
+        if row_number == 0 and (
+            state != PositionState.FLAT.name
+            or event != TradeEvent.NONE.value
+            or current_y != 0.0
+            or current_x != 0.0
+        ):
+            raise ValueError(
+                "The first position-schedule row must be an unexecuted flat "
+                "position."
+            )
+
+        if state == PositionState.FLAT.name:
+            if current_y != 0.0 or current_x != 0.0:
+                raise ValueError(
+                    f"Flat position has nonzero units at row position {row_number}."
+                )
+        elif state == PositionState.LONG_SPREAD.name:
+            if current_y <= 0.0 or current_x >= 0.0:
+                raise ValueError(
+                    f"Long-spread units have invalid signs at row position {row_number}."
+                )
+        elif current_y >= 0.0 or current_x <= 0.0:
+            raise ValueError(
+                f"Short-spread units have invalid signs at row position {row_number}."
+            )
+
+        if event == TradeEvent.NONE.value:
+            if (
+                state != previous_state
+                or current_y != previous_y
+                or current_x != previous_x
+            ):
+                raise ValueError(
+                    "Position state or units changed without an execution event "
+                    f"at row position {row_number}."
+                )
+        elif event == TradeEvent.ENTER_LONG.value:
+            if (
+                previous_state != PositionState.FLAT.name
+                or state != PositionState.LONG_SPREAD.name
+            ):
+                raise ValueError(
+                    f"Invalid executed long entry at row position {row_number}."
+                )
+        elif event == TradeEvent.ENTER_SHORT.value:
+            if (
+                previous_state != PositionState.FLAT.name
+                or state != PositionState.SHORT_SPREAD.name
+            ):
+                raise ValueError(
+                    f"Invalid executed short entry at row position {row_number}."
+                )
+        elif event in _EXIT_EVENTS:
+            if (
+                previous_state == PositionState.FLAT.name
+                or state != PositionState.FLAT.name
+            ):
+                raise ValueError(
+                    f"Invalid executed exit at row position {row_number}."
+                )
+
+        previous_state = state
+        previous_y = float(current_y)
+        previous_x = float(current_x)
+
+    result = pd.DataFrame(
+        {
+            "executed_state": pd.Series(states, index=schedule.index, dtype=object),
+            "execution_event": pd.Series(events, index=schedule.index, dtype=object),
+            "units_y": units_y,
+            "units_x": units_x,
+        }
+    )
+    result.index = schedule.index
+    return result
+
+
+def _causal_cumulative(values: np.ndarray, name: str) -> np.ndarray:
+    """Cumulatively sum until an unknown observation makes the total unknown."""
+    cumulative = np.empty(len(values), dtype=float)
+    running_total = 0.0
+    total_is_known = True
+    for row_number, value in enumerate(values):
+        if np.isnan(value):
+            total_is_known = False
+            cumulative[row_number] = np.nan
+            continue
+        if not total_is_known:
+            cumulative[row_number] = np.nan
+            continue
+        with np.errstate(over="ignore", invalid="ignore"):
+            running_total += value
+        if not np.isfinite(running_total):
+            raise ValueError(f"{name} overflowed at row position {row_number}.")
+        cumulative[row_number] = running_total
+    return cumulative
+
+
+def _calculate_exposures(
+    schedule: pd.DataFrame,
+    price_y: pd.Series,
+    price_x: pd.Series,
+) -> pd.DataFrame:
+    """Mark current post-execution units to current prices."""
+    states = schedule["executed_state"].to_numpy(dtype=object)
+    units_y = schedule["units_y"].to_numpy(dtype=float)
+    units_x = schedule["units_x"].to_numpy(dtype=float)
+    y_values = price_y.to_numpy(dtype=float)
+    x_values = price_x.to_numpy(dtype=float)
+    rows: list[tuple[float, ...]] = []
+
+    for row_number, (state, unit_y, unit_x, mark_y, mark_x) in enumerate(
+        zip(states, units_y, units_x, y_values, x_values, strict=True)
+    ):
+        if state == PositionState.FLAT.name:
+            rows.append((0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+            continue
+
+        with np.errstate(over="ignore", invalid="ignore"):
+            market_value_y = unit_y * mark_y if np.isfinite(mark_y) else np.nan
+            market_value_x = unit_x * mark_x if np.isfinite(mark_x) else np.nan
+        finite_values = np.array([market_value_y, market_value_x], dtype=float)
+        if np.isinf(finite_values).any():
+            raise ValueError(
+                "Market value overflowed at row position "
+                f"{row_number}."
+            )
+        if np.isnan(finite_values).any():
+            rows.append(
+                (
+                    float(market_value_y),
+                    float(market_value_x),
+                    np.nan,
+                    np.nan,
+                    np.nan,
+                    np.nan,
+                )
+            )
+            continue
+
+        with np.errstate(over="ignore", invalid="ignore"):
+            gross_exposure = abs(market_value_y) + abs(market_value_x)
+            net_exposure = market_value_y + market_value_x
+            long_exposure = max(market_value_y, 0.0) + max(market_value_x, 0.0)
+            short_exposure = abs(min(market_value_y, 0.0)) + abs(
+                min(market_value_x, 0.0)
+            )
+        aggregate = np.array(
+            [gross_exposure, net_exposure, long_exposure, short_exposure],
+            dtype=float,
+        )
+        if not np.isfinite(aggregate).all():
+            raise ValueError(
+                "Exposure accounting overflowed at row position "
+                f"{row_number}."
+            )
+        rows.append(
+            (
+                float(market_value_y),
+                float(market_value_x),
+                float(gross_exposure),
+                float(net_exposure),
+                float(long_exposure),
+                float(short_exposure),
+            )
+        )
+
+    result = pd.DataFrame.from_records(
+        rows,
+        columns=[
+            "market_value_y",
+            "market_value_x",
+            "gross_exposure",
+            "net_exposure",
+            "long_exposure",
+            "short_exposure",
+        ],
+    )
+    result.index = schedule.index
+    return result.astype("float64")
+
+
+def _interval_leg_pnl(
+    prior_units: float,
+    prior_price: float,
+    current_price: float,
+    *,
+    leg: str,
+    row_number: int,
+) -> float:
+    """Calculate one leg's interval P&L under the explicit missing-mark policy."""
+    if prior_units == 0.0:
+        return 0.0
+    if np.isnan(prior_price) or np.isnan(current_price):
+        return np.nan
+    with np.errstate(over="ignore", invalid="ignore"):
+        result = prior_units * (current_price - prior_price)
+    if not np.isfinite(result):
+        raise ValueError(f"{leg} P&L overflowed at row position {row_number}.")
+    return float(result)
+
+
+def _decompose_realised_pnl(
+    states: np.ndarray,
+    gross_pnl: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Split gross P&L into open-trade unrealised and close-row realised P&L."""
+    realised = np.zeros(len(gross_pnl), dtype=float)
+    unrealised = np.zeros(len(gross_pnl), dtype=float)
+    cumulative_realised = np.zeros(len(gross_pnl), dtype=float)
+    previous_state = PositionState.FLAT.name
+    open_trade_pnl = 0.0
+    running_realised = 0.0
+    realised_total_is_known = True
+
+    for row_number, (state, interval_pnl) in enumerate(
+        zip(states, gross_pnl, strict=True)
+    ):
+        if previous_state == PositionState.FLAT.name:
+            if state != PositionState.FLAT.name:
+                open_trade_pnl = 0.0
+        elif state == previous_state:
+            if np.isnan(open_trade_pnl) or np.isnan(interval_pnl):
+                open_trade_pnl = np.nan
+            else:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    open_trade_pnl += interval_pnl
+                if not np.isfinite(open_trade_pnl):
+                    raise ValueError(
+                        "Unrealised P&L overflowed at row position "
+                        f"{row_number}."
+                    )
+        elif state == PositionState.FLAT.name:
+            if np.isnan(open_trade_pnl) or np.isnan(interval_pnl):
+                terminal_trade_pnl = np.nan
+            else:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    terminal_trade_pnl = open_trade_pnl + interval_pnl
+                if not np.isfinite(terminal_trade_pnl):
+                    raise ValueError(
+                        "Realised P&L overflowed at row position "
+                        f"{row_number}."
+                    )
+            realised[row_number] = terminal_trade_pnl
+            if np.isnan(terminal_trade_pnl):
+                realised_total_is_known = False
+            elif realised_total_is_known:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    running_realised += terminal_trade_pnl
+                if not np.isfinite(running_realised):
+                    raise ValueError(
+                        "Cumulative realised P&L overflowed at row position "
+                        f"{row_number}."
+                    )
+            open_trade_pnl = 0.0
+        else:  # The validated schedule cannot reverse directly.
+            raise RuntimeError("Position direction changed without a flat row.")
+
+        unrealised[row_number] = (
+            open_trade_pnl if state != PositionState.FLAT.name else 0.0
+        )
+        cumulative_realised[row_number] = (
+            running_realised if realised_total_is_known else np.nan
+        )
+        previous_state = state
+
+    return realised, unrealised, cumulative_realised
+
+
+def calculate_position_pnl(
+    position_schedule: pd.DataFrame,
+    price_y: pd.Series,
+    price_x: pd.Series,
+) -> pd.DataFrame:
+    """Calculate causal per-leg, gross, realised, and unrealised pair P&L.
+
+    Row ``t`` uses units effective at ``t-1`` against the price change from
+    ``t-1`` to ``t``.  Consequently an entry earns no pre-fill interval P&L,
+    while an exit row includes the final interval earned by the position held
+    before that exit.  The first row is zero because it has no prior interval.
+
+    If a nonzero prior holding lacks either required mark, that leg and gross
+    interval P&L are missing.  Row-level P&L resumes when both endpoint marks
+    are again available, but cumulative P&L remains unknown after any missing
+    held interval because the omitted wealth change cannot be reconstructed.
+    """
+    schedule = _validated_position_schedule(position_schedule)
+    y_values = _validated_market_series(price_y, "price_y", strictly_positive=True)
+    x_values = _validated_market_series(price_x, "price_x", strictly_positive=True)
+    _require_matching_index(schedule.index, price_y.index, "price_y")
+    _require_matching_index(schedule.index, price_x.index, "price_x")
+
+    y_array = y_values.to_numpy(dtype=float)
+    x_array = x_values.to_numpy(dtype=float)
+    units_y = schedule["units_y"].to_numpy(dtype=float)
+    units_x = schedule["units_x"].to_numpy(dtype=float)
+    pnl_y = np.zeros(len(schedule), dtype=float)
+    pnl_x = np.zeros(len(schedule), dtype=float)
+    gross_pnl = np.zeros(len(schedule), dtype=float)
+
+    for row_number in range(1, len(schedule)):
+        pnl_y[row_number] = _interval_leg_pnl(
+            units_y[row_number - 1],
+            y_array[row_number - 1],
+            y_array[row_number],
+            leg="symbol_y",
+            row_number=row_number,
+        )
+        pnl_x[row_number] = _interval_leg_pnl(
+            units_x[row_number - 1],
+            x_array[row_number - 1],
+            x_array[row_number],
+            leg="symbol_x",
+            row_number=row_number,
+        )
+        if np.isnan(pnl_y[row_number]) or np.isnan(pnl_x[row_number]):
+            gross_pnl[row_number] = np.nan
+        else:
+            with np.errstate(over="ignore", invalid="ignore"):
+                gross_pnl[row_number] = pnl_y[row_number] + pnl_x[row_number]
+            if not np.isfinite(gross_pnl[row_number]):
+                raise ValueError(
+                    f"Gross P&L overflowed at row position {row_number}."
+                )
+
+    states = schedule["executed_state"].to_numpy(dtype=object)
+    realised, unrealised, cumulative_realised = _decompose_realised_pnl(
+        states,
+        gross_pnl,
+    )
+    cumulative_gross = _causal_cumulative(gross_pnl, "Cumulative gross P&L")
+    result = pd.DataFrame(
+        {
+            "pnl_y": pnl_y,
+            "pnl_x": pnl_x,
+            "gross_pnl": gross_pnl,
+            "realised_pnl": realised,
+            "unrealised_pnl": unrealised,
+            "cumulative_realised_pnl": cumulative_realised,
+            "cumulative_gross_pnl": cumulative_gross,
+        },
+        index=schedule.index,
+    )
+    result.index = position_schedule.index
+    return result.astype("float64")
+
+
+def calculate_strategy_returns(
+    gross_pnl: pd.Series,
+    initial_capital: float = 1_000_000.0,
+) -> pd.DataFrame:
+    """Calculate cumulative gross P&L, equity, and prior-equity returns.
+
+    The first gross P&L observation must be zero and its return is defined as
+    zero.  Later returns divide by prior-row equity.  A finite non-positive
+    prior equity raises an error rather than permitting division by zero or a
+    misleading return.  Missing interval P&L makes cumulative equity and all
+    later returns unknown.
+    """
+    capital = _finite_positive_scalar(initial_capital, "initial_capital")
+    values = _validated_market_series(
+        gross_pnl,
+        "gross_pnl",
+        strictly_positive=False,
+    )
+    if len(values) and (np.isnan(values.iat[0]) or values.iat[0] != 0.0):
+        raise ValueError("The first gross_pnl observation must be zero.")
+
+    pnl_array = values.to_numpy(dtype=float)
+    cumulative = _causal_cumulative(pnl_array, "Cumulative gross P&L")
+    equity = np.full(len(values), np.nan, dtype=float)
+    returns = np.full(len(values), np.nan, dtype=float)
+
+    for row_number, cumulative_pnl in enumerate(cumulative):
+        if np.isnan(cumulative_pnl):
+            continue
+        with np.errstate(over="ignore", invalid="ignore"):
+            equity[row_number] = capital + cumulative_pnl
+        if not np.isfinite(equity[row_number]):
+            raise ValueError(
+                f"Portfolio equity overflowed at row position {row_number}."
+            )
+
+    if len(values):
+        returns[0] = 0.0
+    for row_number in range(1, len(values)):
+        prior_equity = equity[row_number - 1]
+        if np.isnan(prior_equity):
+            returns[row_number] = np.nan
+            continue
+        if prior_equity <= 0.0:
+            raise ValueError(
+                "Prior portfolio equity must be positive to calculate a return; "
+                f"row position {row_number} has prior equity {prior_equity}."
+            )
+        if np.isnan(pnl_array[row_number]):
+            returns[row_number] = np.nan
+            continue
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            returns[row_number] = pnl_array[row_number] / prior_equity
+        if not np.isfinite(returns[row_number]):
+            raise ValueError(
+                f"Strategy return is non-finite at row position {row_number}."
+            )
+
+    result = pd.DataFrame(
+        {
+            "cumulative_gross_pnl": cumulative,
+            "portfolio_equity": equity,
+            "strategy_return": returns,
+        },
+        index=values.index,
+    )
+    result.index = gross_pnl.index
+    return result.astype("float64")
+
+
+def build_pnl_schedule(
+    position_schedule: pd.DataFrame,
+    price_y: pd.Series,
+    price_x: pd.Series,
+    initial_capital: float = 1_000_000.0,
+) -> pd.DataFrame:
+    """Build the complete gross marked-to-market accounting schedule.
+
+    Exposures use current post-execution units and marks.  Interval P&L uses
+    prior-row units, so executions never earn a price move that occurred before
+    the fill.  No transaction, borrow, financing, or other costs are applied.
+    """
+    schedule = _validated_position_schedule(position_schedule)
+    y_values = _validated_market_series(price_y, "price_y", strictly_positive=True)
+    x_values = _validated_market_series(price_x, "price_x", strictly_positive=True)
+    _require_matching_index(schedule.index, price_y.index, "price_y")
+    _require_matching_index(schedule.index, price_x.index, "price_x")
+    capital = _finite_positive_scalar(initial_capital, "initial_capital")
+
+    exposures = _calculate_exposures(schedule, y_values, x_values)
+    pnl = calculate_position_pnl(schedule, y_values, x_values)
+    returns = calculate_strategy_returns(pnl["gross_pnl"], capital)
+    result = pd.concat(
+        [
+            y_values.rename("price_y"),
+            x_values.rename("price_x"),
+            schedule[["units_y", "units_x"]],
+            exposures,
+            pnl[
+                [
+                    "pnl_y",
+                    "pnl_x",
+                    "gross_pnl",
+                    "realised_pnl",
+                    "unrealised_pnl",
+                    "cumulative_realised_pnl",
+                ]
+            ],
+            returns,
+        ],
+        axis=1,
+        copy=False,
+    )
+    result.index = position_schedule.index
+    return result.loc[:, list(_PNL_OUTPUT_COLUMNS)]

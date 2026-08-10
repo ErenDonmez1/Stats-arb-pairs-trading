@@ -10,11 +10,14 @@ import pytest
 
 from pairs_trading.backtest import (
     PairUnits,
+    apply_execution_costs,
+    build_net_pnl_schedule,
     build_pnl_schedule,
     build_position_schedule,
     calculate_pair_units,
     calculate_position_pnl,
     calculate_strategy_returns,
+    calculate_transaction_costs,
     lag_trade_decisions,
 )
 
@@ -1139,3 +1142,519 @@ def test_public_pnl_and_return_functions_match_composed_schedule() -> None:
         returns,
         combined[returns.columns],
     )
+
+
+def _flat_price_round_trip(
+    *,
+    entry_event: str = "ENTER_LONG",
+    commission_bps: float = 10.0,
+    slippage_bps: float = 5.0,
+    fixed_commission_per_leg: float = 2.0,
+    index: pd.Index | None = None,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.DataFrame]:
+    """Return a constant-price round trip with transparent execution costs."""
+    events = [entry_event, "NONE", "EXIT_TIME", "NONE"]
+    if index is None:
+        index = pd.RangeIndex(4, name="row")
+    price_y = pd.Series(100.0, index=index, name="Y")
+    price_x = pd.Series(50.0, index=index, name="X")
+    schedule = build_position_schedule(
+        price_y,
+        price_x,
+        _signals_from_events(events, index),
+        hedge_ratio=1.0,
+        target_gross_notional=2_000.0,
+    )
+    result = build_net_pnl_schedule(
+        schedule,
+        price_y,
+        price_x,
+        initial_capital=10_000.0,
+        commission_bps=commission_bps,
+        slippage_bps=slippage_bps,
+        fixed_commission_per_leg=fixed_commission_per_leg,
+    )
+    return schedule, price_y, price_x, result
+
+
+def test_build_net_pnl_schedule_returns_required_schema() -> None:
+    _, _, _, result = _flat_price_round_trip()
+
+    assert result.columns.tolist() == [
+        "price_y",
+        "price_x",
+        "units_y",
+        "units_x",
+        "delta_units_y",
+        "delta_units_x",
+        "traded_notional_y",
+        "traded_notional_x",
+        "commission_y",
+        "commission_x",
+        "fixed_commission_y",
+        "fixed_commission_x",
+        "commission_cost",
+        "slippage_y",
+        "slippage_x",
+        "slippage_cost",
+        "transaction_cost",
+        "cumulative_transaction_cost",
+        "gross_pnl",
+        "net_pnl",
+        "cumulative_gross_pnl",
+        "cumulative_net_pnl",
+        "portfolio_equity",
+        "net_portfolio_equity",
+        "strategy_return",
+        "net_strategy_return",
+    ]
+    assert not any(
+        name in result.columns
+        for name in ("borrow_fee", "financing_cost", "margin_call", "trade_id")
+    )
+
+
+def test_zero_cost_parameters_reproduce_gross_pnl_equity_and_returns() -> None:
+    schedule, price_y, price_x, gross = _accounting_case()
+
+    result = build_net_pnl_schedule(
+        schedule,
+        price_y,
+        price_x,
+        initial_capital=10_000.0,
+    )
+
+    assert result["transaction_cost"].eq(0.0).all()
+    pd.testing.assert_series_equal(
+        result["net_pnl"].rename("gross_pnl"),
+        gross["gross_pnl"],
+    )
+    pd.testing.assert_series_equal(
+        result["net_portfolio_equity"].rename("portfolio_equity"),
+        gross["portfolio_equity"],
+    )
+    pd.testing.assert_series_equal(
+        result["net_strategy_return"].rename("strategy_return"),
+        gross["strategy_return"],
+    )
+
+
+def test_costs_occur_only_on_actual_unit_changes_not_decision_rows() -> None:
+    schedule, _, _, result = _flat_price_round_trip()
+
+    assert schedule.loc[0, "decision_event"] == "ENTER_LONG"
+    assert schedule.loc[0, "execution_event"] == "NONE"
+    assert result["transaction_cost"].tolist() == pytest.approx(
+        [0.0, 7.0, 0.0, 7.0]
+    )
+    assert result.loc[2, ["delta_units_y", "delta_units_x"]].tolist() == [
+        0.0,
+        0.0,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("entry_event", "expected_delta_y", "expected_delta_x"),
+    [("ENTER_LONG", 10.0, -20.0), ("ENTER_SHORT", -10.0, 20.0)],
+)
+def test_long_and_short_entries_pay_commission_on_both_absolute_traded_legs(
+    entry_event: str,
+    expected_delta_y: float,
+    expected_delta_x: float,
+) -> None:
+    _, _, _, result = _flat_price_round_trip(
+        entry_event=entry_event,
+        slippage_bps=0.0,
+        fixed_commission_per_leg=0.0,
+    )
+    entry = result.loc[1]
+
+    assert entry["delta_units_y"] == pytest.approx(expected_delta_y)
+    assert entry["delta_units_x"] == pytest.approx(expected_delta_x)
+    assert entry["traded_notional_y"] == pytest.approx(1_000.0)
+    assert entry["traded_notional_x"] == pytest.approx(1_000.0)
+    assert entry["commission_y"] == pytest.approx(1.0)
+    assert entry["commission_x"] == pytest.approx(1.0)
+
+
+def test_exit_pays_commission_and_fixed_fee_once_per_closing_leg() -> None:
+    _, _, _, result = _flat_price_round_trip(slippage_bps=0.0)
+    exit_row = result.loc[3]
+
+    assert exit_row["delta_units_y"] == pytest.approx(-10.0)
+    assert exit_row["delta_units_x"] == pytest.approx(20.0)
+    assert exit_row["commission_y"] == pytest.approx(1.0)
+    assert exit_row["commission_x"] == pytest.approx(1.0)
+    assert exit_row["fixed_commission_y"] == pytest.approx(2.0)
+    assert exit_row["fixed_commission_x"] == pytest.approx(2.0)
+    assert exit_row["commission_cost"] == pytest.approx(6.0)
+
+
+def test_unchanged_legs_pay_no_variable_or_fixed_commission() -> None:
+    _, _, _, result = _flat_price_round_trip()
+    unchanged = result.loc[2]
+
+    assert unchanged[
+        [
+            "traded_notional_y",
+            "traded_notional_x",
+            "commission_y",
+            "commission_x",
+            "fixed_commission_y",
+            "fixed_commission_x",
+            "transaction_cost",
+        ]
+    ].eq(0.0).all()
+
+
+def test_bps_commission_and_slippage_use_absolute_traded_notional() -> None:
+    _, _, _, result = _flat_price_round_trip(
+        commission_bps=10.0,
+        slippage_bps=5.0,
+        fixed_commission_per_leg=0.0,
+    )
+
+    for row_number in (1, 3):
+        row = result.loc[row_number]
+        assert row["commission_y"] == pytest.approx(1.0)
+        assert row["commission_x"] == pytest.approx(1.0)
+        assert row["slippage_y"] == pytest.approx(0.5)
+        assert row["slippage_x"] == pytest.approx(0.5)
+        assert row["slippage_cost"] == pytest.approx(1.0)
+        assert row["transaction_cost"] == pytest.approx(3.0)
+
+
+def test_slippage_is_adverse_for_buys_and_sells_on_open_and_close() -> None:
+    _, _, _, result = _flat_price_round_trip(
+        commission_bps=0.0,
+        slippage_bps=10.0,
+        fixed_commission_per_leg=0.0,
+    )
+
+    assert result.loc[1, "delta_units_y"] > 0.0
+    assert result.loc[1, "delta_units_x"] < 0.0
+    assert result.loc[3, "delta_units_y"] < 0.0
+    assert result.loc[3, "delta_units_x"] > 0.0
+    assert result.loc[[1, 3], ["slippage_y", "slippage_x"]].gt(0.0).all().all()
+    assert result.loc[[1, 3], "net_pnl"].lt(0.0).all()
+
+
+def test_transaction_cost_equals_commission_plus_slippage() -> None:
+    _, _, _, result = _flat_price_round_trip()
+
+    expected = result["commission_cost"] + result["slippage_cost"]
+    pd.testing.assert_series_equal(
+        result["transaction_cost"],
+        expected.rename("transaction_cost"),
+    )
+
+
+def test_net_pnl_and_cumulative_cost_accounting_are_exact() -> None:
+    _, _, _, result = _flat_price_round_trip()
+
+    expected_net = result["gross_pnl"] - result["transaction_cost"]
+    pd.testing.assert_series_equal(result["net_pnl"], expected_net.rename("net_pnl"))
+    assert result["cumulative_transaction_cost"].tolist() == pytest.approx(
+        [0.0, 7.0, 7.0, 14.0]
+    )
+    assert result["cumulative_net_pnl"].tolist() == pytest.approx(
+        [0.0, -7.0, -7.0, -14.0]
+    )
+
+
+def test_net_equity_and_returns_use_cumulative_net_pnl_and_prior_net_equity() -> None:
+    _, _, _, result = _flat_price_round_trip()
+
+    assert result["net_portfolio_equity"].tolist() == pytest.approx(
+        [10_000.0, 9_993.0, 9_993.0, 9_986.0]
+    )
+    assert result["net_strategy_return"].tolist() == pytest.approx(
+        [0.0, -7.0 / 10_000.0, 0.0, -7.0 / 9_993.0]
+    )
+
+
+def test_flat_price_round_trip_loses_exactly_total_execution_costs() -> None:
+    _, _, _, result = _flat_price_round_trip()
+
+    assert result["gross_pnl"].eq(0.0).all()
+    assert result.loc[3, "cumulative_net_pnl"] == pytest.approx(-14.0)
+    assert result.loc[3, "cumulative_net_pnl"] == pytest.approx(
+        -result.loc[3, "cumulative_transaction_cost"]
+    )
+
+
+def test_larger_bps_assumptions_produce_larger_costs() -> None:
+    _, _, _, low = _flat_price_round_trip(
+        commission_bps=1.0,
+        slippage_bps=1.0,
+        fixed_commission_per_leg=0.0,
+    )
+    _, _, _, high = _flat_price_round_trip(
+        commission_bps=10.0,
+        slippage_bps=10.0,
+        fixed_commission_per_leg=0.0,
+    )
+
+    assert high["transaction_cost"].sum() > low["transaction_cost"].sum()
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    ["commission_bps", "slippage_bps", "fixed_commission_per_leg"],
+)
+def test_negative_cost_parameters_are_rejected(parameter: str) -> None:
+    schedule, price_y, price_x, _ = _accounting_case()
+
+    with pytest.raises(ValueError, match=parameter):
+        calculate_transaction_costs(
+            schedule,
+            price_y,
+            price_x,
+            **{parameter: -0.01},
+        )
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    ["commission_bps", "slippage_bps", "fixed_commission_per_leg"],
+)
+@pytest.mark.parametrize(
+    "invalid",
+    [True, np.bool_(False), "1.0", np.nan, np.inf, -np.inf],
+)
+def test_cost_parameters_reject_booleans_strings_nan_and_infinity(
+    parameter: str,
+    invalid: Any,
+) -> None:
+    schedule, price_y, price_x, _ = _accounting_case()
+
+    with pytest.raises((TypeError, ValueError), match=parameter):
+        calculate_transaction_costs(
+            schedule,
+            price_y,
+            price_x,
+            **{parameter: invalid},
+        )
+
+
+@pytest.mark.parametrize("missing_leg", ["price_y", "price_x"])
+def test_trade_rows_with_missing_execution_prices_are_rejected(
+    missing_leg: str,
+) -> None:
+    schedule, price_y, price_x, _ = _flat_price_round_trip()
+    if missing_leg == "price_y":
+        price_y = price_y.copy(deep=True)
+        price_y.iloc[1] = np.nan
+    else:
+        price_x = price_x.copy(deep=True)
+        price_x.iloc[1] = np.nan
+
+    with pytest.raises(ValueError, match="execution price is missing"):
+        calculate_transaction_costs(schedule, price_y, price_x, 10.0)
+
+
+def test_missing_gross_pnl_remains_unknown_instead_of_cost_only_loss() -> None:
+    events = ["ENTER_LONG", "NONE", "EXIT_TIME", "NONE"]
+    index = pd.RangeIndex(4, name="row")
+    price_y = pd.Series([100.0, 100.0, np.nan, 100.0], index=index)
+    price_x = pd.Series(50.0, index=index)
+    schedule = build_position_schedule(
+        price_y,
+        price_x,
+        _signals_from_events(events, index),
+        1.0,
+        2_000.0,
+    )
+
+    result = build_net_pnl_schedule(
+        schedule,
+        price_y,
+        price_x,
+        10_000.0,
+        commission_bps=10.0,
+    )
+
+    assert pd.isna(result.loc[2, "gross_pnl"])
+    assert pd.isna(result.loc[2, "net_pnl"])
+    assert result.loc[3, "transaction_cost"] > 0.0
+    assert pd.isna(result.loc[3, "gross_pnl"])
+    assert pd.isna(result.loc[3, "net_pnl"])
+    assert pd.isna(result.loc[3, "cumulative_net_pnl"])
+    assert pd.isna(result.loc[3, "net_portfolio_equity"])
+
+
+def test_first_row_external_cost_uses_initial_capital_return_denominator() -> None:
+    pnl = pd.DataFrame({"gross_pnl": [0.0, 0.0]})
+    costs = pd.Series([5.0, 0.0], name="transaction_cost")
+
+    result = apply_execution_costs(pnl, costs, initial_capital=1_000.0)
+
+    assert result.loc[0, "net_pnl"] == pytest.approx(-5.0)
+    assert result.loc[0, "net_portfolio_equity"] == pytest.approx(995.0)
+    assert result.loc[0, "net_strategy_return"] == pytest.approx(-0.005)
+
+
+def test_cost_accounting_does_not_mutate_inputs_and_is_deterministic() -> None:
+    schedule, price_y, price_x, gross = _accounting_case()
+    schedule_before = schedule.copy(deep=True)
+    y_before = price_y.copy(deep=True)
+    x_before = price_x.copy(deep=True)
+    gross_before = gross.copy(deep=True)
+
+    first = build_net_pnl_schedule(
+        schedule,
+        price_y,
+        price_x,
+        10_000.0,
+        commission_bps=3.0,
+        slippage_bps=2.0,
+        fixed_commission_per_leg=0.5,
+    )
+    second = build_net_pnl_schedule(
+        schedule,
+        price_y,
+        price_x,
+        10_000.0,
+        commission_bps=3.0,
+        slippage_bps=2.0,
+        fixed_commission_per_leg=0.5,
+    )
+
+    pd.testing.assert_frame_equal(first, second)
+    pd.testing.assert_frame_equal(schedule, schedule_before)
+    pd.testing.assert_series_equal(price_y, y_before)
+    pd.testing.assert_series_equal(price_x, x_before)
+    pd.testing.assert_frame_equal(gross, gross_before)
+
+
+@pytest.mark.parametrize("mismatch", ["price_y", "price_x"])
+def test_misaligned_cost_price_indices_are_rejected(mismatch: str) -> None:
+    schedule, price_y, price_x, _ = _accounting_case()
+    if mismatch == "price_y":
+        price_y = price_y.set_axis(price_y.index[::-1])
+    else:
+        price_x = price_x.set_axis(price_x.index[::-1])
+
+    with pytest.raises(ValueError, match="index"):
+        calculate_transaction_costs(schedule, price_y, price_x)
+
+
+@pytest.mark.parametrize("duplicated", ["schedule", "price_y", "price_x"])
+def test_duplicate_cost_indices_are_rejected(duplicated: str) -> None:
+    schedule, price_y, price_x, _ = _accounting_case()
+    duplicate_index = pd.Index([0, 0, 1, 2])
+    if duplicated == "schedule":
+        schedule = schedule.set_axis(duplicate_index)
+    elif duplicated == "price_y":
+        price_y = price_y.set_axis(duplicate_index)
+    else:
+        price_x = price_x.set_axis(duplicate_index)
+
+    with pytest.raises(ValueError, match="unique index"):
+        calculate_transaction_costs(schedule, price_y, price_x)
+
+
+def test_non_datetime_cost_index_is_preserved() -> None:
+    index = pd.Index(["z", "a", "m", "b"], name="execution_order")
+    _, _, _, result = _flat_price_round_trip(index=index)
+
+    pd.testing.assert_index_equal(result.index, index, exact=True)
+
+
+def test_timezone_aware_cost_index_metadata_is_preserved() -> None:
+    index = pd.date_range(
+        "2026-10-23",
+        periods=4,
+        freq="h",
+        tz="Europe/London",
+        name="execution_time",
+    )
+    _, _, _, result = _flat_price_round_trip(index=index)
+
+    pd.testing.assert_index_equal(result.index, index, exact=True)
+    assert result.index.tz == index.tz
+    assert result.index.freq == index.freq
+    assert result.index.name == index.name
+
+
+def test_future_execution_changes_do_not_alter_earlier_cost_rows() -> None:
+    index = pd.RangeIndex(7)
+    original_events = [
+        "ENTER_LONG",
+        "NONE",
+        "NONE",
+        "NONE",
+        "EXIT_TIME",
+        "NONE",
+        "NONE",
+    ]
+    changed_events = [
+        "ENTER_LONG",
+        "NONE",
+        "NONE",
+        "EXIT_STOP",
+        "ENTER_SHORT",
+        "NONE",
+        "NONE",
+    ]
+    original_y, original_x, original_signals, beta = _market_inputs(
+        original_events,
+        index=index,
+        beta=1.0,
+    )
+    changed_y = original_y.copy(deep=True)
+    changed_x = original_x.copy(deep=True)
+    changed_y.iloc[3:] *= 1.25
+    changed_x.iloc[3:] *= 0.8
+    original_schedule = build_position_schedule(
+        original_y,
+        original_x,
+        original_signals,
+        beta,
+        2_000.0,
+    )
+    changed_schedule = build_position_schedule(
+        changed_y,
+        changed_x,
+        _signals_from_events(changed_events, index),
+        beta,
+        2_000.0,
+    )
+
+    original = build_net_pnl_schedule(
+        original_schedule,
+        original_y,
+        original_x,
+        10_000.0,
+        commission_bps=4.0,
+        slippage_bps=3.0,
+        fixed_commission_per_leg=0.25,
+    )
+    changed = build_net_pnl_schedule(
+        changed_schedule,
+        changed_y,
+        changed_x,
+        10_000.0,
+        commission_bps=4.0,
+        slippage_bps=3.0,
+        fixed_commission_per_leg=0.25,
+    )
+
+    pd.testing.assert_frame_equal(original.iloc[:3], changed.iloc[:3])
+
+
+def test_public_cost_functions_match_composed_net_schedule() -> None:
+    schedule, price_y, price_x, combined = _flat_price_round_trip()
+    gross = build_pnl_schedule(schedule, price_y, price_x, 10_000.0)
+    costs = calculate_transaction_costs(
+        schedule,
+        price_y,
+        price_x,
+        commission_bps=10.0,
+        slippage_bps=5.0,
+        fixed_commission_per_leg=2.0,
+    )
+    net = apply_execution_costs(gross, costs, 10_000.0)
+
+    pd.testing.assert_frame_equal(costs, combined[costs.columns])
+    pd.testing.assert_frame_equal(net, combined[net.columns])

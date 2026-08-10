@@ -26,6 +26,9 @@ __all__ = [
     "calculate_position_pnl",
     "calculate_strategy_returns",
     "build_pnl_schedule",
+    "calculate_transaction_costs",
+    "apply_execution_costs",
+    "build_net_pnl_schedule",
 ]
 
 
@@ -73,6 +76,35 @@ _PNL_OUTPUT_COLUMNS = (
     "strategy_return",
 )
 
+_NET_PNL_OUTPUT_COLUMNS = (
+    "price_y",
+    "price_x",
+    "units_y",
+    "units_x",
+    "delta_units_y",
+    "delta_units_x",
+    "traded_notional_y",
+    "traded_notional_x",
+    "commission_y",
+    "commission_x",
+    "fixed_commission_y",
+    "fixed_commission_x",
+    "commission_cost",
+    "slippage_y",
+    "slippage_x",
+    "slippage_cost",
+    "transaction_cost",
+    "cumulative_transaction_cost",
+    "gross_pnl",
+    "net_pnl",
+    "cumulative_gross_pnl",
+    "cumulative_net_pnl",
+    "portfolio_equity",
+    "net_portfolio_equity",
+    "strategy_return",
+    "net_strategy_return",
+)
+
 
 class PairUnits(NamedTuple):
     """Signed fractional units of the dependent and explanatory symbols."""
@@ -105,6 +137,21 @@ def _finite_positive_scalar(value: Any, name: str) -> float:
         raise ValueError(f"{name} must be finite.")
     if normalised <= 0.0:
         raise ValueError(f"{name} must be strictly positive.")
+    return normalised
+
+
+def _finite_nonnegative_scalar(value: Any, name: str) -> float:
+    """Return a finite, non-negative, non-Boolean real scalar."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise TypeError(f"{name} must be a non-Boolean real number.")
+    try:
+        normalised = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be representable as a float.") from exc
+    if not np.isfinite(normalised):
+        raise ValueError(f"{name} must be finite.")
+    if normalised < 0.0:
+        raise ValueError(f"{name} must be non-negative.")
     return normalised
 
 
@@ -1010,3 +1057,353 @@ def build_pnl_schedule(
     )
     result.index = position_schedule.index
     return result.loc[:, list(_PNL_OUTPUT_COLUMNS)]
+
+
+def _traded_leg_costs(
+    delta_units: float,
+    execution_price: float,
+    commission_rate: float,
+    slippage_rate: float,
+    fixed_commission: float,
+    *,
+    leg: str,
+    row_number: int,
+) -> tuple[float, float, float, float]:
+    """Return traded notional, variable commission, fixed fee, and slippage."""
+    if delta_units == 0.0:
+        return 0.0, 0.0, 0.0, 0.0
+    if not np.isfinite(execution_price):
+        raise ValueError(
+            f"{leg} execution price is missing on a traded row at position "
+            f"{row_number}."
+        )
+
+    with np.errstate(over="ignore", invalid="ignore"):
+        traded_notional = abs(delta_units) * execution_price
+        variable_commission = traded_notional * commission_rate
+        slippage = traded_notional * slippage_rate
+    calculated = np.array(
+        [traded_notional, variable_commission, slippage],
+        dtype=float,
+    )
+    if not np.isfinite(calculated).all():
+        raise ValueError(
+            f"{leg} transaction-cost calculation overflowed at row position "
+            f"{row_number}."
+        )
+    return (
+        float(traded_notional),
+        float(variable_commission),
+        fixed_commission,
+        float(slippage),
+    )
+
+
+def calculate_transaction_costs(
+    position_schedule: pd.DataFrame,
+    price_y: pd.Series,
+    price_x: pd.Series,
+    commission_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+    fixed_commission_per_leg: float = 0.0,
+) -> pd.DataFrame:
+    """Calculate deterministic execution costs from actual unit changes.
+
+    The first row assumes zero prior units.  Every later row compares current
+    post-execution units with the previous row.  A leg with no unit change has
+    exactly zero traded notional, variable commission, fixed commission, and
+    slippage, irrespective of signal events.  Changed legs use current-row
+    market prices; a missing execution price is rejected defensively.
+
+    Basis-point commission and slippage are charged on absolute traded
+    notional.  Slippage is represented as an adverse cost deduction rather
+    than modifying stored market prices.
+    """
+    schedule = _validated_position_schedule(position_schedule)
+    y_values = _validated_market_series(price_y, "price_y", strictly_positive=True)
+    x_values = _validated_market_series(price_x, "price_x", strictly_positive=True)
+    _require_matching_index(schedule.index, price_y.index, "price_y")
+    _require_matching_index(schedule.index, price_x.index, "price_x")
+
+    commission = _finite_nonnegative_scalar(commission_bps, "commission_bps")
+    slippage = _finite_nonnegative_scalar(slippage_bps, "slippage_bps")
+    fixed = _finite_nonnegative_scalar(
+        fixed_commission_per_leg,
+        "fixed_commission_per_leg",
+    )
+    commission_rate = commission / 10_000.0
+    slippage_rate = slippage / 10_000.0
+
+    units_y = schedule["units_y"].to_numpy(dtype=float)
+    units_x = schedule["units_x"].to_numpy(dtype=float)
+    y_array = y_values.to_numpy(dtype=float)
+    x_array = x_values.to_numpy(dtype=float)
+    rows: list[tuple[float, ...]] = []
+    previous_y = 0.0
+    previous_x = 0.0
+
+    for row_number, (current_y, current_x, mark_y, mark_x) in enumerate(
+        zip(units_y, units_x, y_array, x_array, strict=True)
+    ):
+        with np.errstate(over="ignore", invalid="ignore"):
+            delta_y = current_y - previous_y
+            delta_x = current_x - previous_x
+        if not np.isfinite([delta_y, delta_x]).all():
+            raise ValueError(
+                f"Unit delta overflowed at row position {row_number}."
+            )
+        delta_y = 0.0 if delta_y == 0.0 else float(delta_y)
+        delta_x = 0.0 if delta_x == 0.0 else float(delta_x)
+        traded_y, commission_y, fixed_y, slippage_y = _traded_leg_costs(
+            delta_y,
+            mark_y,
+            commission_rate,
+            slippage_rate,
+            fixed,
+            leg="symbol_y",
+            row_number=row_number,
+        )
+        traded_x, commission_x, fixed_x, slippage_x = _traded_leg_costs(
+            delta_x,
+            mark_x,
+            commission_rate,
+            slippage_rate,
+            fixed,
+            leg="symbol_x",
+            row_number=row_number,
+        )
+        with np.errstate(over="ignore", invalid="ignore"):
+            commission_cost = commission_y + commission_x + fixed_y + fixed_x
+            slippage_cost = slippage_y + slippage_x
+            transaction_cost = commission_cost + slippage_cost
+        totals = np.array(
+            [commission_cost, slippage_cost, transaction_cost],
+            dtype=float,
+        )
+        if not np.isfinite(totals).all():
+            raise ValueError(
+                "Aggregate transaction cost overflowed at row position "
+                f"{row_number}."
+            )
+        if bool((totals < 0.0).any()):  # Defensive against future cost models.
+            raise RuntimeError("Transaction costs must be non-negative.")
+        rows.append(
+            (
+                delta_y,
+                delta_x,
+                traded_y,
+                traded_x,
+                commission_y,
+                commission_x,
+                fixed_y,
+                fixed_x,
+                float(commission_cost),
+                slippage_y,
+                slippage_x,
+                float(slippage_cost),
+                float(transaction_cost),
+            )
+        )
+        previous_y = current_y
+        previous_x = current_x
+
+    result = pd.DataFrame.from_records(
+        rows,
+        columns=[
+            "delta_units_y",
+            "delta_units_x",
+            "traded_notional_y",
+            "traded_notional_x",
+            "commission_y",
+            "commission_x",
+            "fixed_commission_y",
+            "fixed_commission_x",
+            "commission_cost",
+            "slippage_y",
+            "slippage_x",
+            "slippage_cost",
+            "transaction_cost",
+        ],
+    )
+    result.index = position_schedule.index
+    transaction_array = result["transaction_cost"].to_numpy(dtype=float)
+    result["cumulative_transaction_cost"] = _causal_cumulative(
+        transaction_array,
+        "Cumulative transaction cost",
+    )
+    return result.astype("float64")
+
+
+def _validated_transaction_costs(
+    transaction_costs: pd.DataFrame | pd.Series,
+) -> pd.Series:
+    """Return an independent non-negative transaction-cost Series."""
+    if isinstance(transaction_costs, pd.DataFrame):
+        if not transaction_costs.index.is_unique:
+            raise ValueError("transaction_costs must have a unique index.")
+        if "transaction_cost" not in transaction_costs.columns:
+            raise ValueError(
+                "transaction_costs is missing required column: transaction_cost."
+            )
+        source = transaction_costs["transaction_cost"]
+    elif isinstance(transaction_costs, pd.Series):
+        source = transaction_costs
+    else:
+        raise TypeError("transaction_costs must be a pandas DataFrame or Series.")
+
+    values = _validated_market_series(
+        source,
+        "transaction_cost",
+        strictly_positive=False,
+    )
+    if values.isna().any():
+        raise ValueError("transaction_cost must not contain missing values.")
+    if bool((values < 0.0).any()):
+        raise ValueError("transaction_cost must be non-negative.")
+    values.name = "transaction_cost"
+    return values
+
+
+def apply_execution_costs(
+    pnl_schedule: pd.DataFrame,
+    transaction_costs: pd.DataFrame | pd.Series,
+    initial_capital: float = 1_000_000.0,
+) -> pd.DataFrame:
+    """Deduct execution costs and calculate cumulative net wealth and returns.
+
+    If gross P&L is missing, net P&L remains missing even when the row's cost is
+    known.  Cumulative net P&L and equity therefore remain unknown afterward,
+    matching the gross accounting policy.  The first-row net return uses
+    initial capital as its denominator if a nonzero first-row cost is ever
+    supplied; normal Milestone 6A schedules start flat and therefore return
+    zero on the first row.
+    """
+    if not isinstance(pnl_schedule, pd.DataFrame):
+        raise TypeError("pnl_schedule must be a pandas DataFrame.")
+    if not pnl_schedule.index.is_unique:
+        raise ValueError("pnl_schedule must have a unique index.")
+    if "gross_pnl" not in pnl_schedule.columns:
+        raise ValueError("pnl_schedule is missing required column: gross_pnl.")
+
+    capital = _finite_positive_scalar(initial_capital, "initial_capital")
+    gross = _validated_market_series(
+        pnl_schedule["gross_pnl"],
+        "gross_pnl",
+        strictly_positive=False,
+    )
+    if len(gross) and (np.isnan(gross.iat[0]) or gross.iat[0] != 0.0):
+        raise ValueError("The first gross_pnl observation must be zero.")
+    costs = _validated_transaction_costs(transaction_costs)
+    _require_matching_index(pnl_schedule.index, costs.index, "transaction_costs")
+
+    gross_array = gross.to_numpy(dtype=float)
+    cost_array = costs.to_numpy(dtype=float)
+    net_pnl = np.full(len(gross), np.nan, dtype=float)
+    for row_number, (gross_value, cost_value) in enumerate(
+        zip(gross_array, cost_array, strict=True)
+    ):
+        if np.isnan(gross_value):
+            continue
+        with np.errstate(over="ignore", invalid="ignore"):
+            net_pnl[row_number] = gross_value - cost_value
+        if not np.isfinite(net_pnl[row_number]):
+            raise ValueError(f"Net P&L overflowed at row position {row_number}.")
+
+    cumulative_cost = _causal_cumulative(
+        cost_array,
+        "Cumulative transaction cost",
+    )
+    cumulative_net = _causal_cumulative(net_pnl, "Cumulative net P&L")
+    gross_returns = calculate_strategy_returns(gross, capital)
+    net_equity = np.full(len(gross), np.nan, dtype=float)
+    net_returns = np.full(len(gross), np.nan, dtype=float)
+
+    for row_number, cumulative_value in enumerate(cumulative_net):
+        if np.isnan(cumulative_value):
+            continue
+        with np.errstate(over="ignore", invalid="ignore"):
+            net_equity[row_number] = capital + cumulative_value
+        if not np.isfinite(net_equity[row_number]):
+            raise ValueError(
+                f"Net portfolio equity overflowed at row position {row_number}."
+            )
+
+    if len(gross) and not np.isnan(net_pnl[0]):
+        net_returns[0] = net_pnl[0] / capital
+    for row_number in range(1, len(gross)):
+        prior_equity = net_equity[row_number - 1]
+        if np.isnan(prior_equity):
+            continue
+        if prior_equity <= 0.0:
+            raise ValueError(
+                "Prior net portfolio equity must be positive to calculate a "
+                f"return; row position {row_number} has prior equity "
+                f"{prior_equity}."
+            )
+        if np.isnan(net_pnl[row_number]):
+            continue
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            net_returns[row_number] = net_pnl[row_number] / prior_equity
+        if not np.isfinite(net_returns[row_number]):
+            raise ValueError(
+                f"Net strategy return is non-finite at row position {row_number}."
+            )
+
+    result = pd.DataFrame(
+        {
+            "gross_pnl": gross_array,
+            "transaction_cost": cost_array,
+            "cumulative_transaction_cost": cumulative_cost,
+            "net_pnl": net_pnl,
+            "cumulative_gross_pnl": gross_returns["cumulative_gross_pnl"],
+            "cumulative_net_pnl": cumulative_net,
+            "portfolio_equity": gross_returns["portfolio_equity"],
+            "net_portfolio_equity": net_equity,
+            "strategy_return": gross_returns["strategy_return"],
+            "net_strategy_return": net_returns,
+        },
+        index=pnl_schedule.index,
+    )
+    result.index = pnl_schedule.index
+    return result.astype("float64")
+
+
+def build_net_pnl_schedule(
+    position_schedule: pd.DataFrame,
+    price_y: pd.Series,
+    price_x: pd.Series,
+    initial_capital: float = 1_000_000.0,
+    *,
+    commission_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+    fixed_commission_per_leg: float = 0.0,
+) -> pd.DataFrame:
+    """Build gross and net accounting with deterministic execution costs."""
+    gross = build_pnl_schedule(
+        position_schedule,
+        price_y,
+        price_x,
+        initial_capital,
+    )
+    costs = calculate_transaction_costs(
+        position_schedule,
+        price_y,
+        price_x,
+        commission_bps,
+        slippage_bps,
+        fixed_commission_per_leg,
+    )
+    net = apply_execution_costs(gross, costs, initial_capital)
+    result = pd.concat(
+        [
+            gross[["price_y", "price_x", "units_y", "units_x"]],
+            costs,
+            net.drop(
+                columns=["transaction_cost", "cumulative_transaction_cost"]
+            ),
+        ],
+        axis=1,
+        copy=False,
+    )
+    result.index = position_schedule.index
+    return result.loc[:, list(_NET_PNL_OUTPUT_COLUMNS)]

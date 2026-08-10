@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from typing import Any
 
 import numpy as np
@@ -9,8 +10,12 @@ import pandas as pd
 import pytest
 
 from pairs_trading.backtest import (
+    LedgerReconciliation,
     PairUnits,
+    TradeRecord,
+    TradeExitReason,
     apply_execution_costs,
+    build_trade_ledger,
     build_net_pnl_schedule,
     build_pnl_schedule,
     build_position_schedule,
@@ -22,7 +27,9 @@ from pairs_trading.backtest import (
     calculate_strategy_returns,
     calculate_transaction_costs,
     build_financed_pnl_schedule,
+    force_liquidate_open_position,
     lag_trade_decisions,
+    reconcile_trade_ledger,
 )
 
 
@@ -2303,3 +2310,617 @@ def test_future_price_beta_rate_and_state_changes_do_not_affect_prior_rows() -> 
     )
 
     pd.testing.assert_frame_equal(original.iloc[:3], changed.iloc[:3])
+
+
+def _completed_trade_case(
+    *,
+    side: str = "LONG",
+    index: pd.Index | None = None,
+    beta_values: list[float] | None = None,
+    rebalance: bool = False,
+) -> tuple[
+    pd.DataFrame,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+    pd.DataFrame,
+    pd.DataFrame,
+]:
+    """Return one fully financed completed trade and its ledger."""
+    entry_event = "ENTER_LONG" if side == "LONG" else "ENTER_SHORT"
+    events = [entry_event, "NONE", "NONE", "EXIT_TIME", "NONE", "NONE"]
+    if index is None:
+        index = pd.RangeIndex(len(events), name="ledger_row")
+    price_y = pd.Series(
+        [100.0, 100.0, 102.0, 104.0, 105.0, 106.0],
+        index=index,
+        name="Y",
+    )
+    price_x = pd.Series(
+        [50.0, 50.0, 49.0, 48.0, 47.0, 46.0],
+        index=index,
+        name="X",
+    )
+    if beta_values is None:
+        beta_values = [1.0] * len(events)
+    beta = pd.Series(beta_values, index=index, name="beta")
+    schedule = build_position_schedule(
+        price_y,
+        price_x,
+        _signals_from_events(events, index),
+        beta,
+        target_gross_notional=2_000.0,
+    )
+    accounting = build_financed_pnl_schedule(
+        schedule,
+        price_y,
+        price_x,
+        initial_capital=10_000.0,
+        commission_bps=10.0,
+        slippage_bps=5.0,
+        fixed_commission_per_leg=0.25,
+        borrow_rate_y=0.252,
+        borrow_rate_x=0.504,
+        financing_rate=0.126,
+        periods_per_year=252,
+        rebalance=rebalance,
+        hedge_ratio=beta,
+        target_gross_notional=2_000.0,
+        rebalance_threshold=0.5,
+    )
+    ledger = build_trade_ledger(accounting, schedule)
+    return schedule, price_y, price_x, beta, accounting, ledger
+
+
+def _forced_liquidation_case(
+    *,
+    force_liquidation: bool = True,
+    index: pd.Index | None = None,
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+    pd.DataFrame,
+    pd.DataFrame,
+]:
+    """Return original/possibly forced schedules, accounting, and ledger."""
+    events = ["ENTER_LONG", "NONE", "NONE", "NONE", "NONE"]
+    if index is None:
+        index = pd.RangeIndex(len(events), name="forced_row")
+    price_y = pd.Series(
+        [100.0, 100.0, 101.0, 103.0, 106.0],
+        index=index,
+        name="Y",
+    )
+    price_x = pd.Series(
+        [50.0, 50.0, 49.0, 48.0, 47.0],
+        index=index,
+        name="X",
+    )
+    beta = pd.Series(1.0, index=index, name="beta")
+    original = build_position_schedule(
+        price_y,
+        price_x,
+        _signals_from_events(events, index),
+        beta,
+        target_gross_notional=2_000.0,
+    )
+    closed = force_liquidate_open_position(
+        original,
+        price_y,
+        price_x,
+        beta,
+        force_liquidation=force_liquidation,
+    )
+    accounting = build_financed_pnl_schedule(
+        closed,
+        price_y,
+        price_x,
+        initial_capital=10_000.0,
+        commission_bps=10.0,
+        slippage_bps=5.0,
+        fixed_commission_per_leg=0.25,
+        borrow_rate_x=0.252,
+        financing_rate=0.126,
+        periods_per_year=252,
+    )
+    ledger = build_trade_ledger(accounting, closed)
+    return original, closed, price_y, price_x, beta, accounting, ledger
+
+
+def test_completed_long_trade_has_complete_lifecycle_and_endpoint_fields() -> None:
+    schedule, _, _, beta, accounting, ledger = _completed_trade_case()
+
+    assert len(ledger) == 1
+    trade = ledger.iloc[0]
+    assert trade["trade_id"] == 1
+    assert trade["side"] == "LONG_SPREAD"
+    assert trade["entry_row"] == 1
+    assert trade["exit_row"] == 4
+    assert trade["entry_index"] == accounting.index[1]
+    assert trade["exit_index"] == accounting.index[4]
+    assert trade["entry_event"] == "ENTER_LONG"
+    assert trade["exit_event"] == "EXIT_TIME"
+    assert trade["exit_reason"] == TradeExitReason.TIME.value
+    assert trade["entry_price_y"] == accounting["price_y"].iat[1]
+    assert trade["entry_price_x"] == accounting["price_x"].iat[1]
+    assert trade["exit_price_y"] == accounting["price_y"].iat[4]
+    assert trade["exit_price_x"] == accounting["price_x"].iat[4]
+    assert trade["entry_units_y"] == accounting["units_y"].iat[1]
+    assert trade["entry_units_x"] == accounting["units_x"].iat[1]
+    assert trade["exit_units_y"] == accounting["units_y"].iat[3]
+    assert trade["exit_units_x"] == accounting["units_x"].iat[3]
+    assert trade["entry_hedge_ratio"] == beta.iat[1]
+    assert trade["exit_hedge_ratio"] == beta.iat[4]
+    assert trade["holding_period_rows"] == 3
+    assert trade["entry_gross_notional"] == pytest.approx(2_000.0)
+    assert not trade["forced_exit"]
+    assert schedule["executed_state"].iat[4] == "FLAT"
+
+
+def test_completed_short_trade_produces_one_short_ledger_record() -> None:
+    _, _, _, _, accounting, ledger = _completed_trade_case(side="SHORT")
+
+    assert len(ledger) == 1
+    assert ledger.loc[0, "side"] == "SHORT_SPREAD"
+    assert ledger.loc[0, "entry_event"] == "ENTER_SHORT"
+    assert ledger.loc[0, "entry_units_y"] < 0.0
+    assert ledger.loc[0, "entry_units_x"] > 0.0
+    assert ledger.loc[0, "exit_units_y"] == accounting["units_y"].iat[3]
+    assert ledger.loc[0, "exit_units_x"] == accounting["units_x"].iat[3]
+
+
+def test_multiple_trades_receive_sequential_deterministic_ids() -> None:
+    events = [
+        "ENTER_LONG",
+        "NONE",
+        "EXIT_TIME",
+        "NONE",
+        "ENTER_SHORT",
+        "NONE",
+        "NONE",
+        "EXIT_STOP",
+        "NONE",
+        "NONE",
+    ]
+    index = pd.RangeIndex(len(events), name="multi_row")
+    price_y = pd.Series(100.0 + np.arange(len(events)), index=index)
+    price_x = pd.Series(50.0 - 0.5 * np.arange(len(events)), index=index)
+    beta = pd.Series(1.0, index=index)
+    schedule = build_position_schedule(
+        price_y,
+        price_x,
+        _signals_from_events(events, index),
+        beta,
+        2_000.0,
+    )
+    accounting = build_financed_pnl_schedule(schedule, price_y, price_x, 10_000.0)
+
+    first = build_trade_ledger(accounting, schedule)
+    second = build_trade_ledger(accounting, schedule)
+
+    assert first["trade_id"].tolist() == [1, 2]
+    assert first["side"].tolist() == ["LONG_SPREAD", "SHORT_SPREAD"]
+    assert first["entry_row"].tolist() == [1, 5]
+    assert first["exit_row"].tolist() == [3, 8]
+    pd.testing.assert_frame_equal(first, second)
+
+
+def test_trade_cost_pnl_carry_and_return_attribution_are_exact() -> None:
+    _, _, _, _, accounting, ledger = _completed_trade_case()
+    trade = ledger.iloc[0]
+    attributed = accounting.iloc[1:5]
+
+    assert trade["gross_pnl"] == pytest.approx(attributed["gross_pnl"].sum())
+    assert trade["commission_cost"] == pytest.approx(
+        attributed["commission_cost"].sum()
+    )
+    assert trade["slippage_cost"] == pytest.approx(
+        attributed["slippage_cost"].sum()
+    )
+    assert trade["transaction_cost"] == pytest.approx(
+        attributed["transaction_cost"].sum()
+    )
+    assert trade["borrow_cost"] == pytest.approx(attributed["borrow_cost"].sum())
+    assert trade["financing_cost"] == pytest.approx(
+        attributed["financing_cost"].sum()
+    )
+    assert trade["carry_cost"] == pytest.approx(
+        trade["borrow_cost"] + trade["financing_cost"]
+    )
+    assert trade["total_cost"] == pytest.approx(
+        trade["transaction_cost"] + trade["carry_cost"]
+    )
+    assert trade["net_pnl"] == pytest.approx(
+        trade["gross_pnl"] - trade["total_cost"]
+    )
+    assert trade["return_on_entry_gross_notional"] == pytest.approx(
+        trade["net_pnl"] / trade["entry_gross_notional"]
+    )
+
+
+def test_rebalance_stays_in_one_trade_and_its_cost_is_attributed() -> None:
+    _, _, _, _, accounting, ledger = _completed_trade_case(
+        beta_values=[1.0, 1.0, 2.0, 2.0, 2.0, 2.0],
+        rebalance=True,
+    )
+
+    assert accounting["rebalance"].sum() == 1
+    rebalance_row = int(np.flatnonzero(accounting["rebalance"].to_numpy())[0])
+    assert rebalance_row == 2
+    assert len(ledger) == 1
+    assert ledger.loc[0, "transaction_cost"] == pytest.approx(
+        accounting.loc[1:4, "transaction_cost"].sum()
+    )
+    assert accounting["transaction_cost"].iat[rebalance_row] > 0.0
+    assert ledger.loc[0, "transaction_cost"] > (
+        accounting["transaction_cost"].iat[1]
+        + accounting["transaction_cost"].iat[4]
+    )
+
+
+def test_flat_rows_between_or_after_trades_do_not_leak_costs() -> None:
+    schedule, _, _, _, accounting, expected = _completed_trade_case()
+    altered = accounting.copy(deep=True)
+    final_row = len(altered) - 1
+    altered.iat[
+        final_row, altered.columns.get_loc("commission_cost")
+    ] += 7.0
+    altered.iat[
+        final_row, altered.columns.get_loc("transaction_cost")
+    ] += 7.0
+    altered.iat[
+        final_row, altered.columns.get_loc("net_pnl_after_carry")
+    ] -= 7.0
+    altered.iat[
+        final_row,
+        altered.columns.get_loc("cumulative_net_pnl_after_carry"),
+    ] -= 7.0
+
+    actual = build_trade_ledger(altered, schedule)
+
+    pd.testing.assert_frame_equal(actual, expected)
+
+
+def test_open_final_trade_is_omitted_when_liquidation_is_disabled() -> None:
+    original, unchanged, _, _, _, accounting, ledger = _forced_liquidation_case(
+        force_liquidation=False
+    )
+
+    pd.testing.assert_frame_equal(unchanged, original)
+    assert ledger.empty
+    assert accounting["units_y"].iat[-1] != 0.0
+    assert accounting["units_x"].iat[-1] != 0.0
+
+
+def test_forced_liquidation_closes_final_row_and_marks_completed_trade() -> None:
+    original, closed, _, _, _, accounting, ledger = _forced_liquidation_case()
+
+    assert original["executed_state"].iat[-1] == "LONG_SPREAD"
+    assert closed["executed_state"].iat[-1] == "FLAT"
+    assert closed["execution_event"].iat[-1] == "FORCED_EXIT"
+    assert closed["units_y"].iat[-1] == 0.0
+    assert closed["units_x"].iat[-1] == 0.0
+    assert accounting["units_y"].iat[-1] == 0.0
+    assert accounting["units_x"].iat[-1] == 0.0
+    assert len(ledger) == 1
+    assert bool(ledger.loc[0, "forced_exit"])
+    assert ledger.loc[0, "exit_event"] == "FORCED_EXIT"
+    assert ledger.loc[0, "exit_reason"] == TradeExitReason.END_OF_BACKTEST.value
+
+
+def test_forced_close_charges_normal_costs_and_preserves_final_interval_pnl() -> None:
+    original, closed, price_y, price_x, _, forced, ledger = (
+        _forced_liquidation_case()
+    )
+    open_accounting = build_financed_pnl_schedule(
+        original,
+        price_y,
+        price_x,
+        initial_capital=10_000.0,
+        commission_bps=10.0,
+        slippage_bps=5.0,
+        fixed_commission_per_leg=0.25,
+        borrow_rate_x=0.252,
+        financing_rate=0.126,
+        periods_per_year=252,
+    )
+
+    assert forced["gross_pnl"].iat[-1] == pytest.approx(
+        open_accounting["gross_pnl"].iat[-1]
+    )
+    assert forced["transaction_cost"].iat[-1] > 0.0
+    assert forced["delta_units_y"].iat[-1] == pytest.approx(
+        -closed["units_y"].iat[-2]
+    )
+    assert forced["delta_units_x"].iat[-1] == pytest.approx(
+        -closed["units_x"].iat[-2]
+    )
+    expected_net = (
+        ledger.loc[0, "gross_pnl"]
+        - ledger.loc[0, "transaction_cost"]
+        - ledger.loc[0, "carry_cost"]
+    )
+    assert ledger.loc[0, "net_pnl"] == pytest.approx(expected_net)
+    assert ledger.loc[0, "total_cost"] == pytest.approx(
+        ledger.loc[0, "transaction_cost"] + ledger.loc[0, "carry_cost"]
+    )
+
+
+@pytest.mark.parametrize("missing_input", ["price_y", "price_x", "hedge_ratio"])
+def test_missing_final_market_input_prevents_forced_liquidation(
+    missing_input: str,
+) -> None:
+    events = ["ENTER_LONG", "NONE", "NONE", "NONE"]
+    index = pd.RangeIndex(len(events))
+    price_y = pd.Series([100.0, 100.0, 101.0, 102.0], index=index)
+    price_x = pd.Series([50.0, 50.0, 49.0, 48.0], index=index)
+    beta = pd.Series(1.0, index=index)
+    if missing_input == "price_y":
+        price_y.iat[-1] = np.nan
+    elif missing_input == "price_x":
+        price_x.iat[-1] = np.nan
+    else:
+        beta.iat[-1] = np.nan
+    schedule = build_position_schedule(
+        price_y,
+        price_x,
+        _signals_from_events(events, index),
+        beta,
+        2_000.0,
+    )
+
+    with pytest.raises(ValueError, match="Final prices|Final hedge ratio"):
+        force_liquidate_open_position(schedule)
+
+
+def test_fully_closed_ledger_reconciles_to_final_after_carry_accounting() -> None:
+    schedule, _, _, _, accounting, ledger = _completed_trade_case()
+
+    result = reconcile_trade_ledger(ledger, accounting, schedule)
+
+    assert isinstance(result, LedgerReconciliation)
+    assert result.status == "RECONCILED"
+    assert result.completed_trade_count == 1
+    assert not result.has_open_trade
+    assert result.fully_reconcilable
+    assert result.completed_totals_match
+    assert result.final_accounting_match is True
+    assert result.gross_pnl_match is True
+    assert result.transaction_cost_match is True
+    assert result.carry_cost_match is True
+    assert result.net_pnl_match is True
+    assert result.ledger_net_pnl == pytest.approx(
+        accounting["cumulative_net_pnl_after_carry"].iat[-1]
+    )
+
+
+def test_forced_liquidation_reconciles_closing_cost_with_final_equity() -> None:
+    _, closed, _, _, _, accounting, ledger = _forced_liquidation_case()
+
+    result = reconcile_trade_ledger(ledger, accounting, closed)
+
+    assert result.status == "RECONCILED"
+    assert result.final_accounting_match is True
+    assert accounting["net_equity_after_carry"].iat[-1] == pytest.approx(
+        10_000.0 + ledger["net_pnl"].sum()
+    )
+
+
+def test_open_trade_reconciliation_reports_incomplete_accounting_separately() -> None:
+    _, open_schedule, _, _, _, accounting, ledger = _forced_liquidation_case(
+        force_liquidation=False
+    )
+
+    result = reconcile_trade_ledger(ledger, accounting, open_schedule)
+
+    assert result.status == "OPEN_TRADE"
+    assert result.has_open_trade
+    assert result.completed_trade_count == 0
+    assert result.completed_totals_match
+    assert result.final_accounting_match is None
+    assert result.open_trade_transaction_cost > 0.0
+    assert result.open_trade_net_pnl == pytest.approx(
+        accounting["net_pnl_after_carry"].iloc[1:].sum()
+    )
+
+
+def test_unknown_completed_trade_pnl_remains_nan_and_is_not_reconciled() -> None:
+    events = ["ENTER_LONG", "NONE", "NONE", "EXIT_TIME", "NONE", "NONE"]
+    index = pd.RangeIndex(len(events))
+    price_y = pd.Series([100.0, 100.0, np.nan, 103.0, 104.0, 105.0], index=index)
+    price_x = pd.Series([50.0, 50.0, 49.0, 48.0, 47.0, 46.0], index=index)
+    beta = pd.Series(1.0, index=index)
+    schedule = build_position_schedule(
+        price_y,
+        price_x,
+        _signals_from_events(events, index),
+        beta,
+        2_000.0,
+    )
+    accounting = build_financed_pnl_schedule(
+        schedule,
+        price_y,
+        price_x,
+        10_000.0,
+        commission_bps=5.0,
+        borrow_rate_x=0.1,
+        financing_rate=0.05,
+    )
+    ledger = build_trade_ledger(accounting, schedule)
+
+    assert len(ledger) == 1
+    assert np.isnan(ledger.loc[0, "gross_pnl"])
+    assert np.isnan(ledger.loc[0, "net_pnl"])
+    assert np.isfinite(ledger.loc[0, "transaction_cost"])
+    result = reconcile_trade_ledger(ledger, accounting, schedule)
+    assert result.status == "UNKNOWN_ACCOUNTING"
+    assert not result.fully_reconcilable
+    assert result.gross_pnl_match is None
+    assert result.net_pnl_match is None
+    assert result.final_accounting_match is None
+
+
+def test_ledger_rejects_malformed_executed_state_transitions() -> None:
+    schedule, _, _, _, accounting, _ = _completed_trade_case()
+    malformed = schedule.copy(deep=True)
+    malformed.iat[2, malformed.columns.get_loc("execution_event")] = "ENTER_SHORT"
+
+    with pytest.raises(ValueError, match="Invalid|changed|transition"):
+        build_trade_ledger(accounting, malformed)
+
+
+def test_ledger_rejects_duplicate_and_misaligned_indices() -> None:
+    schedule, _, _, _, accounting, _ = _completed_trade_case()
+    duplicated = accounting.copy(deep=True)
+    duplicated.index = pd.Index([0, 0, 1, 2, 3, 4])
+    reordered = schedule.iloc[::-1].copy()
+
+    with pytest.raises(ValueError, match="unique index"):
+        build_trade_ledger(duplicated, schedule)
+    with pytest.raises(ValueError, match="position_schedule index"):
+        build_trade_ledger(accounting, reordered)
+
+
+@pytest.mark.parametrize("invalid", [np.bool_(True), 1, 0, "true", None])
+def test_forced_liquidation_requires_actual_bool(invalid: Any) -> None:
+    original, _, price_y, price_x, beta, _, _ = _forced_liquidation_case(
+        force_liquidation=False
+    )
+
+    with pytest.raises(TypeError, match="force_liquidation"):
+        force_liquidate_open_position(
+            original,
+            price_y,
+            price_x,
+            beta,
+            force_liquidation=invalid,
+        )
+
+
+def test_ledger_and_liquidation_are_immutable_and_deterministic() -> None:
+    schedule, price_y, price_x, beta, accounting, _ = _completed_trade_case()
+    schedule_before = schedule.copy(deep=True)
+    accounting_before = accounting.copy(deep=True)
+
+    first = build_trade_ledger(accounting, schedule)
+    second = build_trade_ledger(accounting, schedule)
+    pd.testing.assert_frame_equal(first, second)
+    pd.testing.assert_frame_equal(schedule, schedule_before)
+    pd.testing.assert_frame_equal(accounting, accounting_before)
+
+    _, open_schedule, _, _, _, _, _ = _forced_liquidation_case(
+        force_liquidation=False
+    )
+    open_before = open_schedule.copy(deep=True)
+    liquidated_first = force_liquidate_open_position(
+        open_schedule, price_y.iloc[:5], price_x.iloc[:5], beta.iloc[:5]
+    )
+    liquidated_second = force_liquidate_open_position(
+        open_schedule, price_y.iloc[:5], price_x.iloc[:5], beta.iloc[:5]
+    )
+    pd.testing.assert_frame_equal(liquidated_first, liquidated_second)
+    pd.testing.assert_frame_equal(open_schedule, open_before)
+
+
+def test_trade_record_and_reconciliation_structures_are_frozen() -> None:
+    schedule, _, _, _, accounting, ledger = _completed_trade_case()
+    record = TradeRecord(**ledger.iloc[0].to_dict())
+    reconciliation = reconcile_trade_ledger(ledger, accounting, schedule)
+
+    with pytest.raises(FrozenInstanceError):
+        record.trade_id = 2  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        reconciliation.status = "MISMATCH"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "index",
+    [
+        pd.Index(["z", "a", "m", "b", "q", "x"], name="ledger_order"),
+        pd.date_range(
+            "2026-10-25",
+            periods=6,
+            freq="h",
+            tz="Europe/London",
+            name="ledger_time",
+        ),
+    ],
+)
+def test_ledger_preserves_non_datetime_and_timezone_aware_index_values(
+    index: pd.Index,
+) -> None:
+    _, _, _, _, _, ledger = _completed_trade_case(index=index)
+
+    assert ledger.loc[0, "entry_index"] == index[1]
+    assert ledger.loc[0, "exit_index"] == index[4]
+    if isinstance(index, pd.DatetimeIndex):
+        assert str(ledger.loc[0, "entry_index"].tz) == str(index.tz)
+        assert str(ledger.loc[0, "exit_index"].tz) == str(index.tz)
+
+
+def test_future_rows_do_not_change_an_already_completed_trade_record() -> None:
+    events = [
+        "ENTER_LONG",
+        "NONE",
+        "EXIT_TIME",
+        "NONE",
+        "NONE",
+        "NONE",
+        "NONE",
+        "NONE",
+    ]
+    index = pd.RangeIndex(len(events))
+    original_y = pd.Series([100.0, 100.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0], index=index)
+    original_x = pd.Series([50.0, 50.0, 49.0, 48.0, 47.0, 46.0, 45.0, 44.0], index=index)
+    original_beta = pd.Series(1.0, index=index)
+    changed_y = original_y.copy(deep=True)
+    changed_x = original_x.copy(deep=True)
+    changed_beta = original_beta.copy(deep=True)
+    changed_y.iloc[4:] *= 10.0
+    changed_x.iloc[4:] *= 0.1
+    changed_beta.iloc[4:] = 5.0
+    changed_events = events.copy()
+    changed_events[4:] = ["ENTER_SHORT", "NONE", "EXIT_STOP", "NONE"]
+
+    original_schedule = build_position_schedule(
+        original_y,
+        original_x,
+        _signals_from_events(events, index),
+        original_beta,
+        2_000.0,
+    )
+    changed_schedule = build_position_schedule(
+        changed_y,
+        changed_x,
+        _signals_from_events(changed_events, index),
+        changed_beta,
+        2_000.0,
+    )
+    original_accounting = build_financed_pnl_schedule(
+        original_schedule,
+        original_y,
+        original_x,
+        10_000.0,
+        commission_bps=5.0,
+        financing_rate=0.05,
+    )
+    changed_accounting = build_financed_pnl_schedule(
+        changed_schedule,
+        changed_y,
+        changed_x,
+        10_000.0,
+        commission_bps=5.0,
+        financing_rate=0.05,
+    )
+
+    original_ledger = build_trade_ledger(original_accounting, original_schedule)
+    changed_ledger = build_trade_ledger(changed_accounting, changed_schedule)
+
+    pd.testing.assert_series_equal(
+        original_ledger.iloc[0],
+        changed_ledger.iloc[0],
+        check_names=False,
+    )

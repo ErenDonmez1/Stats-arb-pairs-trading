@@ -1,14 +1,17 @@
-"""Causal pair execution, unit sizing, and marked-to-market accounting.
+"""Causal pair execution, accounting, and completed-trade attribution.
 
 The module converts state-changing decisions into lagged executions, sizes the
 two legs on the actual execution row, and accounts for exposure, P&L,
-execution costs, and simple carry costs.  Trade ledgers and performance
-metrics remain outside this milestone.
+execution costs, and simple carry costs.  It also supports an explicit final
+liquidation and attributes existing accounting rows to completed trades.
+Performance metrics remain outside this milestone.
 """
 
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import asdict, dataclass
+from enum import Enum
 from numbers import Integral, Real
 from typing import Any, NamedTuple
 
@@ -33,6 +36,12 @@ __all__ = [
     "calculate_financing_costs",
     "calculate_rebalancing_costs",
     "build_financed_pnl_schedule",
+    "TradeExitReason",
+    "TradeRecord",
+    "LedgerReconciliation",
+    "force_liquidate_open_position",
+    "build_trade_ledger",
+    "reconcile_trade_ledger",
 ]
 
 
@@ -52,10 +61,13 @@ _OUTPUT_COLUMNS = (
     "net_exposure",
 )
 
+_FORCED_EXIT_EVENT = "FORCED_EXIT"
+
 _EXIT_EVENTS = {
     TradeEvent.EXIT_MEAN_REVERSION.value,
     TradeEvent.EXIT_STOP.value,
     TradeEvent.EXIT_TIME.value,
+    _FORCED_EXIT_EVENT,
 }
 
 _PNL_OUTPUT_COLUMNS = (
@@ -127,6 +139,117 @@ _FINANCED_OUTPUT_COLUMNS = _NET_PNL_OUTPUT_COLUMNS + (
     "net_equity_after_carry",
     "net_return_after_carry",
 )
+
+_TRADE_LEDGER_COLUMNS = (
+    "trade_id",
+    "side",
+    "entry_row",
+    "exit_row",
+    "entry_index",
+    "exit_index",
+    "entry_event",
+    "exit_event",
+    "exit_reason",
+    "entry_price_y",
+    "entry_price_x",
+    "exit_price_y",
+    "exit_price_x",
+    "entry_units_y",
+    "entry_units_x",
+    "exit_units_y",
+    "exit_units_x",
+    "entry_hedge_ratio",
+    "exit_hedge_ratio",
+    "holding_period_rows",
+    "entry_gross_notional",
+    "gross_pnl",
+    "commission_cost",
+    "slippage_cost",
+    "transaction_cost",
+    "borrow_cost",
+    "financing_cost",
+    "carry_cost",
+    "total_cost",
+    "net_pnl",
+    "return_on_entry_gross_notional",
+    "forced_exit",
+)
+
+
+class TradeExitReason(str, Enum):
+    """Canonical reasons recorded when an executed trade closes."""
+
+    MEAN_REVERSION = "MEAN_REVERSION"
+    STOP = "STOP"
+    TIME = "TIME"
+    END_OF_BACKTEST = "END_OF_BACKTEST"
+
+
+@dataclass(frozen=True)
+class TradeRecord:
+    """Immutable attribution record for one completed executed trade."""
+
+    trade_id: int
+    side: str
+    entry_row: int
+    exit_row: int
+    entry_index: Any
+    exit_index: Any
+    entry_event: str
+    exit_event: str
+    exit_reason: str
+    entry_price_y: float
+    entry_price_x: float
+    exit_price_y: float
+    exit_price_x: float
+    entry_units_y: float
+    entry_units_x: float
+    exit_units_y: float
+    exit_units_x: float
+    entry_hedge_ratio: float
+    exit_hedge_ratio: float
+    holding_period_rows: int
+    entry_gross_notional: float
+    gross_pnl: float
+    commission_cost: float
+    slippage_cost: float
+    transaction_cost: float
+    borrow_cost: float
+    financing_cost: float
+    carry_cost: float
+    total_cost: float
+    net_pnl: float
+    return_on_entry_gross_notional: float
+    forced_exit: bool
+
+
+@dataclass(frozen=True)
+class LedgerReconciliation:
+    """Immutable comparison of ledger totals with their accounting rows."""
+
+    status: str
+    completed_trade_count: int
+    has_open_trade: bool
+    fully_reconcilable: bool
+    completed_totals_match: bool
+    final_accounting_match: bool | None
+    gross_pnl_match: bool | None
+    transaction_cost_match: bool | None
+    carry_cost_match: bool | None
+    net_pnl_match: bool | None
+    ledger_gross_pnl: float
+    schedule_completed_gross_pnl: float
+    ledger_transaction_cost: float
+    schedule_completed_transaction_cost: float
+    ledger_carry_cost: float
+    schedule_completed_carry_cost: float
+    ledger_net_pnl: float
+    schedule_completed_net_pnl: float
+    open_trade_gross_pnl: float
+    open_trade_transaction_cost: float
+    open_trade_carry_cost: float
+    open_trade_net_pnl: float
+    final_cumulative_net_pnl_after_carry: float
 
 
 class PairUnits(NamedTuple):
@@ -205,6 +328,8 @@ def _normalise_event(value: Any) -> str:
     if isinstance(value, TradeEvent):
         return value.value
     if isinstance(value, str):
+        if value == _FORCED_EXIT_EVENT:
+            return value
         try:
             return TradeEvent(value).value
         except ValueError as exc:
@@ -2057,3 +2182,700 @@ def build_financed_pnl_schedule(
     result = pd.concat([base_net, additions], axis=1, copy=False)
     result.index = position_schedule.index
     return result.loc[:, list(_FINANCED_OUTPUT_COLUMNS)]
+
+
+def _liquidation_series(
+    supplied: pd.Series | None,
+    schedule: pd.DataFrame,
+    column: str,
+) -> pd.Series:
+    """Resolve and validate a current-data Series used for final liquidation."""
+    if supplied is None:
+        if column not in schedule.columns:
+            raise ValueError(
+                f"{column} is required to force-liquidate an open position."
+            )
+        source = schedule[column]
+    else:
+        source = supplied
+    values = _validated_market_series(source, column, strictly_positive=True)
+    _require_matching_index(schedule.index, source.index, column)
+    return values
+
+
+def force_liquidate_open_position(
+    position_schedule: pd.DataFrame,
+    price_y: pd.Series | None = None,
+    price_x: pd.Series | None = None,
+    hedge_ratio: float | pd.Series | None = None,
+    *,
+    force_liquidation: bool = True,
+) -> pd.DataFrame:
+    """Return a copied schedule with an optional final-row forced close.
+
+    Only the final row is changed.  Its prior-row holdings still drive final
+    interval P&L when the returned schedule is passed through the existing
+    accounting functions.  Normal 6C transaction costs then arise from the
+    final unit deltas; no penalty fee is introduced.
+
+    Final prices and beta are taken from explicit aligned inputs when supplied,
+    otherwise from matching columns in ``position_schedule``.  They must be
+    observable on the final row.  This function does not backfill them.
+    """
+    if type(force_liquidation) is not bool:
+        raise TypeError("force_liquidation must be a bool.")
+    validated = _validated_position_schedule(position_schedule)
+    result = position_schedule.copy(deep=True)
+    if not force_liquidation or result.empty:
+        return result
+
+    final_row = len(result) - 1
+    if validated["executed_state"].iat[final_row] == PositionState.FLAT.name:
+        return result
+
+    y_values = _liquidation_series(price_y, result, "price_y")
+    x_values = _liquidation_series(price_x, result, "price_x")
+    final_y = y_values.iat[final_row]
+    final_x = x_values.iat[final_row]
+    if not np.isfinite(final_y) or not np.isfinite(final_x):
+        raise ValueError(
+            "Final prices must be available to force-liquidate an open position."
+        )
+
+    if hedge_ratio is None:
+        if "hedge_ratio" not in result.columns:
+            raise ValueError(
+                "hedge_ratio is required to force-liquidate an open position."
+            )
+        beta_values = _validated_market_series(
+            result["hedge_ratio"],
+            "hedge_ratio",
+            strictly_positive=True,
+        )
+    elif isinstance(hedge_ratio, pd.Series):
+        beta_values = _validated_market_series(
+            hedge_ratio,
+            "hedge_ratio",
+            strictly_positive=True,
+        )
+        _require_matching_index(result.index, hedge_ratio.index, "hedge_ratio")
+    else:
+        beta = _finite_positive_scalar(hedge_ratio, "hedge_ratio")
+        beta_values = pd.Series(beta, index=result.index, dtype=float)
+    final_beta = beta_values.iat[final_row]
+    if not np.isfinite(final_beta):
+        raise ValueError(
+            "Final hedge ratio must be available to force-liquidate an open "
+            "position."
+        )
+
+    # If the schedule stores market inputs, keep its final row consistent with
+    # the explicit current observations used to authorize the close.
+    for column, current_value in (
+        ("price_y", float(final_y)),
+        ("price_x", float(final_x)),
+        ("hedge_ratio", float(final_beta)),
+    ):
+        if column in result.columns:
+            result.iat[final_row, result.columns.get_loc(column)] = current_value
+
+    result.iat[
+        final_row, result.columns.get_loc("executed_state")
+    ] = PositionState.FLAT.name
+    result.iat[
+        final_row, result.columns.get_loc("execution_event")
+    ] = _FORCED_EXIT_EVENT
+    result.iat[final_row, result.columns.get_loc("units_y")] = 0.0
+    result.iat[final_row, result.columns.get_loc("units_x")] = 0.0
+    for column in (
+        "notional_y",
+        "notional_x",
+        "gross_exposure",
+        "net_exposure",
+    ):
+        if column in result.columns:
+            result.iat[final_row, result.columns.get_loc(column)] = 0.0
+    if "rebalance" in result.columns:
+        result.iat[final_row, result.columns.get_loc("rebalance")] = False
+
+    _validated_position_schedule(result)
+    result.index = position_schedule.index
+    return result
+
+
+def _validated_ledger_inputs(
+    accounting_schedule: pd.DataFrame,
+    position_schedule: pd.DataFrame | None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+    """Validate and copy the financed and executed-state ledger inputs."""
+    if not isinstance(accounting_schedule, pd.DataFrame):
+        raise TypeError("accounting_schedule must be a pandas DataFrame.")
+    if not accounting_schedule.index.is_unique:
+        raise ValueError("accounting_schedule must have a unique index.")
+
+    required_accounting = {
+        "price_y",
+        "price_x",
+        "units_y",
+        "units_x",
+        "gross_pnl",
+        "commission_cost",
+        "slippage_cost",
+        "transaction_cost",
+        "borrow_cost",
+        "financing_cost",
+        "carry_cost",
+        "net_pnl_after_carry",
+        "cumulative_net_pnl_after_carry",
+        "rebalance",
+    }
+    missing = required_accounting.difference(accounting_schedule.columns)
+    if missing:
+        raise ValueError(
+            "accounting_schedule is missing required financed columns: "
+            f"{sorted(missing)}."
+        )
+
+    if position_schedule is None:
+        metadata = accounting_schedule
+    else:
+        if not isinstance(position_schedule, pd.DataFrame):
+            raise TypeError("position_schedule must be a pandas DataFrame.")
+        if not position_schedule.index.is_unique:
+            raise ValueError("position_schedule must have a unique index.")
+        _require_matching_index(
+            accounting_schedule.index,
+            position_schedule.index,
+            "position_schedule",
+        )
+        metadata = position_schedule
+    required_metadata = {"executed_state", "execution_event", "hedge_ratio"}
+    missing_metadata = required_metadata.difference(metadata.columns)
+    if missing_metadata:
+        raise ValueError(
+            "position_schedule is missing required ledger metadata: "
+            f"{sorted(missing_metadata)}."
+        )
+
+    accounting = accounting_schedule.copy(deep=True)
+    validation_schedule = pd.DataFrame(
+        {
+            "executed_state": metadata["executed_state"],
+            "execution_event": metadata["execution_event"],
+            "units_y": accounting["units_y"],
+            "units_x": accounting["units_x"],
+            "rebalance": accounting["rebalance"],
+        },
+        index=accounting.index,
+    )
+    states = _validated_position_schedule(validation_schedule)
+    hedge = _validated_market_series(
+        metadata["hedge_ratio"],
+        "position_schedule['hedge_ratio']",
+        strictly_positive=True,
+    )
+    _require_matching_index(accounting.index, hedge.index, "hedge_ratio")
+
+    numeric_columns = {
+        "price_y": True,
+        "price_x": True,
+        "gross_pnl": False,
+        "commission_cost": False,
+        "slippage_cost": False,
+        "transaction_cost": False,
+        "borrow_cost": False,
+        "financing_cost": False,
+        "carry_cost": False,
+        "net_pnl_after_carry": False,
+        "cumulative_net_pnl_after_carry": False,
+    }
+    validated_numeric: dict[str, pd.Series] = {}
+    for column, strictly_positive in numeric_columns.items():
+        validated_numeric[column] = _validated_market_series(
+            accounting[column],
+            f"accounting_schedule['{column}']",
+            strictly_positive=strictly_positive,
+        )
+        accounting[column] = validated_numeric[column]
+
+    for column in (
+        "commission_cost",
+        "slippage_cost",
+        "transaction_cost",
+        "borrow_cost",
+        "financing_cost",
+        "carry_cost",
+    ):
+        present = accounting[column].dropna()
+        if bool((present < 0.0).any()):
+            raise ValueError(f"accounting_schedule['{column}'] must be non-negative.")
+
+    commission = accounting["commission_cost"].to_numpy(dtype=float)
+    slippage = accounting["slippage_cost"].to_numpy(dtype=float)
+    transaction = accounting["transaction_cost"].to_numpy(dtype=float)
+    borrow = accounting["borrow_cost"].to_numpy(dtype=float)
+    financing = accounting["financing_cost"].to_numpy(dtype=float)
+    carry = accounting["carry_cost"].to_numpy(dtype=float)
+    gross = accounting["gross_pnl"].to_numpy(dtype=float)
+    net = accounting["net_pnl_after_carry"].to_numpy(dtype=float)
+    for row_number in range(len(accounting)):
+        if np.isfinite([commission[row_number], slippage[row_number]]).all():
+            expected_transaction = commission[row_number] + slippage[row_number]
+            if not np.isclose(
+                transaction[row_number], expected_transaction, rtol=1e-10, atol=1e-12
+            ):
+                raise ValueError(
+                    "transaction_cost is inconsistent at row position "
+                    f"{row_number}."
+                )
+        elif not np.isnan(transaction[row_number]):
+            raise ValueError(
+                "transaction_cost must remain unknown when a required cost "
+                f"component is unknown at row position {row_number}."
+            )
+        if np.isfinite([borrow[row_number], financing[row_number]]).all():
+            expected_carry = borrow[row_number] + financing[row_number]
+            if not np.isclose(
+                carry[row_number], expected_carry, rtol=1e-10, atol=1e-12
+            ):
+                raise ValueError(
+                    f"carry_cost is inconsistent at row position {row_number}."
+                )
+        elif not np.isnan(carry[row_number]):
+            raise ValueError(
+                "carry_cost must remain unknown when a required carry "
+                f"component is unknown at row position {row_number}."
+            )
+        if np.isfinite(
+            [gross[row_number], transaction[row_number], carry[row_number]]
+        ).all():
+            expected_net = (
+                gross[row_number]
+                - transaction[row_number]
+                - carry[row_number]
+            )
+            if not np.isclose(
+                net[row_number], expected_net, rtol=1e-10, atol=1e-12
+            ):
+                raise ValueError(
+                    "net_pnl_after_carry is inconsistent at row position "
+                    f"{row_number}."
+                )
+        elif not np.isnan(net[row_number]):
+            raise ValueError(
+                "net_pnl_after_carry must remain unknown when gross P&L or a "
+                f"required cost is unknown at row position {row_number}."
+            )
+
+    accounting.index = accounting_schedule.index
+    states.index = accounting_schedule.index
+    hedge.index = accounting_schedule.index
+    return accounting, states, hedge
+
+
+def _trade_windows(
+    states: pd.DataFrame,
+) -> tuple[list[tuple[int, int]], int | None]:
+    """Return completed inclusive row windows and any final open entry row."""
+    completed: list[tuple[int, int]] = []
+    open_entry: int | None = None
+    previous_state = PositionState.FLAT.name
+    for row_number, current_state in enumerate(states["executed_state"]):
+        if previous_state == PositionState.FLAT.name and current_state != previous_state:
+            if open_entry is not None:
+                raise ValueError("A new trade began while another trade was open.")
+            open_entry = row_number
+        elif previous_state != PositionState.FLAT.name and current_state == PositionState.FLAT.name:
+            if open_entry is None:
+                raise ValueError("A trade closed when no trade was open.")
+            completed.append((open_entry, row_number))
+            open_entry = None
+        previous_state = current_state
+    return completed, open_entry
+
+
+def _sum_preserving_unknown(values: pd.Series | np.ndarray) -> float:
+    """Sum known values, returning NaN when any attributed value is unknown."""
+    array = np.asarray(values, dtype=float)
+    if np.isnan(array).any():
+        return np.nan
+    with np.errstate(over="ignore", invalid="ignore"):
+        total = float(array.sum(dtype=float))
+    if not np.isfinite(total):
+        raise ValueError("Attributed accounting total overflowed.")
+    return total
+
+
+def _exit_reason(event: str) -> TradeExitReason:
+    """Map an executed close event to its canonical ledger reason."""
+    reasons = {
+        TradeEvent.EXIT_MEAN_REVERSION.value: TradeExitReason.MEAN_REVERSION,
+        TradeEvent.EXIT_STOP.value: TradeExitReason.STOP,
+        TradeEvent.EXIT_TIME.value: TradeExitReason.TIME,
+        _FORCED_EXIT_EVENT: TradeExitReason.END_OF_BACKTEST,
+    }
+    try:
+        return reasons[event]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported executed exit event: {event!r}.") from exc
+
+
+def _finite_trade_endpoint(value: Any, name: str) -> float:
+    """Validate an observable positive trade endpoint price or hedge ratio."""
+    return _finite_positive_scalar(value, name)
+
+
+def build_trade_ledger(
+    accounting_schedule: pd.DataFrame,
+    position_schedule: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Attribute existing financed accounting rows to completed trades.
+
+    ``accounting_schedule`` supplies valued holdings, P&L, and costs, while
+    ``position_schedule`` supplies executed states, events, and hedge ratios.
+    The latter may be omitted only when those metadata columns were explicitly
+    joined to the accounting frame by the caller.  An open final trade is not
+    fabricated as completed; callers may first use
+    :func:`force_liquidate_open_position` and rebuild accounting.
+    """
+    accounting, states, hedge = _validated_ledger_inputs(
+        accounting_schedule,
+        position_schedule,
+    )
+    completed, _ = _trade_windows(states)
+    records: list[TradeRecord] = []
+
+    for trade_number, (entry_row, exit_row) in enumerate(completed, start=1):
+        side = states["executed_state"].iat[entry_row]
+        entry_event = states["execution_event"].iat[entry_row]
+        exit_event = states["execution_event"].iat[exit_row]
+        entry_price_y = _finite_trade_endpoint(
+            accounting["price_y"].iat[entry_row],
+            "entry_price_y",
+        )
+        entry_price_x = _finite_trade_endpoint(
+            accounting["price_x"].iat[entry_row],
+            "entry_price_x",
+        )
+        exit_price_y = _finite_trade_endpoint(
+            accounting["price_y"].iat[exit_row],
+            "exit_price_y",
+        )
+        exit_price_x = _finite_trade_endpoint(
+            accounting["price_x"].iat[exit_row],
+            "exit_price_x",
+        )
+        entry_beta = _finite_trade_endpoint(
+            hedge.iat[entry_row],
+            "entry_hedge_ratio",
+        )
+        exit_beta = _finite_trade_endpoint(
+            hedge.iat[exit_row],
+            "exit_hedge_ratio",
+        )
+        entry_units_y = float(accounting["units_y"].iat[entry_row])
+        entry_units_x = float(accounting["units_x"].iat[entry_row])
+        with np.errstate(over="ignore", invalid="ignore"):
+            entry_gross = (
+                abs(entry_units_y * entry_price_y)
+                + abs(entry_units_x * entry_price_x)
+            )
+        entry_gross = _finite_trade_endpoint(
+            entry_gross,
+            "entry_gross_notional",
+        )
+        attributed = accounting.iloc[entry_row : exit_row + 1]
+        gross_pnl = _sum_preserving_unknown(attributed["gross_pnl"])
+        commission_cost = _sum_preserving_unknown(
+            attributed["commission_cost"]
+        )
+        slippage_cost = _sum_preserving_unknown(attributed["slippage_cost"])
+        transaction_cost = _sum_preserving_unknown(
+            attributed["transaction_cost"]
+        )
+        borrow_cost = _sum_preserving_unknown(attributed["borrow_cost"])
+        financing_cost = _sum_preserving_unknown(
+            attributed["financing_cost"]
+        )
+        carry_cost = _sum_preserving_unknown(attributed["carry_cost"])
+        if np.isnan(carry_cost) or np.isnan(transaction_cost):
+            total_cost = np.nan
+        else:
+            total_cost = transaction_cost + carry_cost
+        if np.isnan(gross_pnl) or np.isnan(total_cost):
+            net_pnl = np.nan
+            trade_return = np.nan
+        else:
+            net_pnl = gross_pnl - total_cost
+            trade_return = net_pnl / entry_gross
+        if np.isinf([total_cost, net_pnl, trade_return]).any():
+            raise ValueError(f"Trade {trade_number} attribution overflowed.")
+
+        records.append(
+            TradeRecord(
+                trade_id=trade_number,
+                side=side,
+                entry_row=entry_row,
+                exit_row=exit_row,
+                entry_index=accounting.index[entry_row],
+                exit_index=accounting.index[exit_row],
+                entry_event=entry_event,
+                exit_event=exit_event,
+                exit_reason=_exit_reason(exit_event).value,
+                entry_price_y=entry_price_y,
+                entry_price_x=entry_price_x,
+                exit_price_y=exit_price_y,
+                exit_price_x=exit_price_x,
+                entry_units_y=entry_units_y,
+                entry_units_x=entry_units_x,
+                exit_units_y=float(accounting["units_y"].iat[exit_row - 1]),
+                exit_units_x=float(accounting["units_x"].iat[exit_row - 1]),
+                entry_hedge_ratio=entry_beta,
+                exit_hedge_ratio=exit_beta,
+                holding_period_rows=exit_row - entry_row,
+                entry_gross_notional=entry_gross,
+                gross_pnl=gross_pnl,
+                commission_cost=commission_cost,
+                slippage_cost=slippage_cost,
+                transaction_cost=transaction_cost,
+                borrow_cost=borrow_cost,
+                financing_cost=financing_cost,
+                carry_cost=carry_cost,
+                total_cost=total_cost,
+                net_pnl=net_pnl,
+                return_on_entry_gross_notional=trade_return,
+                forced_exit=exit_event == _FORCED_EXIT_EVENT,
+            )
+        )
+
+    result = pd.DataFrame.from_records(
+        [asdict(record) for record in records],
+        columns=list(_TRADE_LEDGER_COLUMNS),
+    )
+    if not result.empty:
+        result["trade_id"] = result["trade_id"].astype("int64")
+        result["entry_row"] = result["entry_row"].astype("int64")
+        result["exit_row"] = result["exit_row"].astype("int64")
+        result["holding_period_rows"] = result["holding_period_rows"].astype(
+            "int64"
+        )
+        result["forced_exit"] = result["forced_exit"].astype(bool)
+    return result.loc[:, list(_TRADE_LEDGER_COLUMNS)]
+
+
+def _validated_ledger(ledger: pd.DataFrame) -> pd.DataFrame:
+    """Validate the public completed-trade ledger contract."""
+    if not isinstance(ledger, pd.DataFrame):
+        raise TypeError("ledger must be a pandas DataFrame.")
+    missing = set(_TRADE_LEDGER_COLUMNS).difference(ledger.columns)
+    if missing:
+        raise ValueError(f"ledger is missing required columns: {sorted(missing)}.")
+    result = ledger.loc[:, list(_TRADE_LEDGER_COLUMNS)].copy(deep=True)
+    expected_ids = list(range(1, len(result) + 1))
+    ids: list[int] = []
+    for value in result["trade_id"]:
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
+            raise TypeError("ledger trade_id values must be integers.")
+        ids.append(int(value))
+    if ids != expected_ids:
+        raise ValueError("ledger trade_id values must be unique and consecutive from 1.")
+    for value in result["forced_exit"]:
+        if not isinstance(value, (bool, np.bool_)):
+            raise TypeError("ledger forced_exit values must be Boolean.")
+
+    numeric = (
+        "gross_pnl",
+        "transaction_cost",
+        "carry_cost",
+        "net_pnl",
+    )
+    for column in numeric:
+        result[column] = _validated_market_series(
+            result[column],
+            f"ledger['{column}']",
+            strictly_positive=False,
+        )
+    return result
+
+
+def _rows_total(
+    accounting: pd.DataFrame,
+    windows: list[tuple[int, int]],
+    column: str,
+) -> float:
+    """Aggregate one accounting column across disjoint inclusive windows."""
+    if not windows:
+        return 0.0
+    values = np.concatenate(
+        [
+            accounting[column].iloc[entry : exit + 1].to_numpy(dtype=float)
+            for entry, exit in windows
+        ]
+    )
+    return _sum_preserving_unknown(values)
+
+
+def _optional_close(
+    left: float,
+    right: float,
+    *,
+    rtol: float,
+    atol: float,
+) -> bool | None:
+    """Compare known totals, using None when both sides are unknown."""
+    left_unknown = bool(np.isnan(left))
+    right_unknown = bool(np.isnan(right))
+    if left_unknown and right_unknown:
+        return None
+    if left_unknown or right_unknown:
+        return False
+    return bool(np.isclose(left, right, rtol=rtol, atol=atol))
+
+
+def reconcile_trade_ledger(
+    ledger: pd.DataFrame,
+    accounting_schedule: pd.DataFrame,
+    position_schedule: pd.DataFrame | None = None,
+    *,
+    rtol: float = 1e-9,
+    atol: float = 1e-12,
+) -> LedgerReconciliation:
+    """Reconcile completed ledger totals with their causal accounting rows.
+
+    A final open trade is reported separately and deliberately prevents a
+    final cumulative comparison.  Unknown completed-trade accounting produces
+    ``UNKNOWN_ACCOUNTING`` rather than a false successful reconciliation.
+    """
+    relative_tolerance = _finite_nonnegative_scalar(rtol, "rtol")
+    absolute_tolerance = _finite_nonnegative_scalar(atol, "atol")
+    accounting, states, _ = _validated_ledger_inputs(
+        accounting_schedule,
+        position_schedule,
+    )
+    completed, open_entry = _trade_windows(states)
+    checked_ledger = _validated_ledger(ledger)
+
+    ledger_gross = _sum_preserving_unknown(checked_ledger["gross_pnl"])
+    ledger_transaction = _sum_preserving_unknown(
+        checked_ledger["transaction_cost"]
+    )
+    ledger_carry = _sum_preserving_unknown(checked_ledger["carry_cost"])
+    ledger_net = _sum_preserving_unknown(checked_ledger["net_pnl"])
+    schedule_gross = _rows_total(accounting, completed, "gross_pnl")
+    schedule_transaction = _rows_total(
+        accounting,
+        completed,
+        "transaction_cost",
+    )
+    schedule_carry = _rows_total(accounting, completed, "carry_cost")
+    schedule_net = _rows_total(
+        accounting,
+        completed,
+        "net_pnl_after_carry",
+    )
+
+    gross_match = _optional_close(
+        ledger_gross,
+        schedule_gross,
+        rtol=relative_tolerance,
+        atol=absolute_tolerance,
+    )
+    transaction_match = _optional_close(
+        ledger_transaction,
+        schedule_transaction,
+        rtol=relative_tolerance,
+        atol=absolute_tolerance,
+    )
+    carry_match = _optional_close(
+        ledger_carry,
+        schedule_carry,
+        rtol=relative_tolerance,
+        atol=absolute_tolerance,
+    )
+    net_match = _optional_close(
+        ledger_net,
+        schedule_net,
+        rtol=relative_tolerance,
+        atol=absolute_tolerance,
+    )
+    component_matches = (
+        gross_match,
+        transaction_match,
+        carry_match,
+        net_match,
+    )
+    count_matches = len(checked_ledger) == len(completed)
+    completed_match = count_matches and all(value is True for value in component_matches)
+    fully_reconcilable = all(value is not None for value in component_matches)
+
+    if accounting.empty:
+        final_cumulative = 0.0
+    else:
+        final_cumulative = float(
+            accounting["cumulative_net_pnl_after_carry"].iat[-1]
+        )
+    if open_entry is None:
+        final_match = _optional_close(
+            ledger_net,
+            final_cumulative,
+            rtol=relative_tolerance,
+            atol=absolute_tolerance,
+        )
+        open_gross = 0.0
+        open_transaction = 0.0
+        open_carry = 0.0
+        open_net = 0.0
+    else:
+        final_match = None
+        open_gross = _sum_preserving_unknown(
+            accounting["gross_pnl"].iloc[open_entry:]
+        )
+        open_transaction = _sum_preserving_unknown(
+            accounting["transaction_cost"].iloc[open_entry:]
+        )
+        open_carry = _sum_preserving_unknown(
+            accounting["carry_cost"].iloc[open_entry:]
+        )
+        open_net = _sum_preserving_unknown(
+            accounting["net_pnl_after_carry"].iloc[open_entry:]
+        )
+
+    explicit_mismatch = (
+        not count_matches
+        or any(value is False for value in component_matches)
+        or final_match is False
+    )
+    if explicit_mismatch:
+        status = "MISMATCH"
+    elif not fully_reconcilable or final_match is None and open_entry is None:
+        status = "UNKNOWN_ACCOUNTING"
+    elif open_entry is not None:
+        status = "OPEN_TRADE"
+    else:
+        status = "RECONCILED"
+
+    return LedgerReconciliation(
+        status=status,
+        completed_trade_count=len(completed),
+        has_open_trade=open_entry is not None,
+        fully_reconcilable=fully_reconcilable,
+        completed_totals_match=completed_match,
+        final_accounting_match=final_match,
+        gross_pnl_match=gross_match,
+        transaction_cost_match=transaction_match,
+        carry_cost_match=carry_match,
+        net_pnl_match=net_match,
+        ledger_gross_pnl=ledger_gross,
+        schedule_completed_gross_pnl=schedule_gross,
+        ledger_transaction_cost=ledger_transaction,
+        schedule_completed_transaction_cost=schedule_transaction,
+        ledger_carry_cost=ledger_carry,
+        schedule_completed_carry_cost=schedule_carry,
+        ledger_net_pnl=ledger_net,
+        schedule_completed_net_pnl=schedule_net,
+        open_trade_gross_pnl=open_gross,
+        open_trade_transaction_cost=open_transaction,
+        open_trade_carry_cost=open_carry,
+        open_trade_net_pnl=open_net,
+        final_cumulative_net_pnl_after_carry=final_cumulative,
+    )

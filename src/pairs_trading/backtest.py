@@ -1,9 +1,9 @@
 """Causal pair execution, unit sizing, and marked-to-market accounting.
 
 The module converts state-changing decisions into lagged executions, sizes the
-two legs on the actual execution row, and accounts for exposure and gross P&L.
-Transaction costs, financing, trade ledgers, and performance metrics remain
-outside this milestone.
+two legs on the actual execution row, and accounts for exposure, P&L,
+execution costs, and simple carry costs.  Trade ledgers and performance
+metrics remain outside this milestone.
 """
 
 from __future__ import annotations
@@ -29,6 +29,10 @@ __all__ = [
     "calculate_transaction_costs",
     "apply_execution_costs",
     "build_net_pnl_schedule",
+    "calculate_borrow_costs",
+    "calculate_financing_costs",
+    "calculate_rebalancing_costs",
+    "build_financed_pnl_schedule",
 ]
 
 
@@ -103,6 +107,25 @@ _NET_PNL_OUTPUT_COLUMNS = (
     "net_portfolio_equity",
     "strategy_return",
     "net_strategy_return",
+)
+
+_FINANCED_OUTPUT_COLUMNS = _NET_PNL_OUTPUT_COLUMNS + (
+    "borrow_cost_y",
+    "borrow_cost_x",
+    "borrow_cost",
+    "financing_cost",
+    "carry_cost",
+    "cumulative_borrow_cost",
+    "cumulative_financing_cost",
+    "cumulative_carry_cost",
+    "rebalance",
+    "rebalance_beta",
+    "rebalance_delta_units_y",
+    "rebalance_delta_units_x",
+    "net_pnl_after_carry",
+    "cumulative_net_pnl_after_carry",
+    "net_equity_after_carry",
+    "net_return_after_carry",
 )
 
 
@@ -588,18 +611,27 @@ def _validated_position_schedule(schedule: pd.DataFrame) -> pd.DataFrame:
     )
     if units_y.isna().any() or units_x.isna().any():
         raise ValueError("Position units must not contain missing values.")
+    if "rebalance" in schedule.columns:
+        rebalance_flags: list[bool] = []
+        for value in schedule["rebalance"]:
+            if not isinstance(value, (bool, np.bool_)):
+                raise TypeError("position_schedule['rebalance'] must contain bool values.")
+            rebalance_flags.append(bool(value))
+    else:
+        rebalance_flags = [False] * len(schedule)
 
     previous_state = PositionState.FLAT.name
     previous_y = 0.0
     previous_x = 0.0
-    for row_number, (state, event, current_y, current_x) in enumerate(
-        zip(states, events, units_y, units_x, strict=True)
+    for row_number, (state, event, current_y, current_x, is_rebalance) in enumerate(
+        zip(states, events, units_y, units_x, rebalance_flags, strict=True)
     ):
         if row_number == 0 and (
             state != PositionState.FLAT.name
             or event != TradeEvent.NONE.value
             or current_y != 0.0
             or current_x != 0.0
+            or is_rebalance
         ):
             raise ValueError(
                 "The first position-schedule row must be an unexecuted flat "
@@ -621,7 +653,18 @@ def _validated_position_schedule(schedule: pd.DataFrame) -> pd.DataFrame:
                 f"Short-spread units have invalid signs at row position {row_number}."
             )
 
-        if event == TradeEvent.NONE.value:
+        if is_rebalance:
+            if (
+                event != TradeEvent.NONE.value
+                or previous_state == PositionState.FLAT.name
+                or state != previous_state
+                or (current_y == previous_y and current_x == previous_x)
+            ):
+                raise ValueError(
+                    "Invalid hedge-rebalancing unit change at row position "
+                    f"{row_number}."
+                )
+        elif event == TradeEvent.NONE.value:
             if (
                 state != previous_state
                 or current_y != previous_y
@@ -666,6 +709,11 @@ def _validated_position_schedule(schedule: pd.DataFrame) -> pd.DataFrame:
             "execution_event": pd.Series(events, index=schedule.index, dtype=object),
             "units_y": units_y,
             "units_x": units_x,
+            "rebalance": pd.Series(
+                rebalance_flags,
+                index=schedule.index,
+                dtype=bool,
+            ),
         }
     )
     result.index = schedule.index
@@ -1407,3 +1455,605 @@ def build_net_pnl_schedule(
     )
     result.index = position_schedule.index
     return result.loc[:, list(_NET_PNL_OUTPUT_COLUMNS)]
+
+
+def _aligned_nonnegative_rate(
+    rate: float | pd.Series,
+    index: pd.Index,
+    name: str,
+) -> pd.Series:
+    """Return a finite non-negative scalar or exactly aligned rate Series."""
+    if isinstance(rate, pd.Series):
+        values = _validated_market_series(rate, name, strictly_positive=False)
+        _require_matching_index(index, rate.index, name)
+        if values.isna().any():
+            raise ValueError(f"{name} must not contain missing values.")
+        if bool((values < 0.0).any()):
+            raise ValueError(f"{name} must be non-negative.")
+        return values
+    normalised = _finite_nonnegative_scalar(rate, name)
+    return pd.Series(
+        np.full(len(index), normalised, dtype=float),
+        index=index,
+        name=name,
+    )
+
+
+def calculate_borrow_costs(
+    pnl_schedule: pd.DataFrame,
+    borrow_rate_y: float | pd.Series = 0.0,
+    borrow_rate_x: float | pd.Series = 0.0,
+    periods_per_year: int = 252,
+) -> pd.DataFrame:
+    """Accrue annualised short-borrow fees from prior-row short exposure.
+
+    A dynamic rate observed at ``t-1`` applies to interval ``t-1`` to ``t``.
+    The first row is zero.  Long and flat legs have zero borrow cost.  A short
+    leg with an unavailable prior market value has unknown borrow cost rather
+    than an assumed zero charge.
+    """
+    if not isinstance(pnl_schedule, pd.DataFrame):
+        raise TypeError("pnl_schedule must be a pandas DataFrame.")
+    if not pnl_schedule.index.is_unique:
+        raise ValueError("pnl_schedule must have a unique index.")
+    required = {"units_y", "units_x", "market_value_y", "market_value_x"}
+    missing = required.difference(pnl_schedule.columns)
+    if missing:
+        raise ValueError(
+            f"pnl_schedule is missing required columns: {sorted(missing)}."
+        )
+
+    periods = _positive_integer(periods_per_year, "periods_per_year")
+    units_y = _validated_market_series(
+        pnl_schedule["units_y"],
+        "units_y",
+        strictly_positive=False,
+    )
+    units_x = _validated_market_series(
+        pnl_schedule["units_x"],
+        "units_x",
+        strictly_positive=False,
+    )
+    values_y = _validated_market_series(
+        pnl_schedule["market_value_y"],
+        "market_value_y",
+        strictly_positive=False,
+    )
+    values_x = _validated_market_series(
+        pnl_schedule["market_value_x"],
+        "market_value_x",
+        strictly_positive=False,
+    )
+    if units_y.isna().any() or units_x.isna().any():
+        raise ValueError("Position units must not contain missing values.")
+    rates_y = _aligned_nonnegative_rate(
+        borrow_rate_y,
+        pnl_schedule.index,
+        "borrow_rate_y",
+    )
+    rates_x = _aligned_nonnegative_rate(
+        borrow_rate_x,
+        pnl_schedule.index,
+        "borrow_rate_x",
+    )
+
+    unit_y_array = units_y.to_numpy(dtype=float)
+    unit_x_array = units_x.to_numpy(dtype=float)
+    value_y_array = values_y.to_numpy(dtype=float)
+    value_x_array = values_x.to_numpy(dtype=float)
+    rate_y_array = rates_y.to_numpy(dtype=float)
+    rate_x_array = rates_x.to_numpy(dtype=float)
+    cost_y = np.zeros(len(pnl_schedule), dtype=float)
+    cost_x = np.zeros(len(pnl_schedule), dtype=float)
+    total = np.zeros(len(pnl_schedule), dtype=float)
+
+    for row_number in range(1, len(pnl_schedule)):
+        if unit_y_array[row_number - 1] < 0.0:
+            prior_value_y = value_y_array[row_number - 1]
+            if np.isnan(prior_value_y):
+                cost_y[row_number] = np.nan
+            else:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    cost_y[row_number] = (
+                        max(-prior_value_y, 0.0)
+                        * rate_y_array[row_number - 1]
+                        / periods
+                    )
+        if unit_x_array[row_number - 1] < 0.0:
+            prior_value_x = value_x_array[row_number - 1]
+            if np.isnan(prior_value_x):
+                cost_x[row_number] = np.nan
+            else:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    cost_x[row_number] = (
+                        max(-prior_value_x, 0.0)
+                        * rate_x_array[row_number - 1]
+                        / periods
+                    )
+        if np.isinf([cost_y[row_number], cost_x[row_number]]).any():
+            raise ValueError(
+                f"Borrow cost overflowed at row position {row_number}."
+            )
+        if np.isnan(cost_y[row_number]) or np.isnan(cost_x[row_number]):
+            total[row_number] = np.nan
+        else:
+            with np.errstate(over="ignore", invalid="ignore"):
+                total[row_number] = cost_y[row_number] + cost_x[row_number]
+            if not np.isfinite(total[row_number]):
+                raise ValueError(
+                    f"Total borrow cost overflowed at row position {row_number}."
+                )
+
+    result = pd.DataFrame(
+        {
+            "borrow_cost_y": cost_y,
+            "borrow_cost_x": cost_x,
+            "borrow_cost": total,
+            "cumulative_borrow_cost": _causal_cumulative(
+                total,
+                "Cumulative borrow cost",
+            ),
+        },
+        index=pnl_schedule.index,
+    )
+    result.index = pnl_schedule.index
+    return result.astype("float64")
+
+
+def calculate_financing_costs(
+    pnl_schedule: pd.DataFrame,
+    financing_rate: float = 0.0,
+    periods_per_year: int = 252,
+) -> pd.DataFrame:
+    """Accrue a simple funding charge on prior-row gross exposure.
+
+    This is a deliberately simplified gross-exposure charge, not a
+    prime-broker-specific cash, margin, or collateral financing model.
+    """
+    if not isinstance(pnl_schedule, pd.DataFrame):
+        raise TypeError("pnl_schedule must be a pandas DataFrame.")
+    if not pnl_schedule.index.is_unique:
+        raise ValueError("pnl_schedule must have a unique index.")
+    if "gross_exposure" not in pnl_schedule.columns:
+        raise ValueError("pnl_schedule is missing required column: gross_exposure.")
+
+    rate = _finite_nonnegative_scalar(financing_rate, "financing_rate")
+    periods = _positive_integer(periods_per_year, "periods_per_year")
+    exposure = _validated_market_series(
+        pnl_schedule["gross_exposure"],
+        "gross_exposure",
+        strictly_positive=False,
+    )
+    present = exposure.dropna()
+    if bool((present < 0.0).any()):
+        raise ValueError("gross_exposure must be non-negative.")
+
+    exposure_array = exposure.to_numpy(dtype=float)
+    financing = np.zeros(len(exposure), dtype=float)
+    for row_number in range(1, len(exposure)):
+        prior_exposure = exposure_array[row_number - 1]
+        if np.isnan(prior_exposure):
+            financing[row_number] = np.nan
+            continue
+        with np.errstate(over="ignore", invalid="ignore"):
+            financing[row_number] = prior_exposure * rate / periods
+        if not np.isfinite(financing[row_number]):
+            raise ValueError(
+                f"Financing cost overflowed at row position {row_number}."
+            )
+
+    result = pd.DataFrame(
+        {
+            "financing_cost": financing,
+            "cumulative_financing_cost": _causal_cumulative(
+                financing,
+                "Cumulative financing cost",
+            ),
+        },
+        index=pnl_schedule.index,
+    )
+    result.index = pnl_schedule.index
+    return result.astype("float64")
+
+
+def calculate_rebalancing_costs(
+    position_schedule: pd.DataFrame,
+    price_y: pd.Series,
+    price_x: pd.Series,
+    hedge_ratio: float | pd.Series | None = None,
+    target_gross_notional: float | None = None,
+    *,
+    rebalance: bool = False,
+    rebalance_threshold: float = 0.0,
+    commission_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+    fixed_commission_per_leg: float = 0.0,
+) -> pd.DataFrame:
+    """Overlay causal hedge rebalancing and reuse normal execution costs.
+
+    The relative trigger compares current beta with the beta used at the last
+    entry or rebalance.  Missing current beta or prices suppresses rebalancing
+    on that row; each later valid row is reconsidered against the unchanged
+    last-sizing beta.  No order is backdated.  State and execution-event values
+    remain unchanged, while ``rebalance`` identifies same-state unit changes.
+    """
+    if type(rebalance) is not bool:  # Actual bool, not np.bool_, is required.
+        raise TypeError("rebalance must be a bool.")
+    threshold = _finite_nonnegative_scalar(
+        rebalance_threshold,
+        "rebalance_threshold",
+    )
+    base = _validated_position_schedule(position_schedule)
+    y_values = _validated_market_series(price_y, "price_y", strictly_positive=True)
+    x_values = _validated_market_series(price_x, "price_x", strictly_positive=True)
+    _require_matching_index(base.index, price_y.index, "price_y")
+    _require_matching_index(base.index, price_x.index, "price_x")
+
+    beta_source = hedge_ratio
+    if beta_source is None and "hedge_ratio" in position_schedule.columns:
+        beta_source = position_schedule["hedge_ratio"]
+    if isinstance(beta_source, pd.Series):
+        beta_values = _validated_market_series(
+            beta_source,
+            "hedge_ratio",
+            strictly_positive=True,
+        )
+        _require_matching_index(base.index, beta_source.index, "hedge_ratio")
+    elif beta_source is not None:
+        beta = _finite_positive_scalar(beta_source, "hedge_ratio")
+        beta_values = pd.Series(
+            np.full(len(base), beta, dtype=float),
+            index=base.index,
+            name="hedge_ratio",
+        )
+    else:
+        beta_values = pd.Series(
+            np.full(len(base), np.nan, dtype=float),
+            index=base.index,
+            name="hedge_ratio",
+        )
+    if rebalance and beta_source is None:
+        raise ValueError("hedge_ratio is required when rebalance=True.")
+    if target_gross_notional is None:
+        if rebalance:
+            raise ValueError(
+                "target_gross_notional is required when rebalance=True."
+            )
+        target = None
+    else:
+        target = _finite_positive_scalar(
+            target_gross_notional,
+            "target_gross_notional",
+        )
+
+    states = base["executed_state"].to_numpy(dtype=object)
+    events = base["execution_event"].to_numpy(dtype=object)
+    base_y = base["units_y"].to_numpy(dtype=float)
+    base_x = base["units_x"].to_numpy(dtype=float)
+    marks_y = y_values.to_numpy(dtype=float)
+    marks_x = x_values.to_numpy(dtype=float)
+    betas = beta_values.to_numpy(dtype=float)
+    adjusted_y = np.zeros(len(base), dtype=float)
+    adjusted_x = np.zeros(len(base), dtype=float)
+    rebalance_flags = np.zeros(len(base), dtype=bool)
+    rebalance_betas = np.full(len(base), np.nan, dtype=float)
+    rebalance_delta_y = np.zeros(len(base), dtype=float)
+    rebalance_delta_x = np.zeros(len(base), dtype=float)
+    last_sizing_beta: float | None = None
+
+    for row_number, (state, event) in enumerate(zip(states, events, strict=True)):
+        if not rebalance:
+            adjusted_y[row_number] = base_y[row_number]
+            adjusted_x[row_number] = base_x[row_number]
+            continue
+        current_beta = betas[row_number]
+        if event in {
+            TradeEvent.ENTER_LONG.value,
+            TradeEvent.ENTER_SHORT.value,
+        }:
+            if not np.isfinite(current_beta):
+                raise ValueError(
+                    "An executed entry requires a current hedge ratio when "
+                    "rebalance=True."
+                )
+            adjusted_y[row_number] = base_y[row_number]
+            adjusted_x[row_number] = base_x[row_number]
+            last_sizing_beta = float(current_beta)
+            continue
+        if event in _EXIT_EVENTS or state == PositionState.FLAT.name:
+            adjusted_y[row_number] = 0.0
+            adjusted_x[row_number] = 0.0
+            last_sizing_beta = None
+            continue
+
+        adjusted_y[row_number] = adjusted_y[row_number - 1]
+        adjusted_x[row_number] = adjusted_x[row_number - 1]
+        current_inputs_available = bool(
+            np.isfinite(current_beta)
+            and np.isfinite(marks_y[row_number])
+            and np.isfinite(marks_x[row_number])
+        )
+        if not current_inputs_available or last_sizing_beta is None:
+            continue
+
+        beta_changed = current_beta != last_sizing_beta
+        relative_change = abs(current_beta - last_sizing_beta) / abs(
+            last_sizing_beta
+        )
+        if not beta_changed or relative_change < threshold:
+            continue
+        if target is None:  # Defensive: rebalance=True validates this above.
+            raise RuntimeError("Missing rebalancing target gross notional.")
+        desired = calculate_pair_units(
+            state,
+            marks_y[row_number],
+            marks_x[row_number],
+            current_beta,
+            target,
+        )
+        desired_matches_current = bool(
+            np.isclose(
+                desired.units_y,
+                adjusted_y[row_number],
+                rtol=1e-12,
+                atol=1e-12,
+            )
+            and np.isclose(
+                desired.units_x,
+                adjusted_x[row_number],
+                rtol=1e-12,
+                atol=1e-12,
+            )
+        )
+        last_sizing_beta = float(current_beta)
+        if desired_matches_current:
+            continue
+
+        rebalance_flags[row_number] = True
+        rebalance_betas[row_number] = current_beta
+        rebalance_delta_y[row_number] = (
+            desired.units_y - adjusted_y[row_number]
+        )
+        rebalance_delta_x[row_number] = (
+            desired.units_x - adjusted_x[row_number]
+        )
+        adjusted_y[row_number] = desired.units_y
+        adjusted_x[row_number] = desired.units_x
+
+    adjusted = pd.DataFrame(
+        {
+            "executed_state": base["executed_state"],
+            "execution_event": base["execution_event"],
+            "units_y": adjusted_y,
+            "units_x": adjusted_x,
+            "rebalance": rebalance_flags,
+        },
+        index=base.index,
+    )
+    costs = calculate_transaction_costs(
+        adjusted,
+        y_values,
+        x_values,
+        commission_bps,
+        slippage_bps,
+        fixed_commission_per_leg,
+    )
+    result = pd.concat(
+        [
+            adjusted,
+            pd.Series(
+                rebalance_betas,
+                index=base.index,
+                name="rebalance_beta",
+            ),
+            pd.Series(
+                rebalance_delta_y,
+                index=base.index,
+                name="rebalance_delta_units_y",
+            ),
+            pd.Series(
+                rebalance_delta_x,
+                index=base.index,
+                name="rebalance_delta_units_x",
+            ),
+            costs,
+        ],
+        axis=1,
+        copy=False,
+    )
+    result.index = position_schedule.index
+    return result
+
+
+def _equity_and_returns_after_carry(
+    net_pnl: np.ndarray,
+    initial_capital: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return cumulative P&L, equity, and prior-equity returns after carry."""
+    cumulative = _causal_cumulative(net_pnl, "Cumulative net P&L after carry")
+    equity = np.full(len(net_pnl), np.nan, dtype=float)
+    returns = np.full(len(net_pnl), np.nan, dtype=float)
+    for row_number, cumulative_value in enumerate(cumulative):
+        if np.isnan(cumulative_value):
+            continue
+        with np.errstate(over="ignore", invalid="ignore"):
+            equity[row_number] = initial_capital + cumulative_value
+        if not np.isfinite(equity[row_number]):
+            raise ValueError(
+                "Net equity after carry overflowed at row position "
+                f"{row_number}."
+            )
+    if len(net_pnl) and not np.isnan(net_pnl[0]):
+        returns[0] = net_pnl[0] / initial_capital
+    for row_number in range(1, len(net_pnl)):
+        prior_equity = equity[row_number - 1]
+        if np.isnan(prior_equity):
+            continue
+        if prior_equity <= 0.0:
+            raise ValueError(
+                "Prior net equity after carry must be positive to calculate a "
+                f"return at row position {row_number}."
+            )
+        if np.isnan(net_pnl[row_number]):
+            continue
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            returns[row_number] = net_pnl[row_number] / prior_equity
+        if not np.isfinite(returns[row_number]):
+            raise ValueError(
+                "Net return after carry is non-finite at row position "
+                f"{row_number}."
+            )
+    return cumulative, equity, returns
+
+
+def build_financed_pnl_schedule(
+    position_schedule: pd.DataFrame,
+    price_y: pd.Series,
+    price_x: pd.Series,
+    initial_capital: float = 1_000_000.0,
+    *,
+    commission_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+    fixed_commission_per_leg: float = 0.0,
+    borrow_rate_y: float | pd.Series = 0.0,
+    borrow_rate_x: float | pd.Series = 0.0,
+    financing_rate: float = 0.0,
+    periods_per_year: int = 252,
+    rebalance: bool = False,
+    hedge_ratio: float | pd.Series | None = None,
+    target_gross_notional: float | None = None,
+    rebalance_threshold: float = 0.0,
+) -> pd.DataFrame:
+    """Build execution, gross, transaction, carry, and financed net accounting."""
+    capital = _finite_positive_scalar(initial_capital, "initial_capital")
+    periods = _positive_integer(periods_per_year, "periods_per_year")
+    rebalanced = calculate_rebalancing_costs(
+        position_schedule,
+        price_y,
+        price_x,
+        hedge_ratio,
+        target_gross_notional,
+        rebalance=rebalance,
+        rebalance_threshold=rebalance_threshold,
+        commission_bps=commission_bps,
+        slippage_bps=slippage_bps,
+        fixed_commission_per_leg=fixed_commission_per_leg,
+    )
+    adjusted_schedule = rebalanced[
+        [
+            "executed_state",
+            "execution_event",
+            "units_y",
+            "units_x",
+            "rebalance",
+        ]
+    ].copy()
+    gross = build_pnl_schedule(
+        adjusted_schedule,
+        price_y,
+        price_x,
+        capital,
+    )
+    cost_columns = [
+        "delta_units_y",
+        "delta_units_x",
+        "traded_notional_y",
+        "traded_notional_x",
+        "commission_y",
+        "commission_x",
+        "fixed_commission_y",
+        "fixed_commission_x",
+        "commission_cost",
+        "slippage_y",
+        "slippage_x",
+        "slippage_cost",
+        "transaction_cost",
+        "cumulative_transaction_cost",
+    ]
+    costs = rebalanced[cost_columns]
+    net = apply_execution_costs(gross, costs, capital)
+    base_net = pd.concat(
+        [
+            gross[["price_y", "price_x", "units_y", "units_x"]],
+            costs,
+            net.drop(
+                columns=["transaction_cost", "cumulative_transaction_cost"]
+            ),
+        ],
+        axis=1,
+        copy=False,
+    ).loc[:, list(_NET_PNL_OUTPUT_COLUMNS)]
+
+    borrow = calculate_borrow_costs(
+        gross,
+        borrow_rate_y,
+        borrow_rate_x,
+        periods,
+    )
+    financing = calculate_financing_costs(gross, financing_rate, periods)
+    borrow_array = borrow["borrow_cost"].to_numpy(dtype=float)
+    financing_array = financing["financing_cost"].to_numpy(dtype=float)
+    gross_array = gross["gross_pnl"].to_numpy(dtype=float)
+    transaction_array = costs["transaction_cost"].to_numpy(dtype=float)
+    carry = np.full(len(gross), np.nan, dtype=float)
+    financed_net = np.full(len(gross), np.nan, dtype=float)
+
+    for row_number, (borrow_value, financing_value) in enumerate(
+        zip(borrow_array, financing_array, strict=True)
+    ):
+        if np.isnan(borrow_value) or np.isnan(financing_value):
+            continue
+        with np.errstate(over="ignore", invalid="ignore"):
+            carry[row_number] = borrow_value + financing_value
+        if not np.isfinite(carry[row_number]):
+            raise ValueError(
+                f"Carry cost overflowed at row position {row_number}."
+            )
+        if np.isnan(gross_array[row_number]):
+            continue
+        with np.errstate(over="ignore", invalid="ignore"):
+            financed_net[row_number] = (
+                gross_array[row_number]
+                - transaction_array[row_number]
+                - carry[row_number]
+            )
+        if not np.isfinite(financed_net[row_number]):
+            raise ValueError(
+                "Net P&L after carry overflowed at row position "
+                f"{row_number}."
+            )
+
+    cumulative_carry = _causal_cumulative(carry, "Cumulative carry cost")
+    cumulative_financed, financed_equity, financed_returns = (
+        _equity_and_returns_after_carry(financed_net, capital)
+    )
+    additions = pd.DataFrame(
+        {
+            "borrow_cost_y": borrow["borrow_cost_y"],
+            "borrow_cost_x": borrow["borrow_cost_x"],
+            "borrow_cost": borrow["borrow_cost"],
+            "financing_cost": financing["financing_cost"],
+            "carry_cost": carry,
+            "cumulative_borrow_cost": borrow["cumulative_borrow_cost"],
+            "cumulative_financing_cost": financing[
+                "cumulative_financing_cost"
+            ],
+            "cumulative_carry_cost": cumulative_carry,
+            "rebalance": rebalanced["rebalance"].astype(bool),
+            "rebalance_beta": rebalanced["rebalance_beta"],
+            "rebalance_delta_units_y": rebalanced[
+                "rebalance_delta_units_y"
+            ],
+            "rebalance_delta_units_x": rebalanced[
+                "rebalance_delta_units_x"
+            ],
+            "net_pnl_after_carry": financed_net,
+            "cumulative_net_pnl_after_carry": cumulative_financed,
+            "net_equity_after_carry": financed_equity,
+            "net_return_after_carry": financed_returns,
+        },
+        index=gross.index,
+    )
+    result = pd.concat([base_net, additions], axis=1, copy=False)
+    result.index = position_schedule.index
+    return result.loc[:, list(_FINANCED_OUTPUT_COLUMNS)]

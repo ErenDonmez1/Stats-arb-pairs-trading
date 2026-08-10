@@ -15,9 +15,13 @@ from pairs_trading.backtest import (
     build_pnl_schedule,
     build_position_schedule,
     calculate_pair_units,
+    calculate_borrow_costs,
+    calculate_financing_costs,
     calculate_position_pnl,
+    calculate_rebalancing_costs,
     calculate_strategy_returns,
     calculate_transaction_costs,
+    build_financed_pnl_schedule,
     lag_trade_decisions,
 )
 
@@ -1658,3 +1662,644 @@ def test_public_cost_functions_match_composed_net_schedule() -> None:
 
     pd.testing.assert_frame_equal(costs, combined[costs.columns])
     pd.testing.assert_frame_equal(net, combined[net.columns])
+
+
+def _constant_price_carry_case(
+    *,
+    entry_event: str = "ENTER_LONG",
+    borrow_rate_y: float | pd.Series = 0.0,
+    borrow_rate_x: float | pd.Series = 0.0,
+    financing_rate: float = 0.0,
+    periods_per_year: int = 252,
+    commission_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+    index: pd.Index | None = None,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.DataFrame]:
+    """Return an entry, exit, and post-exit row at constant prices."""
+    events = [entry_event, "NONE", "EXIT_TIME", "NONE", "NONE"]
+    if index is None:
+        index = pd.RangeIndex(5, name="row")
+    price_y = pd.Series(100.0, index=index, name="Y")
+    price_x = pd.Series(50.0, index=index, name="X")
+    schedule = build_position_schedule(
+        price_y,
+        price_x,
+        _signals_from_events(events, index),
+        hedge_ratio=1.0,
+        target_gross_notional=2_000.0,
+    )
+    result = build_financed_pnl_schedule(
+        schedule,
+        price_y,
+        price_x,
+        initial_capital=10_000.0,
+        commission_bps=commission_bps,
+        slippage_bps=slippage_bps,
+        borrow_rate_y=borrow_rate_y,
+        borrow_rate_x=borrow_rate_x,
+        financing_rate=financing_rate,
+        periods_per_year=periods_per_year,
+    )
+    return schedule, price_y, price_x, result
+
+
+def _rebalancing_case(
+    beta_values: list[float],
+    *,
+    threshold: float = 0.5,
+    rebalance: bool = True,
+    y_values: list[float] | None = None,
+    x_values: list[float] | None = None,
+    commission_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+    fixed_commission_per_leg: float = 0.0,
+    index: pd.Index | None = None,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series, pd.DataFrame]:
+    """Return an open long-spread schedule with optional dynamic rebalancing."""
+    count = len(beta_values)
+    if index is None:
+        index = pd.RangeIndex(count, name="row")
+    if y_values is None:
+        y_values = [100.0] * count
+    if x_values is None:
+        x_values = [50.0] * count
+    price_y = pd.Series(y_values, index=index, name="Y")
+    price_x = pd.Series(x_values, index=index, name="X")
+    beta = pd.Series(beta_values, index=index, name="beta")
+    events = ["ENTER_LONG"] + ["NONE"] * (count - 1)
+    schedule = build_position_schedule(
+        price_y,
+        price_x,
+        _signals_from_events(events, index),
+        beta,
+        2_000.0,
+    )
+    result = build_financed_pnl_schedule(
+        schedule,
+        price_y,
+        price_x,
+        initial_capital=10_000.0,
+        commission_bps=commission_bps,
+        slippage_bps=slippage_bps,
+        fixed_commission_per_leg=fixed_commission_per_leg,
+        rebalance=rebalance,
+        hedge_ratio=beta,
+        target_gross_notional=2_000.0,
+        rebalance_threshold=threshold,
+    )
+    return schedule, price_y, price_x, beta, result
+
+
+def test_financed_schedule_preserves_existing_6c_schema_and_adds_6d_fields() -> None:
+    _, _, _, result = _constant_price_carry_case()
+
+    expected_additions = {
+        "borrow_cost_y",
+        "borrow_cost_x",
+        "borrow_cost",
+        "financing_cost",
+        "carry_cost",
+        "cumulative_borrow_cost",
+        "cumulative_financing_cost",
+        "cumulative_carry_cost",
+        "rebalance",
+        "rebalance_beta",
+        "rebalance_delta_units_y",
+        "rebalance_delta_units_x",
+        "net_pnl_after_carry",
+        "cumulative_net_pnl_after_carry",
+        "net_equity_after_carry",
+        "net_return_after_carry",
+    }
+    assert set(result.columns[:26]) == {
+        "price_y",
+        "price_x",
+        "units_y",
+        "units_x",
+        "delta_units_y",
+        "delta_units_x",
+        "traded_notional_y",
+        "traded_notional_x",
+        "commission_y",
+        "commission_x",
+        "fixed_commission_y",
+        "fixed_commission_x",
+        "commission_cost",
+        "slippage_y",
+        "slippage_x",
+        "slippage_cost",
+        "transaction_cost",
+        "cumulative_transaction_cost",
+        "gross_pnl",
+        "net_pnl",
+        "cumulative_gross_pnl",
+        "cumulative_net_pnl",
+        "portfolio_equity",
+        "net_portfolio_equity",
+        "strategy_return",
+        "net_strategy_return",
+    }
+    assert expected_additions.issubset(result.columns)
+
+
+def test_zero_borrow_and_financing_reproduce_6c_net_accounting() -> None:
+    schedule, price_y, price_x, financed = _constant_price_carry_case(
+        commission_bps=4.0,
+        slippage_bps=3.0,
+    )
+    existing = build_net_pnl_schedule(
+        schedule,
+        price_y,
+        price_x,
+        10_000.0,
+        commission_bps=4.0,
+        slippage_bps=3.0,
+    )
+
+    pd.testing.assert_frame_equal(financed[existing.columns], existing)
+    pd.testing.assert_series_equal(
+        financed["net_pnl_after_carry"].rename("net_pnl"),
+        existing["net_pnl"],
+    )
+    assert financed["carry_cost"].eq(0.0).all()
+
+
+def test_first_row_entry_and_flat_rows_have_zero_borrow_and_financing() -> None:
+    _, _, _, result = _constant_price_carry_case(
+        borrow_rate_x=0.252,
+        financing_rate=0.252,
+    )
+
+    assert result.loc[0, ["borrow_cost", "financing_cost"]].tolist() == [0.0, 0.0]
+    assert result.loc[1, ["borrow_cost", "financing_cost"]].tolist() == [0.0, 0.0]
+    assert result.loc[4, ["borrow_cost", "financing_cost"]].tolist() == [0.0, 0.0]
+
+
+def test_long_spread_charges_only_short_x_borrow_using_prior_exposure() -> None:
+    _, _, _, result = _constant_price_carry_case(
+        borrow_rate_y=0.504,
+        borrow_rate_x=0.252,
+    )
+
+    assert result["borrow_cost_y"].eq(0.0).all()
+    assert result["borrow_cost_x"].tolist() == pytest.approx(
+        [0.0, 0.0, 1.0, 1.0, 0.0]
+    )
+
+
+def test_short_spread_charges_only_short_y_borrow() -> None:
+    _, _, _, result = _constant_price_carry_case(
+        entry_event="ENTER_SHORT",
+        borrow_rate_y=0.504,
+        borrow_rate_x=0.252,
+    )
+
+    assert result["borrow_cost_y"].tolist() == pytest.approx(
+        [0.0, 0.0, 2.0, 2.0, 0.0]
+    )
+    assert result["borrow_cost_x"].eq(0.0).all()
+
+
+def test_exit_row_pays_final_borrow_and_no_fee_follows_exit() -> None:
+    schedule, _, _, result = _constant_price_carry_case(borrow_rate_x=0.252)
+
+    assert schedule.loc[3, "execution_event"] == "EXIT_TIME"
+    assert result.loc[3, "borrow_cost"] == pytest.approx(1.0)
+    assert result.loc[4, "borrow_cost"] == 0.0
+
+
+def test_dynamic_borrow_rates_use_prior_row_rate_without_future_leakage() -> None:
+    index = pd.RangeIndex(5, name="row")
+    rates = pd.Series([0.0, 0.252, 0.504, 9.0, 9.0], index=index)
+    _, _, _, result = _constant_price_carry_case(
+        borrow_rate_x=rates,
+        index=index,
+    )
+
+    assert result["borrow_cost_x"].tolist() == pytest.approx(
+        [0.0, 0.0, 1.0, 2.0, 0.0]
+    )
+
+
+def test_very_high_finite_borrow_rate_is_valid() -> None:
+    _, _, _, result = _constant_price_carry_case(borrow_rate_x=5.04)
+
+    assert result.loc[2, "borrow_cost_x"] == pytest.approx(20.0)
+
+
+@pytest.mark.parametrize("rate_name", ["borrow_rate_y", "borrow_rate_x"])
+@pytest.mark.parametrize(
+    "invalid",
+    [True, np.bool_(False), "0.1", -0.1, np.nan, np.inf, -np.inf],
+)
+def test_invalid_borrow_rates_are_rejected(rate_name: str, invalid: Any) -> None:
+    _, _, _, gross = _accounting_case()
+
+    with pytest.raises((TypeError, ValueError), match=rate_name):
+        calculate_borrow_costs(gross, **{rate_name: invalid})
+
+
+def test_financing_uses_prior_gross_exposure_and_includes_exit_interval() -> None:
+    schedule, _, _, result = _constant_price_carry_case(financing_rate=0.252)
+
+    assert result["financing_cost"].tolist() == pytest.approx(
+        [0.0, 0.0, 2.0, 2.0, 0.0]
+    )
+    assert schedule.loc[3, "execution_event"] == "EXIT_TIME"
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [True, np.bool_(False), "0.1", -0.1, np.nan, np.inf, -np.inf],
+)
+def test_invalid_financing_rates_are_rejected(invalid: Any) -> None:
+    _, _, _, gross = _accounting_case()
+
+    with pytest.raises((TypeError, ValueError), match="financing_rate"):
+        calculate_financing_costs(gross, invalid)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [True, np.bool_(False), 0, -1, 252.0, 1.5, "252", np.nan],
+)
+def test_invalid_periods_per_year_are_rejected(invalid: Any) -> None:
+    _, _, _, gross = _accounting_case()
+
+    with pytest.raises((TypeError, ValueError), match="periods_per_year"):
+        calculate_borrow_costs(gross, periods_per_year=invalid)
+    with pytest.raises((TypeError, ValueError), match="periods_per_year"):
+        calculate_financing_costs(gross, periods_per_year=invalid)
+
+
+def test_carry_cost_and_financed_net_accounting_are_exact() -> None:
+    _, _, _, result = _constant_price_carry_case(
+        borrow_rate_x=0.252,
+        financing_rate=0.252,
+    )
+
+    assert result["carry_cost"].tolist() == pytest.approx(
+        [0.0, 0.0, 3.0, 3.0, 0.0]
+    )
+    expected = result["gross_pnl"] - result["transaction_cost"] - result["carry_cost"]
+    pd.testing.assert_series_equal(
+        result["net_pnl_after_carry"],
+        expected.rename("net_pnl_after_carry"),
+    )
+    assert result["cumulative_carry_cost"].tolist() == pytest.approx(
+        [0.0, 0.0, 3.0, 6.0, 6.0]
+    )
+    assert result["cumulative_net_pnl_after_carry"].tolist() == pytest.approx(
+        [0.0, 0.0, -3.0, -6.0, -6.0]
+    )
+    assert result["net_equity_after_carry"].tolist() == pytest.approx(
+        [10_000.0, 10_000.0, 9_997.0, 9_994.0, 9_994.0]
+    )
+    assert result["net_return_after_carry"].tolist() == pytest.approx(
+        [0.0, 0.0, -3.0 / 10_000.0, -3.0 / 9_997.0, 0.0]
+    )
+
+
+def test_rebalance_false_preserves_original_units_exactly() -> None:
+    schedule, _, _, _, result = _rebalancing_case(
+        [1.0, 1.0, 2.0, 3.0, 4.0],
+        rebalance=False,
+    )
+
+    pd.testing.assert_series_equal(result["units_y"], schedule["units_y"])
+    pd.testing.assert_series_equal(result["units_x"], schedule["units_x"])
+    assert not result["rebalance"].any()
+
+
+def test_dynamic_beta_threshold_crossing_rebalances_without_state_change() -> None:
+    schedule, _, _, _, result = _rebalancing_case([1.0, 1.0, 2.0, 2.0, 2.0])
+
+    assert bool(result.loc[2, "rebalance"])
+    assert result.loc[2, "rebalance_beta"] == pytest.approx(2.0)
+    assert schedule.loc[2, "executed_state"] == "LONG_SPREAD"
+    assert result.loc[2, "units_y"] == pytest.approx(2_000.0 / 3.0 / 100.0)
+    assert result.loc[2, "units_x"] == pytest.approx(-4_000.0 / 3.0 / 50.0)
+    assert result.loc[2, "units_y"] != schedule.loc[2, "units_y"]
+
+
+def test_beta_change_below_threshold_does_not_rebalance() -> None:
+    schedule, _, _, _, result = _rebalancing_case(
+        [1.0, 1.0, 1.1, 1.1, 1.1],
+        threshold=0.2,
+    )
+
+    assert not result["rebalance"].any()
+    pd.testing.assert_series_equal(result["units_y"], schedule["units_y"])
+
+
+def test_flat_positions_never_rebalance() -> None:
+    index = pd.RangeIndex(4)
+    prices_y = pd.Series(100.0, index=index)
+    prices_x = pd.Series(50.0, index=index)
+    beta = pd.Series([1.0, 2.0, 3.0, 4.0], index=index)
+    schedule = build_position_schedule(
+        prices_y,
+        prices_x,
+        _signals_from_events(["NONE"] * 4, index),
+        beta,
+        2_000.0,
+    )
+
+    result = calculate_rebalancing_costs(
+        schedule,
+        prices_y,
+        prices_x,
+        beta,
+        2_000.0,
+        rebalance=True,
+    )
+
+    assert not result["rebalance"].any()
+    assert result[["units_y", "units_x", "transaction_cost"]].eq(0.0).all().all()
+
+
+def test_rebalance_uses_current_prices_and_beta_and_emits_expected_deltas() -> None:
+    schedule, _, _, _, result = _rebalancing_case(
+        [1.0, 1.0, 2.0, 2.0],
+        y_values=[100.0, 100.0, 200.0, 200.0],
+        x_values=[50.0, 50.0, 25.0, 25.0],
+    )
+
+    desired_y = (2_000.0 / 3.0) / 200.0
+    desired_x = -(4_000.0 / 3.0) / 25.0
+    assert result.loc[2, "units_y"] == pytest.approx(desired_y)
+    assert result.loc[2, "units_x"] == pytest.approx(desired_x)
+    assert result.loc[2, "rebalance_delta_units_y"] == pytest.approx(
+        desired_y - schedule.loc[1, "units_y"]
+    )
+    assert result.loc[2, "rebalance_delta_units_x"] == pytest.approx(
+        desired_x - schedule.loc[1, "units_x"]
+    )
+
+
+def test_rebalance_transaction_uses_normal_commission_and_slippage_only() -> None:
+    _, _, _, _, result = _rebalancing_case(
+        [1.0, 1.0, 2.0, 2.0],
+        commission_bps=10.0,
+        slippage_bps=5.0,
+        fixed_commission_per_leg=2.0,
+    )
+    row = result.loc[2]
+
+    expected_commission = (
+        row["traded_notional_y"] + row["traded_notional_x"]
+    ) * 10.0 / 10_000.0 + 4.0
+    expected_slippage = (
+        row["traded_notional_y"] + row["traded_notional_x"]
+    ) * 5.0 / 10_000.0
+    assert row["commission_cost"] == pytest.approx(expected_commission)
+    assert row["slippage_cost"] == pytest.approx(expected_slippage)
+    assert row["transaction_cost"] == pytest.approx(
+        expected_commission + expected_slippage
+    )
+
+
+def test_missing_beta_defers_and_reconsiders_rebalance_on_later_valid_row() -> None:
+    schedule, _, _, beta, result = _rebalancing_case(
+        [1.0, 1.0, np.nan, 2.0, 2.0],
+    )
+
+    assert pd.isna(beta.loc[2])
+    assert not bool(result.loc[2, "rebalance"])
+    assert result.loc[2, "units_y"] == schedule.loc[2, "units_y"]
+    assert bool(result.loc[3, "rebalance"])
+    assert result.loc[3, "rebalance_beta"] == pytest.approx(2.0)
+
+
+def test_future_beta_changes_do_not_leak_into_earlier_rebalancing() -> None:
+    _, _, _, _, original = _rebalancing_case([1.0, 1.0, 1.1, 2.0, 3.0])
+    _, _, _, _, changed = _rebalancing_case([1.0, 1.0, 1.1, 20.0, 30.0])
+
+    pd.testing.assert_frame_equal(original.iloc[:3], changed.iloc[:3])
+
+
+@pytest.mark.parametrize("invalid", [np.bool_(True), 1, 0, "true", None])
+def test_rebalance_requires_actual_bool(invalid: Any) -> None:
+    schedule, price_y, price_x, beta, _ = _rebalancing_case(
+        [1.0, 1.0, 2.0],
+        rebalance=False,
+    )
+
+    with pytest.raises(TypeError, match="rebalance"):
+        calculate_rebalancing_costs(
+            schedule,
+            price_y,
+            price_x,
+            beta,
+            2_000.0,
+            rebalance=invalid,
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [True, np.bool_(False), "0.1", -0.1, np.nan, np.inf, -np.inf],
+)
+def test_invalid_rebalance_threshold_is_rejected(invalid: Any) -> None:
+    schedule, price_y, price_x, beta, _ = _rebalancing_case(
+        [1.0, 1.0, 2.0],
+        rebalance=False,
+    )
+
+    with pytest.raises((TypeError, ValueError), match="rebalance_threshold"):
+        calculate_rebalancing_costs(
+            schedule,
+            price_y,
+            price_x,
+            beta,
+            2_000.0,
+            rebalance=True,
+            rebalance_threshold=invalid,
+        )
+
+
+def test_missing_required_prior_exposure_propagates_carry_and_net_unknown() -> None:
+    events = ["ENTER_LONG", "NONE", "EXIT_TIME", "NONE", "NONE"]
+    index = pd.RangeIndex(5, name="row")
+    price_y = pd.Series(100.0, index=index)
+    price_x = pd.Series([50.0, 50.0, np.nan, 50.0, 50.0], index=index)
+    beta = pd.Series(1.0, index=index)
+    schedule = build_position_schedule(
+        price_y,
+        price_x,
+        _signals_from_events(events, index),
+        beta,
+        2_000.0,
+    )
+
+    result = build_financed_pnl_schedule(
+        schedule,
+        price_y,
+        price_x,
+        10_000.0,
+        borrow_rate_x=0.252,
+        financing_rate=0.252,
+    )
+
+    assert pd.isna(result.loc[3, "borrow_cost"])
+    assert pd.isna(result.loc[3, "financing_cost"])
+    assert pd.isna(result.loc[3, "carry_cost"])
+    assert pd.isna(result.loc[3, "gross_pnl"])
+    assert pd.isna(result.loc[3, "net_pnl_after_carry"])
+    assert pd.isna(result.loc[4, "cumulative_net_pnl_after_carry"])
+    assert pd.isna(result.loc[4, "net_equity_after_carry"])
+
+
+def test_financed_inputs_are_immutable_and_output_is_deterministic() -> None:
+    schedule, price_y, price_x, beta, _ = _rebalancing_case(
+        [1.0, 1.0, 2.0, 2.0],
+        rebalance=False,
+    )
+    schedule_before = schedule.copy(deep=True)
+    y_before = price_y.copy(deep=True)
+    x_before = price_x.copy(deep=True)
+    beta_before = beta.copy(deep=True)
+
+    kwargs = {
+        "initial_capital": 10_000.0,
+        "commission_bps": 3.0,
+        "slippage_bps": 2.0,
+        "borrow_rate_x": 0.3,
+        "financing_rate": 0.2,
+        "rebalance": True,
+        "hedge_ratio": beta,
+        "target_gross_notional": 2_000.0,
+        "rebalance_threshold": 0.5,
+    }
+    first = build_financed_pnl_schedule(schedule, price_y, price_x, **kwargs)
+    second = build_financed_pnl_schedule(schedule, price_y, price_x, **kwargs)
+
+    pd.testing.assert_frame_equal(first, second)
+    pd.testing.assert_frame_equal(schedule, schedule_before)
+    pd.testing.assert_series_equal(price_y, y_before)
+    pd.testing.assert_series_equal(price_x, x_before)
+    pd.testing.assert_series_equal(beta, beta_before)
+
+
+def test_misaligned_dynamic_beta_and_borrow_rate_indices_are_rejected() -> None:
+    schedule, price_y, price_x, beta, _ = _rebalancing_case(
+        [1.0, 1.0, 2.0, 2.0],
+        rebalance=False,
+    )
+    reversed_beta = beta.set_axis(beta.index[::-1])
+    gross = build_pnl_schedule(schedule, price_y, price_x, 10_000.0)
+
+    with pytest.raises(ValueError, match="hedge_ratio index"):
+        calculate_rebalancing_costs(
+            schedule,
+            price_y,
+            price_x,
+            reversed_beta,
+            2_000.0,
+            rebalance=True,
+        )
+    with pytest.raises(ValueError, match="borrow_rate_x index"):
+        calculate_borrow_costs(gross, borrow_rate_x=reversed_beta)
+
+
+def test_duplicate_dynamic_rate_index_is_rejected() -> None:
+    _, _, _, gross = _accounting_case()
+    rate = pd.Series([0.1, 0.1, 0.1, 0.1], index=[0, 0, 1, 2])
+
+    with pytest.raises(ValueError, match="unique index"):
+        calculate_borrow_costs(gross, borrow_rate_x=rate)
+
+
+def test_non_datetime_financed_index_is_preserved() -> None:
+    index = pd.Index(["z", "a", "m", "b", "q"], name="carry_order")
+    _, _, _, result = _constant_price_carry_case(index=index)
+
+    pd.testing.assert_index_equal(result.index, index, exact=True)
+
+
+def test_timezone_aware_financed_index_metadata_is_preserved() -> None:
+    index = pd.date_range(
+        "2026-10-23",
+        periods=5,
+        freq="h",
+        tz="Europe/London",
+        name="carry_time",
+    )
+    _, _, _, result = _constant_price_carry_case(index=index)
+
+    pd.testing.assert_index_equal(result.index, index, exact=True)
+    assert result.index.tz == index.tz
+    assert result.index.freq == index.freq
+    assert result.index.name == index.name
+
+
+def test_future_price_beta_rate_and_state_changes_do_not_affect_prior_rows() -> None:
+    index = pd.RangeIndex(7)
+    original_events = [
+        "ENTER_LONG",
+        "NONE",
+        "NONE",
+        "NONE",
+        "EXIT_TIME",
+        "NONE",
+        "NONE",
+    ]
+    changed_events = [
+        "ENTER_LONG",
+        "NONE",
+        "NONE",
+        "EXIT_STOP",
+        "ENTER_SHORT",
+        "NONE",
+        "NONE",
+    ]
+    original_y = pd.Series(100.0, index=index)
+    original_x = pd.Series(50.0, index=index)
+    original_beta = pd.Series([1.0, 1.0, 1.1, 2.0, 2.0, 2.0, 2.0], index=index)
+    changed_y = original_y.copy(deep=True)
+    changed_x = original_x.copy(deep=True)
+    changed_beta = original_beta.copy(deep=True)
+    changed_y.iloc[3:] *= 1.5
+    changed_x.iloc[3:] *= 0.75
+    changed_beta.iloc[3:] = [20.0, 20.0, 20.0, 20.0]
+    original_rates = pd.Series(0.2, index=index)
+    changed_rates = original_rates.copy(deep=True)
+    changed_rates.iloc[3:] = 5.0
+    original_schedule = build_position_schedule(
+        original_y,
+        original_x,
+        _signals_from_events(original_events, index),
+        original_beta,
+        2_000.0,
+    )
+    changed_schedule = build_position_schedule(
+        changed_y,
+        changed_x,
+        _signals_from_events(changed_events, index),
+        changed_beta,
+        2_000.0,
+    )
+    common = {
+        "initial_capital": 10_000.0,
+        "borrow_rate_x": original_rates,
+        "financing_rate": 0.1,
+        "rebalance": True,
+        "target_gross_notional": 2_000.0,
+        "rebalance_threshold": 0.5,
+    }
+    original = build_financed_pnl_schedule(
+        original_schedule,
+        original_y,
+        original_x,
+        hedge_ratio=original_beta,
+        **common,
+    )
+    changed = build_financed_pnl_schedule(
+        changed_schedule,
+        changed_y,
+        changed_x,
+        hedge_ratio=changed_beta,
+        **{**common, "borrow_rate_x": changed_rates},
+    )
+
+    pd.testing.assert_frame_equal(original.iloc[:3], changed.iloc[:3])

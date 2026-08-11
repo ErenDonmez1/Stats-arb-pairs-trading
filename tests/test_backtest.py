@@ -34,6 +34,7 @@ from pairs_trading.backtest import (
     run_pair_backtest,
     validate_backtest_invariants,
 )
+from pairs_trading.data import MarketDataLoader, OBSERVED_PRICE_MASK_ATTR
 
 
 def _signals_from_events(
@@ -116,6 +117,8 @@ def test_build_position_schedule_returns_required_schema_and_preserves_index() -
         "hedge_ratio",
         "price_y",
         "price_x",
+        "observed_y",
+        "observed_x",
         "units_y",
         "units_x",
         "notional_y",
@@ -266,7 +269,7 @@ def test_scalar_hedge_ratio_is_broadcast() -> None:
     assert result.loc[1, "gross_exposure"] == pytest.approx(12_000.0)
 
 
-def test_dynamic_hedge_ratio_uses_execution_row_value() -> None:
+def test_dynamic_hedge_ratio_uses_latest_prior_available_value() -> None:
     index = pd.RangeIndex(3)
     beta = pd.Series([0.25, 3.0, 8.0], index=index)
     result = _schedule(
@@ -277,7 +280,7 @@ def test_dynamic_hedge_ratio_uses_execution_row_value() -> None:
 
     execution = result.loc[1]
     assert abs(execution["notional_x"] / execution["notional_y"]) == pytest.approx(
-        3.0
+        0.25
     )
 
 
@@ -366,7 +369,8 @@ def test_missing_due_input_defers_entry_to_next_fully_valid_row(
     price_y, price_x, signals, beta = _market_inputs(events)
     inputs = {"price_y": price_y, "price_x": price_x, "hedge_ratio": beta}
     inputs[missing_input] = inputs[missing_input].copy(deep=True)
-    inputs[missing_input].iloc[1] = np.nan
+    missing_row = 0 if missing_input == "hedge_ratio" else 1
+    inputs[missing_input].iloc[missing_row] = np.nan
 
     result = build_position_schedule(
         inputs["price_y"],
@@ -417,7 +421,8 @@ def test_missing_due_input_defers_exit_to_next_fully_valid_row(
     price_y, price_x, signals, beta = _market_inputs(events)
     inputs = {"price_y": price_y, "price_x": price_x, "hedge_ratio": beta}
     inputs[missing_input] = inputs[missing_input].copy(deep=True)
-    inputs[missing_input].iloc[3] = np.nan
+    missing_row = 2 if missing_input == "hedge_ratio" else 3
+    inputs[missing_input].iloc[missing_row] = np.nan
 
     result = build_position_schedule(
         inputs["price_y"],
@@ -469,6 +474,193 @@ def test_missing_mark_preserves_units_without_backfilling_exposure() -> None:
     assert np.isfinite(result.loc[2, "notional_x"])
     assert pd.isna(result.loc[2, "gross_exposure"])
     assert pd.isna(result.loc[2, "net_exposure"])
+
+
+def test_forward_filled_price_cannot_trigger_entry() -> None:
+    events = ["ENTER_LONG", "NONE", "NONE", "NONE"]
+    price_y, price_x, signals, beta = _market_inputs(events)
+    observed_y = pd.Series([True, False, True, True], index=price_y.index)
+    observed_x = pd.Series(True, index=price_x.index)
+
+    result = build_position_schedule(
+        price_y,
+        price_x,
+        signals,
+        beta,
+        12_000.0,
+        observed_y=observed_y,
+        observed_x=observed_x,
+    )
+
+    assert result.loc[1, "executed_state"] == "FLAT"
+    assert result.loc[1, "execution_event"] == "NONE"
+    assert not bool(result.loc[1, "observed_y"])
+    assert result.loc[2, "execution_event"] == "ENTER_LONG"
+
+
+def test_cleaned_price_provenance_automatically_blocks_entry() -> None:
+    dates = pd.bdate_range("2025-01-02", periods=4)
+    raw = pd.DataFrame(
+        {
+            "Y": [100.0, np.nan, 102.0, 103.0],
+            "X": [50.0, 51.0, 52.0, 53.0],
+        },
+        index=dates,
+    )
+    clean, _ = MarketDataLoader.clean(
+        raw,
+        min_coverage=0.75,
+        max_forward_fill=1,
+        min_observations=4,
+    )
+    signals = _signals_from_events(["ENTER_LONG", "NONE", "NONE", "NONE"], dates)
+
+    result = build_position_schedule(
+        clean["Y"],
+        clean["X"],
+        signals,
+        1.0,
+        2_000.0,
+    )
+
+    assert not bool(result.loc[dates[1], "observed_y"])
+    assert result.loc[dates[1], "execution_event"] == "NONE"
+    assert result.loc[dates[2], "execution_event"] == "ENTER_LONG"
+
+
+def test_forward_filled_price_cannot_trigger_exit() -> None:
+    events = ["ENTER_LONG", "NONE", "EXIT_STOP", "NONE", "NONE"]
+    price_y, price_x, signals, beta = _market_inputs(events)
+    observed_y = pd.Series([True, True, True, False, True], index=price_y.index)
+
+    result = build_position_schedule(
+        price_y,
+        price_x,
+        signals,
+        beta,
+        12_000.0,
+        observed_y=observed_y,
+    )
+
+    assert result.loc[3, "executed_state"] == "LONG_SPREAD"
+    assert result.loc[3, "execution_event"] == "NONE"
+    assert result.loc[4, "executed_state"] == "FLAT"
+    assert result.loc[4, "execution_event"] == "EXIT_STOP"
+
+
+def test_stale_price_may_value_holdings_but_cannot_execute() -> None:
+    events = ["ENTER_LONG", "NONE", "NONE", "NONE"]
+    price_y, price_x, signals, beta = _market_inputs(events)
+    observed_y = pd.Series([True, True, False, True], index=price_y.index)
+    schedule = build_position_schedule(
+        price_y,
+        price_x,
+        signals,
+        beta,
+        12_000.0,
+        observed_y=observed_y,
+    )
+
+    accounting = build_pnl_schedule(
+        schedule,
+        price_y,
+        price_x,
+        initial_capital=20_000.0,
+    )
+
+    assert not bool(schedule.loc[2, "observed_y"])
+    assert schedule.loc[2, "execution_event"] == "NONE"
+    assert schedule.loc[2, "units_y"] == schedule.loc[1, "units_y"]
+    assert schedule.loc[2, "notional_y"] == pytest.approx(
+        schedule.loc[2, "units_y"] * price_y.loc[2]
+    )
+    assert accounting.loc[2, "market_value_y"] == pytest.approx(
+        schedule.loc[2, "units_y"] * price_y.loc[2]
+    )
+    assert np.isfinite(accounting.loc[2, "gross_pnl"])
+
+
+def test_due_entry_executes_before_same_row_flat_decision_matures() -> None:
+    events = ["ENTER_LONG", "EXIT_MEAN_REVERSION", "NONE"]
+    price_y, price_x, signals, beta = _market_inputs(events)
+
+    result = build_position_schedule(
+        price_y,
+        price_x,
+        signals,
+        beta,
+        12_000.0,
+    )
+
+    assert result.loc[1, "decision_state"] == "FLAT"
+    assert result.loc[1, "execution_event"] == "ENTER_LONG"
+    assert result.loc[1, "executed_state"] == "LONG_SPREAD"
+    assert result.loc[2, "execution_event"] == "EXIT_MEAN_REVERSION"
+    assert result.loc[2, "executed_state"] == "FLAT"
+
+
+def test_deferred_entry_remains_live_before_flat_decision_matures() -> None:
+    events = ["ENTER_LONG", "NONE", "EXIT_MEAN_REVERSION", "NONE"]
+    price_y, price_x, signals, beta = _market_inputs(events)
+    observed_y = pd.Series([True, False, True, True], index=price_y.index)
+
+    result = build_position_schedule(
+        price_y,
+        price_x,
+        signals,
+        beta,
+        12_000.0,
+        observed_y=observed_y,
+    )
+
+    assert result.loc[1, "execution_event"] == "NONE"
+    assert result.loc[2, "decision_state"] == "FLAT"
+    assert result.loc[2, "execution_event"] == "ENTER_LONG"
+    assert result.loc[2, "executed_state"] == "LONG_SPREAD"
+    assert result.loc[3, "execution_event"] == "EXIT_MEAN_REVERSION"
+
+
+def test_deferred_entry_is_cancelled_when_flat_decision_becomes_due() -> None:
+    events = ["ENTER_LONG", "EXIT_MEAN_REVERSION", "NONE", "NONE"]
+    price_y, price_x, signals, beta = _market_inputs(events)
+    observed_y = pd.Series([True, False, True, True], index=price_y.index)
+
+    result = build_position_schedule(
+        price_y,
+        price_x,
+        signals,
+        beta,
+        12_000.0,
+        observed_y=observed_y,
+    )
+
+    assert result.loc[1, "execution_event"] == "NONE"
+    assert result.loc[2, "decision_event"] == "NONE"
+    assert result.loc[2, "execution_event"] == "NONE"
+    assert result["executed_state"].eq("FLAT").all()
+
+
+def test_pending_entry_cancelled_before_fill_has_no_cost_or_trade() -> None:
+    events = ["ENTER_LONG", "EXIT_MEAN_REVERSION", "NONE", "NONE"]
+    price_y, price_x, signals, _ = _market_inputs(events)
+    observed_y = pd.Series([True, False, True, True], index=price_y.index)
+
+    result = run_pair_backtest(
+        price_y,
+        price_x,
+        1.0,
+        12_000.0,
+        signals=signals,
+        observed_y=observed_y,
+        commission_bps=10.0,
+        slippage_bps=5.0,
+        fixed_commission_per_leg=1.0,
+    )
+
+    assert result.positions["executed_state"].eq("FLAT").all()
+    assert result.positions["execution_event"].eq("NONE").all()
+    assert result.accounting["transaction_cost"].eq(0.0).all()
+    assert result.ledger.empty
 
 
 def test_non_finite_marked_exposure_is_rejected() -> None:
@@ -536,6 +728,24 @@ def test_invalid_execution_lags_are_rejected(invalid: Any) -> None:
 
     with pytest.raises((TypeError, ValueError), match="execution_lag"):
         lag_trade_decisions(signals, invalid)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [True, np.bool_(False), 0, -1, 1.0, 1.5, "1", np.nan, None],
+)
+def test_dynamic_hedge_ratio_lag_must_be_a_positive_integer(invalid: Any) -> None:
+    price_y, price_x, signals, beta = _market_inputs(["NONE", "NONE"])
+
+    with pytest.raises((TypeError, ValueError), match="hedge_ratio_lag"):
+        build_position_schedule(
+            price_y,
+            price_x,
+            signals,
+            beta,
+            12_000.0,
+            hedge_ratio_lag=invalid,
+        )
 
 
 @pytest.mark.parametrize("mismatched", ["price_x", "signals", "hedge_ratio"])
@@ -1776,6 +1986,7 @@ def test_financed_schedule_preserves_existing_6c_schema_and_adds_6d_fields() -> 
         "rebalance_beta",
         "rebalance_delta_units_y",
         "rebalance_delta_units_x",
+        "rebalance_decision_row",
         "net_pnl_after_carry",
         "cumulative_net_pnl_after_carry",
         "net_equity_after_carry",
@@ -1984,12 +2195,82 @@ def test_rebalance_false_preserves_original_units_exactly() -> None:
 def test_dynamic_beta_threshold_crossing_rebalances_without_state_change() -> None:
     schedule, _, _, _, result = _rebalancing_case([1.0, 1.0, 2.0, 2.0, 2.0])
 
-    assert bool(result.loc[2, "rebalance"])
-    assert result.loc[2, "rebalance_beta"] == pytest.approx(2.0)
-    assert schedule.loc[2, "executed_state"] == "LONG_SPREAD"
-    assert result.loc[2, "units_y"] == pytest.approx(2_000.0 / 3.0 / 100.0)
-    assert result.loc[2, "units_x"] == pytest.approx(-4_000.0 / 3.0 / 50.0)
-    assert result.loc[2, "units_y"] != schedule.loc[2, "units_y"]
+    assert bool(result.loc[3, "rebalance"])
+    assert result.loc[3, "rebalance_beta"] == pytest.approx(2.0)
+    assert result.loc[3, "rebalance_decision_row"] == 2
+    assert schedule.loc[3, "executed_state"] == "LONG_SPREAD"
+    assert result.loc[3, "units_y"] == pytest.approx(2_000.0 / 3.0 / 100.0)
+    assert result.loc[3, "units_x"] == pytest.approx(-4_000.0 / 3.0 / 50.0)
+    assert result.loc[3, "units_y"] != schedule.loc[3, "units_y"]
+
+
+def test_beta_shock_cannot_rebalance_same_row_and_records_later_execution() -> None:
+    _, _, _, beta, result = _rebalancing_case(
+        [1.0, 1.0, 3.0, 3.0, 3.0],
+    )
+
+    shock_row = 2
+    execution_row = 3
+    assert beta.loc[shock_row] == 3.0
+    assert not bool(result.loc[shock_row, "rebalance"])
+    assert bool(result.loc[execution_row, "rebalance"])
+    assert result.loc[execution_row, "rebalance_beta"] == 3.0
+    assert result.loc[execution_row, "rebalance_decision_row"] == shock_row
+
+
+def test_forward_filled_price_defers_rebalance_until_observed_row() -> None:
+    index = pd.RangeIndex(5, name="rebalance_observation")
+    price_y = pd.Series(100.0, index=index, name="Y")
+    price_x = pd.Series(50.0, index=index, name="X")
+    beta = pd.Series([1.0, 1.0, 2.0, 2.0, 2.0], index=index, name="beta")
+    observed_y = pd.Series([True, True, True, False, True], index=index)
+    schedule = build_position_schedule(
+        price_y,
+        price_x,
+        _signals_from_events(["ENTER_LONG"] + ["NONE"] * 4, index),
+        beta,
+        2_000.0,
+        observed_y=observed_y,
+    )
+
+    result = calculate_rebalancing_costs(
+        schedule,
+        price_y,
+        price_x,
+        beta,
+        2_000.0,
+        rebalance=True,
+        rebalance_threshold=0.5,
+    )
+
+    assert not bool(result.loc[3, "rebalance"])
+    assert bool(result.loc[4, "rebalance"])
+    assert result.loc[4, "rebalance_decision_row"] == 3
+
+
+def test_price_metadata_false_blocks_rebalance_despite_true_schedule_mask() -> None:
+    schedule, price_y, price_x, beta, _ = _rebalancing_case(
+        [1.0, 1.0, 2.0, 2.0, 2.0],
+    )
+    marked_y = price_y.copy(deep=True)
+    metadata_mask = pd.Series(True, index=marked_y.index)
+    metadata_mask.loc[3] = False
+    marked_y.attrs[OBSERVED_PRICE_MASK_ATTR] = metadata_mask
+
+    result = calculate_rebalancing_costs(
+        schedule,
+        marked_y,
+        price_x,
+        beta,
+        2_000.0,
+        rebalance=True,
+        rebalance_threshold=0.5,
+    )
+
+    assert bool(schedule.loc[3, "observed_y"])
+    assert not bool(metadata_mask.loc[3])
+    assert not bool(result.loc[3, "rebalance"])
+    assert bool(result.loc[4, "rebalance"])
 
 
 def test_beta_change_below_threshold_does_not_rebalance() -> None:
@@ -2030,31 +2311,31 @@ def test_flat_positions_never_rebalance() -> None:
 
 def test_rebalance_uses_current_prices_and_beta_and_emits_expected_deltas() -> None:
     schedule, _, _, _, result = _rebalancing_case(
-        [1.0, 1.0, 2.0, 2.0],
-        y_values=[100.0, 100.0, 200.0, 200.0],
-        x_values=[50.0, 50.0, 25.0, 25.0],
+        [1.0, 1.0, 2.0, 2.0, 2.0],
+        y_values=[100.0, 100.0, 150.0, 200.0, 200.0],
+        x_values=[50.0, 50.0, 40.0, 25.0, 25.0],
     )
 
     desired_y = (2_000.0 / 3.0) / 200.0
     desired_x = -(4_000.0 / 3.0) / 25.0
-    assert result.loc[2, "units_y"] == pytest.approx(desired_y)
-    assert result.loc[2, "units_x"] == pytest.approx(desired_x)
-    assert result.loc[2, "rebalance_delta_units_y"] == pytest.approx(
-        desired_y - schedule.loc[1, "units_y"]
+    assert result.loc[3, "units_y"] == pytest.approx(desired_y)
+    assert result.loc[3, "units_x"] == pytest.approx(desired_x)
+    assert result.loc[3, "rebalance_delta_units_y"] == pytest.approx(
+        desired_y - schedule.loc[2, "units_y"]
     )
-    assert result.loc[2, "rebalance_delta_units_x"] == pytest.approx(
-        desired_x - schedule.loc[1, "units_x"]
+    assert result.loc[3, "rebalance_delta_units_x"] == pytest.approx(
+        desired_x - schedule.loc[2, "units_x"]
     )
 
 
 def test_rebalance_transaction_uses_normal_commission_and_slippage_only() -> None:
     _, _, _, _, result = _rebalancing_case(
-        [1.0, 1.0, 2.0, 2.0],
+        [1.0, 1.0, 2.0, 2.0, 2.0],
         commission_bps=10.0,
         slippage_bps=5.0,
         fixed_commission_per_leg=2.0,
     )
-    row = result.loc[2]
+    row = result.loc[3]
 
     expected_commission = (
         row["traded_notional_y"] + row["traded_notional_x"]
@@ -2077,8 +2358,9 @@ def test_missing_beta_defers_and_reconsiders_rebalance_on_later_valid_row() -> N
     assert pd.isna(beta.loc[2])
     assert not bool(result.loc[2, "rebalance"])
     assert result.loc[2, "units_y"] == schedule.loc[2, "units_y"]
-    assert bool(result.loc[3, "rebalance"])
-    assert result.loc[3, "rebalance_beta"] == pytest.approx(2.0)
+    assert not bool(result.loc[3, "rebalance"])
+    assert bool(result.loc[4, "rebalance"])
+    assert result.loc[4, "rebalance_beta"] == pytest.approx(2.0)
 
 
 def test_future_beta_changes_do_not_leak_into_earlier_rebalancing() -> None:
@@ -2552,7 +2834,7 @@ def test_rebalance_stays_in_one_trade_and_its_cost_is_attributed() -> None:
 
     assert accounting["rebalance"].sum() == 1
     rebalance_row = int(np.flatnonzero(accounting["rebalance"].to_numpy())[0])
-    assert rebalance_row == 2
+    assert rebalance_row == 3
     assert len(ledger) == 1
     assert ledger.loc[0, "transaction_cost"] == pytest.approx(
         accounting.loc[1:4, "transaction_cost"].sum()
@@ -2666,7 +2948,7 @@ def test_missing_final_market_input_prevents_forced_liquidation(
     elif missing_input == "price_x":
         price_x.iat[-1] = np.nan
     else:
-        beta.iat[-1] = np.nan
+        beta.iat[-2] = np.nan
     schedule = build_position_schedule(
         price_y,
         price_x,
@@ -2677,6 +2959,139 @@ def test_missing_final_market_input_prevents_forced_liquidation(
 
     with pytest.raises(ValueError, match="Final prices|Final hedge ratio"):
         force_liquidate_open_position(schedule)
+
+
+def test_forward_filled_final_price_cannot_force_liquidation() -> None:
+    original, _, price_y, price_x, beta, _, _ = _forced_liquidation_case(
+        force_liquidation=False
+    )
+    observed_y = pd.Series(True, index=price_y.index)
+    observed_y.iat[-1] = False
+
+    with pytest.raises(ValueError, match="genuine observed"):
+        force_liquidate_open_position(
+            original,
+            price_y,
+            price_x,
+            beta,
+            observed_y=observed_y,
+        )
+
+
+def test_price_metadata_false_blocks_forced_close_despite_true_schedule_mask() -> None:
+    original, _, price_y, price_x, beta, _, _ = _forced_liquidation_case(
+        force_liquidation=False
+    )
+    marked_y = price_y.copy(deep=True)
+    metadata_mask = pd.Series(True, index=marked_y.index)
+    metadata_mask.iat[-1] = False
+    marked_y.attrs[OBSERVED_PRICE_MASK_ATTR] = metadata_mask
+
+    assert bool(original["observed_y"].iat[-1])
+    with pytest.raises(ValueError, match="genuine observed"):
+        force_liquidate_open_position(
+            original,
+            marked_y,
+            price_x,
+            beta,
+        )
+
+
+def test_explicit_false_mask_blocks_forced_close_when_other_sources_are_true() -> None:
+    original, _, price_y, price_x, beta, _, _ = _forced_liquidation_case(
+        force_liquidation=False
+    )
+    metadata_mask = pd.Series(True, index=price_y.index)
+    price_y.attrs[OBSERVED_PRICE_MASK_ATTR] = metadata_mask
+    explicit_mask = metadata_mask.copy(deep=True)
+    explicit_mask.iat[-1] = False
+
+    with pytest.raises(ValueError, match="genuine observed"):
+        force_liquidate_open_position(
+            original,
+            price_y,
+            price_x,
+            beta,
+            observed_y=explicit_mask,
+        )
+
+
+def test_all_true_provenance_sources_allow_forced_close() -> None:
+    original, _, price_y, price_x, beta, _, _ = _forced_liquidation_case(
+        force_liquidation=False
+    )
+    all_true = pd.Series(True, index=price_y.index)
+    price_y.attrs[OBSERVED_PRICE_MASK_ATTR] = all_true.copy(deep=True)
+
+    result = force_liquidate_open_position(
+        original,
+        price_y,
+        price_x,
+        beta,
+        observed_y=all_true,
+    )
+
+    assert bool(original["observed_y"].iat[-1])
+    assert result["execution_event"].iat[-1] == "FORCED_EXIT"
+    assert result["executed_state"].iat[-1] == "FLAT"
+
+
+def test_misaligned_price_metadata_mask_is_rejected() -> None:
+    price_y, price_x, signals, _ = _market_inputs(["ENTER_LONG", "NONE", "NONE"])
+    price_y.attrs[OBSERVED_PRICE_MASK_ATTR] = pd.Series(
+        True,
+        index=price_y.index[::-1],
+    )
+
+    with pytest.raises(ValueError, match="price metadata index"):
+        build_position_schedule(
+            price_y,
+            price_x,
+            signals,
+            1.0,
+            2_000.0,
+        )
+
+
+@pytest.mark.parametrize("entry_event", ["ENTER_LONG", "ENTER_SHORT"])
+def test_standalone_forced_liquidation_suppresses_terminal_entry(
+    entry_event: str,
+) -> None:
+    events = [entry_event, "NONE"]
+    price_y, price_x, signals, beta = _market_inputs(events)
+    schedule = build_position_schedule(
+        price_y,
+        price_x,
+        signals,
+        beta,
+        2_000.0,
+    )
+
+    suppressed = force_liquidate_open_position(
+        schedule,
+        price_y,
+        price_x,
+        beta,
+    )
+    accounting = build_financed_pnl_schedule(
+        suppressed,
+        price_y,
+        price_x,
+        10_000.0,
+        commission_bps=10.0,
+        slippage_bps=5.0,
+        fixed_commission_per_leg=1.0,
+    )
+    ledger = build_trade_ledger(accounting, suppressed)
+
+    assert schedule["execution_event"].iat[-1] == entry_event
+    pd.testing.assert_frame_equal(suppressed.iloc[:-1], schedule.iloc[:-1])
+    assert suppressed["executed_state"].iat[-1] == "FLAT"
+    assert suppressed["execution_event"].iat[-1] == "NONE"
+    assert suppressed[["units_y", "units_x"]].iloc[-1].eq(0.0).all()
+    assert not suppressed["execution_event"].eq("FORCED_EXIT").any()
+    assert accounting["transaction_cost"].eq(0.0).all()
+    assert ledger.empty
 
 
 def test_fully_closed_ledger_reconciles_to_final_after_carry_accounting() -> None:
@@ -2962,7 +3377,7 @@ def _integrated_case(
         z_values = [0.0, -2.5, -1.0, -1.0, -1.0]
     zscore = pd.Series(z_values, index=index, name="zscore")
     if rebalance:
-        beta_values = [1.0, 1.0, 1.0, 2.0, 2.0, 2.0][:count]
+        beta_values = [1.0, 1.0, 2.0, 2.0, 2.0, 2.0][:count]
     else:
         beta_values = [1.0] * count
     beta = pd.Series(beta_values, index=index, name="beta")
@@ -3133,6 +3548,42 @@ def test_integrated_forced_liquidation_changes_only_final_row_and_equity() -> No
     )
     assert forced_result.reconciliation.status == "RECONCILED"
     assert bool(forced_result.ledger.loc[0, "forced_exit"])
+
+
+def test_terminal_entry_is_suppressed_when_forced_liquidation_is_enabled() -> None:
+    events = ["NONE", "ENTER_LONG", "NONE"]
+    price_y, price_x, signals, _ = _market_inputs(events)
+
+    result = run_pair_backtest(
+        price_y,
+        price_x,
+        1.0,
+        2_000.0,
+        signals=signals,
+        force_liquidation=True,
+        commission_bps=10.0,
+        slippage_bps=5.0,
+    )
+
+    assert result.positions["executed_state"].eq("FLAT").all()
+    assert result.positions["execution_event"].eq("NONE").all()
+    assert result.accounting["transaction_cost"].eq(0.0).all()
+    assert result.ledger.empty
+    assert result.forced_liquidation_requested
+    assert not result.forced_liquidation_applied
+
+
+def test_runner_exposes_research_mode_causality_and_sizing_warnings() -> None:
+    _, result = _integrated_case()
+    metadata = result.research_metadata
+
+    assert metadata.upstream_inputs_assumed_causal
+    assert not metadata.upstream_provenance_validated
+    assert "does not validate" in metadata.warning
+    assert "genuine observed" in metadata.price_policy
+    assert "after 1 row" in metadata.hedge_ratio_policy
+    assert metadata.sizing_policy == "beta_weighted_gross_notional"
+    assert "not dollar-neutral unless beta == 1" in metadata.dollar_neutrality_note
 
 
 def test_integrated_missing_held_mark_reports_unknown_accounting() -> None:

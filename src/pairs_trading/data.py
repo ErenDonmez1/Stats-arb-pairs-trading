@@ -14,6 +14,8 @@ import pandas as pd
 
 LOGGER = logging.getLogger(__name__)
 
+OBSERVED_PRICE_MASK_ATTR = "observed_price_mask"
+
 
 class DataQualityError(ValueError):
     """Raised when prices are unusable for statistical research."""
@@ -289,7 +291,20 @@ class MarketDataLoader:
                 "Insufficient clean data: "
                 f"{len(clean)} complete rows; require {min_observations}."
             )
-        return clean.astype(float), report.sort_index()
+        clean = clean.astype(float)
+        # Keep execution provenance separate from the numeric valuation marks.
+        # A False cell is a limited forward fill: it may mark an existing
+        # holding, but must never authorize a new execution.  DataFrame attrs
+        # propagate to a selected Series in supported pandas versions, while
+        # callers can also pass this mask explicitly to the backtester.
+        observed_mask = valid.loc[clean.index, clean.columns].notna().astype(bool)
+        observed_mask.index = clean.index
+        observed_mask.columns = clean.columns
+        clean.attrs[OBSERVED_PRICE_MASK_ATTR] = observed_mask
+        clean.attrs["valuation_policy"] = (
+            "limited_forward_fill_for_valuation_only; execution_requires_observed"
+        )
+        return clean, report.sort_index()
 
 
 def make_synthetic_universe(

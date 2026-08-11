@@ -13,6 +13,7 @@ import pytest
 from pairs_trading.data import (
     DataQualityError,
     MarketDataLoader,
+    OBSERVED_PRICE_MASK_ATTR,
     make_synthetic_universe,
 )
 
@@ -141,6 +142,34 @@ def test_invalid_prices_are_reported_and_limited_forward_filled() -> None:
     assert dates[3] not in clean.index
 
 
+def test_clean_preserves_observed_mask_for_forward_filled_prices() -> None:
+    dates = pd.bdate_range("2024-01-01", periods=5)
+    prices = pd.DataFrame(
+        {
+            "AAA": [100.0, np.nan, 102.0, 103.0, 104.0],
+            "BBB": [200.0, 201.0, 202.0, 203.0, 204.0],
+        },
+        index=dates,
+    )
+
+    clean, _ = MarketDataLoader.clean(
+        prices,
+        min_coverage=0.8,
+        max_forward_fill=1,
+        min_observations=5,
+    )
+
+    observed = clean.attrs[OBSERVED_PRICE_MASK_ATTR]
+    pd.testing.assert_index_equal(observed.index, clean.index)
+    pd.testing.assert_index_equal(observed.columns, clean.columns)
+    assert observed.dtypes.eq(bool).all()
+    assert clean.loc[dates[1], "AAA"] == 100.0
+    assert not bool(observed.loc[dates[1], "AAA"])
+    assert bool(observed.loc[dates[1], "BBB"])
+    assert bool(observed.loc[dates[2], "AAA"])
+    assert "valuation_only" in clean.attrs["valuation_policy"]
+
+
 def test_limited_forward_fill_never_backfills_earlier_dates() -> None:
     dates = pd.bdate_range("2024-01-01", periods=6)
     prices = pd.DataFrame(
@@ -180,6 +209,35 @@ def test_low_coverage_symbol_is_removed_but_remains_in_report() -> None:
     assert list(clean.columns) == ["AAA", "BBB"]
     assert bool(report.loc["LOW", "retained"]) is False
     assert report.loc["LOW", "coverage"] == pytest.approx(0.2)
+
+
+def test_observed_mask_aligns_after_symbol_and_complete_row_filtering() -> None:
+    dates = pd.bdate_range("2024-01-01", periods=6)
+    prices = pd.DataFrame(
+        {
+            "AAA": [100.0, np.nan, np.nan, 103.0, 104.0, 105.0],
+            "BBB": [200.0, 201.0, 202.0, 203.0, 204.0, 205.0],
+            "LOW": [300.0, np.nan, np.nan, np.nan, np.nan, np.nan],
+        },
+        index=dates,
+    )
+
+    clean, report = MarketDataLoader.clean(
+        prices,
+        min_coverage=0.6,
+        max_forward_fill=1,
+        min_observations=5,
+    )
+
+    observed = clean.attrs[OBSERVED_PRICE_MASK_ATTR]
+    assert list(clean.columns) == ["AAA", "BBB"]
+    assert not bool(report.loc["LOW", "retained"])
+    assert dates[2] not in clean.index
+    pd.testing.assert_index_equal(observed.index, clean.index, exact=True)
+    pd.testing.assert_index_equal(observed.columns, clean.columns, exact=True)
+    assert observed.shape == clean.shape
+    assert not bool(observed.loc[dates[1], "AAA"])
+    assert bool(observed.loc[dates[1], "BBB"])
 
 
 def test_clean_does_not_mutate_callers_dataframe() -> None:

@@ -18,6 +18,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import pandas as pd
 
+from .data import OBSERVED_PRICE_MASK_ATTR
 from .signals import PositionState, TradeEvent, generate_trade_signals
 
 
@@ -39,6 +40,7 @@ __all__ = [
     "TradeExitReason",
     "TradeRecord",
     "LedgerReconciliation",
+    "BacktestResearchMetadata",
     "BacktestResult",
     "force_liquidate_open_position",
     "build_trade_ledger",
@@ -56,6 +58,8 @@ _OUTPUT_COLUMNS = (
     "hedge_ratio",
     "price_y",
     "price_x",
+    "observed_y",
+    "observed_x",
     "units_y",
     "units_x",
     "notional_y",
@@ -137,6 +141,7 @@ _FINANCED_OUTPUT_COLUMNS = _NET_PNL_OUTPUT_COLUMNS + (
     "rebalance_beta",
     "rebalance_delta_units_y",
     "rebalance_delta_units_x",
+    "rebalance_decision_row",
     "net_pnl_after_carry",
     "cumulative_net_pnl_after_carry",
     "net_equity_after_carry",
@@ -256,6 +261,19 @@ class LedgerReconciliation:
 
 
 @dataclass(frozen=True)
+class BacktestResearchMetadata:
+    """Explicit limitations and timing assumptions for research consumers."""
+
+    upstream_inputs_assumed_causal: bool
+    upstream_provenance_validated: bool
+    warning: str
+    price_policy: str
+    hedge_ratio_policy: str
+    sizing_policy: str
+    dollar_neutrality_note: str
+
+
+@dataclass(frozen=True)
 class BacktestResult:
     """Independently owned outputs from one integrated pair backtest.
 
@@ -270,6 +288,7 @@ class BacktestResult:
     accounting: pd.DataFrame
     ledger: pd.DataFrame
     reconciliation: LedgerReconciliation
+    research_metadata: BacktestResearchMetadata
     forced_liquidation_requested: bool
     forced_liquidation_applied: bool
     execution_lag: int
@@ -453,6 +472,100 @@ def _require_matching_index(reference: pd.Index, candidate: pd.Index, name: str)
         raise ValueError(f"{name} index must exactly match the price index and order.")
 
 
+def _validated_observed_mask(
+    price: pd.Series,
+    supplied: pd.Series | None,
+    name: str,
+    schedule_mask: pd.Series | None = None,
+) -> pd.Series:
+    """Return the conservative intersection of all price-provenance masks.
+
+    Explicit masks, metadata attached by :class:`MarketDataLoader`, and mask
+    columns carried by a position schedule are independent evidence.  Every
+    available source is validated and combined with logical AND, so no True
+    source can override another source's False value.  Raw Series with no
+    provenance information treat non-missing values as observed for backward
+    compatibility.
+    """
+    sources: list[tuple[str, pd.Series]] = []
+    if supplied is not None:
+        sources.append(("explicit mask", supplied))
+
+    if OBSERVED_PRICE_MASK_ATTR in price.attrs:
+        provenance = price.attrs[OBSERVED_PRICE_MASK_ATTR]
+        if isinstance(provenance, pd.DataFrame):
+            if price.name not in provenance.columns:
+                raise ValueError(
+                    f"{name} price metadata has no column for {price.name!r}."
+                )
+            sources.append(("price metadata", provenance[price.name]))
+        elif isinstance(provenance, pd.Series):
+            sources.append(("price metadata", provenance))
+        else:
+            raise TypeError(
+                f"{name} price metadata must be a pandas Series or DataFrame."
+            )
+
+    if schedule_mask is not None:
+        sources.append(("schedule mask", schedule_mask))
+
+    if not sources:
+        return price.notna().astype(bool).rename(name)
+
+    result = pd.Series(True, index=price.index, name=name, dtype=bool)
+    for source_label, source in sources:
+        if not isinstance(source, pd.Series):
+            raise TypeError(f"{name} {source_label} must be a pandas Series.")
+        if not source.index.is_unique:
+            raise ValueError(f"{name} {source_label} must have a unique index.")
+        _require_matching_index(
+            price.index,
+            source.index,
+            f"{name} {source_label}",
+        )
+        if source.isna().any():
+            raise ValueError(f"{name} {source_label} must not contain missing values.")
+        valid_values = source.map(
+            lambda value: isinstance(value, (bool, np.bool_))
+        )
+        if not bool(valid_values.all()):
+            raise TypeError(
+                f"{name} {source_label} must contain only Boolean values."
+            )
+        result &= source.astype(bool)
+
+    result = result.copy(deep=True)
+    result.name = name
+    return result
+
+
+def _available_hedge_ratios(
+    hedge_ratio: float | pd.Series,
+    index: pd.Index,
+    availability_lag: int,
+) -> pd.Series:
+    """Return beta values known before each execution row.
+
+    Scalar hedge ratios are treated as pre-frozen parameters.  A Series is
+    treated as close-derived posterior estimates and shifted by the explicit
+    row lag, so ``beta_t`` cannot be used for a same-close execution.
+    """
+    lag = _positive_integer(availability_lag, "hedge_ratio_lag")
+    if isinstance(hedge_ratio, pd.Series):
+        values = _validated_market_series(
+            hedge_ratio,
+            "hedge_ratio",
+            strictly_positive=True,
+        )
+        _require_matching_index(index, hedge_ratio.index, "hedge_ratio")
+        if lag:
+            values = values.shift(lag)
+        values.name = "hedge_ratio"
+        return values
+    beta = _finite_positive_scalar(hedge_ratio, "hedge_ratio")
+    return pd.Series(beta, index=index, name="hedge_ratio", dtype=float)
+
+
 def lag_trade_decisions(
     signals: pd.DataFrame,
     execution_lag: int = 1,
@@ -568,22 +681,27 @@ def build_position_schedule(
     hedge_ratio: float | pd.Series,
     target_gross_notional: float,
     execution_lag: int = 1,
+    *,
+    observed_y: pd.Series | None = None,
+    observed_x: pd.Series | None = None,
+    hedge_ratio_lag: int = 1,
+    suppress_terminal_entries: bool = False,
 ) -> pd.DataFrame:
     """Build a causal schedule of executed states, units, and raw exposures.
 
     State-changing orders become eligible after ``execution_lag`` rows.  If
-    either execution-row price or the execution-row hedge ratio is missing,
-    the order joins a FIFO queue and remains pending without expiry.  At most
-    one state-changing order executes on a valid row; this prevents the
-    scheduler from fabricating a same-row reversal.  Pending orders left after
-    the final row remain unexecuted.
+    either execution-row price is imputed/missing or the execution-available
+    hedge ratio is missing, the order remains pending.  A pending entry is
+    cancelled if the desired state changes before it fills.  At most one
+    state-changing order executes on a valid row, preventing same-row reversal.
 
-    Every execution, including a close, requires both current prices and the
-    current positive hedge ratio.  Open-position units are sized once using
-    those execution-row inputs and then remain unchanged until another
-    execution.  Reported notionals mark those carried units at current prices,
-    so gross exposure generally drifts away from its entry target.  Missing
-    marks remain missing rather than being backfilled.
+    Every execution, including a close, requires genuine observations for both
+    current prices.  Forward-filled prices remain valid valuation marks only.
+    A dynamic beta Series is treated as a close-derived posterior and shifted
+    by ``hedge_ratio_lag``; scalars are treated as pre-frozen parameters.
+    Reported notionals may still use imputed valuation marks.  When terminal
+    entry suppression is enabled, no new flat-to-open execution occurs on the
+    final row.
     """
     lag = _positive_integer(execution_lag, "execution_lag")
     gross_target = _finite_positive_scalar(
@@ -601,25 +719,28 @@ def build_position_schedule(
         strictly_positive=True,
     )
     _require_matching_index(price_y.index, price_x.index, "price_x")
+    observed_y_values = _validated_observed_mask(
+        price_y,
+        observed_y,
+        "observed_y",
+    )
+    observed_x_values = _validated_observed_mask(
+        price_x,
+        observed_x,
+        "observed_x",
+    )
+    if type(suppress_terminal_entries) is not bool:
+        raise TypeError("suppress_terminal_entries must be a bool.")
 
     decisions = _validated_signals(signals)
     _require_matching_index(price_y.index, signals.index, "signals")
     lagged = lag_trade_decisions(signals, execution_lag=lag)
 
-    if isinstance(hedge_ratio, pd.Series):
-        beta_values = _validated_market_series(
-            hedge_ratio,
-            "hedge_ratio",
-            strictly_positive=True,
-        )
-        _require_matching_index(price_y.index, hedge_ratio.index, "hedge_ratio")
-    else:
-        beta = _finite_positive_scalar(hedge_ratio, "hedge_ratio")
-        beta_values = pd.Series(
-            np.full(len(price_y), beta, dtype=float),
-            index=price_y.index,
-            name="hedge_ratio",
-        )
+    beta_values = _available_hedge_ratios(
+        hedge_ratio,
+        price_y.index,
+        hedge_ratio_lag,
+    )
 
     pending_orders: deque[tuple[str, str]] = deque()
     executed_state = PositionState.FLAT.name
@@ -630,6 +751,8 @@ def build_position_schedule(
     y_array = y_values.to_numpy(dtype=float)
     x_array = x_values.to_numpy(dtype=float)
     beta_array = beta_values.to_numpy(dtype=float)
+    observed_y_array = observed_y_values.to_numpy(dtype=bool)
+    observed_x_array = observed_x_values.to_numpy(dtype=bool)
 
     for row_number in range(len(price_y)):
         due_event = lagged["due_event"].iat[row_number]
@@ -637,7 +760,20 @@ def build_position_schedule(
             due_state = lagged["due_state"].iat[row_number]
             if due_state is None:  # Defensive: validation/lagging make this unreachable.
                 raise RuntimeError("A due event has no associated target state.")
-            pending_orders.append((due_state, due_event))
+            if (
+                due_state == PositionState.FLAT.name
+                and executed_state == PositionState.FLAT.name
+            ):
+                # Only a matured FLAT decision may invalidate a deferred entry.
+                # Current-row signal state is deliberately ignored because it
+                # has not yet served its own execution lag.
+                pending_orders = deque(
+                    order
+                    for order in pending_orders
+                    if order[0] == PositionState.FLAT.name
+                )
+            else:
+                pending_orders.append((due_state, due_event))
 
         # Discard a redundant target without presenting it as an execution.
         while pending_orders and pending_orders[0][0] == executed_state:
@@ -651,10 +787,24 @@ def build_position_schedule(
             np.isfinite(current_y)
             and np.isfinite(current_x)
             and np.isfinite(current_beta)
+            and observed_y_array[row_number]
+            and observed_x_array[row_number]
         )
 
         if pending_orders and execution_inputs_available:
-            target_state, source_event = pending_orders.popleft()
+            target_state, source_event = pending_orders[0]
+            terminal_entry_suppressed = bool(
+                suppress_terminal_entries
+                and row_number == len(price_y) - 1
+                and executed_state == PositionState.FLAT.name
+                and target_state != PositionState.FLAT.name
+            )
+            if terminal_entry_suppressed:
+                pending_orders.popleft()
+                target_state = executed_state
+                source_event = TradeEvent.NONE.value
+            else:
+                pending_orders.popleft()
             if (
                 executed_state != PositionState.FLAT.name
                 and target_state != PositionState.FLAT.name
@@ -694,6 +844,8 @@ def build_position_schedule(
                 current_beta,
                 current_y,
                 current_x,
+                bool(observed_y_array[row_number]),
+                bool(observed_x_array[row_number]),
                 units_y,
                 units_x,
                 notional_y,
@@ -717,6 +869,8 @@ def build_position_schedule(
         "net_exposure",
     ):
         result[column] = result[column].astype("float64")
+    for column in ("observed_y", "observed_x"):
+        result[column] = result[column].astype(bool)
     for column in (
         "decision_state",
         "executed_state",
@@ -1816,14 +1970,18 @@ def calculate_rebalancing_costs(
     commission_bps: float = 0.0,
     slippage_bps: float = 0.0,
     fixed_commission_per_leg: float = 0.0,
+    observed_y: pd.Series | None = None,
+    observed_x: pd.Series | None = None,
+    hedge_ratio_lag: int = 1,
 ) -> pd.DataFrame:
     """Overlay causal hedge rebalancing and reuse normal execution costs.
 
-    The relative trigger compares current beta with the beta used at the last
-    entry or rebalance.  Missing current beta or prices suppresses rebalancing
-    on that row; each later valid row is reconsidered against the unchanged
-    last-sizing beta.  No order is backdated.  State and execution-event values
-    remain unchanged, while ``rebalance`` identifies same-state unit changes.
+    The relative trigger compares the latest execution-available beta with the
+    beta used at the last entry or rebalance.  A dynamic posterior beta Series
+    is shifted by ``hedge_ratio_lag`` so its observation and execution rows are
+    distinct by default.  Missing or imputed execution prices suppress the
+    rebalance; each later valid row is reconsidered causally.  State and
+    execution-event values remain unchanged.
     """
     if type(rebalance) is not bool:  # Actual bool, not np.bool_, is required.
         raise TypeError("rebalance must be a bool.")
@@ -1836,17 +1994,39 @@ def calculate_rebalancing_costs(
     x_values = _validated_market_series(price_x, "price_x", strictly_positive=True)
     _require_matching_index(base.index, price_y.index, "price_y")
     _require_matching_index(base.index, price_x.index, "price_x")
+    observed_y_values = _validated_observed_mask(
+        price_y,
+        observed_y,
+        "observed_y",
+        position_schedule.get("observed_y"),
+    )
+    observed_x_values = _validated_observed_mask(
+        price_x,
+        observed_x,
+        "observed_x",
+        position_schedule.get("observed_x"),
+    )
+    beta_lag = _positive_integer(hedge_ratio_lag, "hedge_ratio_lag")
 
     beta_source = hedge_ratio
+    beta_is_execution_available = False
     if beta_source is None and "hedge_ratio" in position_schedule.columns:
         beta_source = position_schedule["hedge_ratio"]
+        beta_is_execution_available = True
     if isinstance(beta_source, pd.Series):
-        beta_values = _validated_market_series(
-            beta_source,
-            "hedge_ratio",
-            strictly_positive=True,
-        )
-        _require_matching_index(base.index, beta_source.index, "hedge_ratio")
+        if beta_is_execution_available:
+            beta_values = _validated_market_series(
+                beta_source,
+                "hedge_ratio",
+                strictly_positive=True,
+            )
+            _require_matching_index(base.index, beta_source.index, "hedge_ratio")
+        else:
+            beta_values = _available_hedge_ratios(
+                beta_source,
+                base.index,
+                beta_lag,
+            )
     elif beta_source is not None:
         beta = _finite_positive_scalar(beta_source, "hedge_ratio")
         beta_values = pd.Series(
@@ -1881,12 +2061,15 @@ def calculate_rebalancing_costs(
     marks_y = y_values.to_numpy(dtype=float)
     marks_x = x_values.to_numpy(dtype=float)
     betas = beta_values.to_numpy(dtype=float)
+    observed_y_array = observed_y_values.to_numpy(dtype=bool)
+    observed_x_array = observed_x_values.to_numpy(dtype=bool)
     adjusted_y = np.zeros(len(base), dtype=float)
     adjusted_x = np.zeros(len(base), dtype=float)
     rebalance_flags = np.zeros(len(base), dtype=bool)
     rebalance_betas = np.full(len(base), np.nan, dtype=float)
     rebalance_delta_y = np.zeros(len(base), dtype=float)
     rebalance_delta_x = np.zeros(len(base), dtype=float)
+    rebalance_decision_rows = np.full(len(base), np.nan, dtype=float)
     last_sizing_beta: float | None = None
 
     for row_number, (state, event) in enumerate(zip(states, events, strict=True)):
@@ -1920,6 +2103,8 @@ def calculate_rebalancing_costs(
             np.isfinite(current_beta)
             and np.isfinite(marks_y[row_number])
             and np.isfinite(marks_x[row_number])
+            and observed_y_array[row_number]
+            and observed_x_array[row_number]
         )
         if not current_inputs_available or last_sizing_beta is None:
             continue
@@ -1959,6 +2144,7 @@ def calculate_rebalancing_costs(
 
         rebalance_flags[row_number] = True
         rebalance_betas[row_number] = current_beta
+        rebalance_decision_rows[row_number] = row_number - beta_lag
         rebalance_delta_y[row_number] = (
             desired.units_y - adjusted_y[row_number]
         )
@@ -2003,6 +2189,11 @@ def calculate_rebalancing_costs(
                 rebalance_delta_x,
                 index=base.index,
                 name="rebalance_delta_units_x",
+            ),
+            pd.Series(
+                rebalance_decision_rows,
+                index=base.index,
+                name="rebalance_decision_row",
             ),
             costs,
         ],
@@ -2071,6 +2262,9 @@ def build_financed_pnl_schedule(
     hedge_ratio: float | pd.Series | None = None,
     target_gross_notional: float | None = None,
     rebalance_threshold: float = 0.0,
+    observed_y: pd.Series | None = None,
+    observed_x: pd.Series | None = None,
+    hedge_ratio_lag: int = 1,
 ) -> pd.DataFrame:
     """Build execution, gross, transaction, carry, and financed net accounting."""
     capital = _finite_positive_scalar(initial_capital, "initial_capital")
@@ -2086,6 +2280,9 @@ def build_financed_pnl_schedule(
         commission_bps=commission_bps,
         slippage_bps=slippage_bps,
         fixed_commission_per_leg=fixed_commission_per_leg,
+        observed_y=observed_y,
+        observed_x=observed_x,
+        hedge_ratio_lag=hedge_ratio_lag,
     )
     adjusted_schedule = rebalanced[
         [
@@ -2195,6 +2392,9 @@ def build_financed_pnl_schedule(
             "rebalance_delta_units_x": rebalanced[
                 "rebalance_delta_units_x"
             ],
+            "rebalance_decision_row": rebalanced[
+                "rebalance_decision_row"
+            ],
             "net_pnl_after_carry": financed_net,
             "cumulative_net_pnl_after_carry": cumulative_financed,
             "net_equity_after_carry": financed_equity,
@@ -2233,6 +2433,8 @@ def force_liquidate_open_position(
     hedge_ratio: float | pd.Series | None = None,
     *,
     force_liquidation: bool = True,
+    observed_y: pd.Series | None = None,
+    observed_x: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Return a copied schedule with an optional final-row forced close.
 
@@ -2242,8 +2444,9 @@ def force_liquidate_open_position(
     final unit deltas; no penalty fee is introduced.
 
     Final prices and beta are taken from explicit aligned inputs when supplied,
-    otherwise from matching columns in ``position_schedule``.  They must be
-    observable on the final row.  This function does not backfill them.
+    otherwise from matching columns in ``position_schedule``.  Both final
+    prices must be genuine observations rather than forward-filled valuation
+    marks.  This function does not backfill them.
     """
     if type(force_liquidation) is not bool:
         raise TypeError("force_liquidation must be a bool.")
@@ -2256,13 +2459,75 @@ def force_liquidate_open_position(
     if validated["executed_state"].iat[final_row] == PositionState.FLAT.name:
         return result
 
+    previous_state = (
+        PositionState.FLAT.name
+        if final_row == 0
+        else validated["executed_state"].iat[final_row - 1]
+    )
+    final_event = validated["execution_event"].iat[final_row]
+    terminal_entry = bool(
+        previous_state == PositionState.FLAT.name
+        and final_event
+        in {
+            TradeEvent.ENTER_LONG.value,
+            TradeEvent.ENTER_SHORT.value,
+        }
+    )
+    if terminal_entry:
+        # A position opened only on the terminal row has no executable holding
+        # interval.  Suppress the entry rather than fabricate an entry and
+        # forced exit at the same timestamp.
+        result.iat[
+            final_row, result.columns.get_loc("executed_state")
+        ] = PositionState.FLAT.name
+        result.iat[
+            final_row, result.columns.get_loc("execution_event")
+        ] = TradeEvent.NONE.value
+        for column in (
+            "units_y",
+            "units_x",
+            "notional_y",
+            "notional_x",
+            "gross_exposure",
+            "net_exposure",
+            "rebalance_delta_units_y",
+            "rebalance_delta_units_x",
+        ):
+            if column in result.columns:
+                result.iat[final_row, result.columns.get_loc(column)] = 0.0
+        if "rebalance" in result.columns:
+            result.iat[final_row, result.columns.get_loc("rebalance")] = False
+        _validated_position_schedule(result)
+        result.index = position_schedule.index
+        return result
+
     y_values = _liquidation_series(price_y, result, "price_y")
     x_values = _liquidation_series(price_x, result, "price_x")
+    y_source = price_y if price_y is not None else result["price_y"]
+    x_source = price_x if price_x is not None else result["price_x"]
+    y_observed = _validated_observed_mask(
+        y_source,
+        observed_y,
+        "observed_y",
+        result.get("observed_y"),
+    )
+    x_observed = _validated_observed_mask(
+        x_source,
+        observed_x,
+        "observed_x",
+        result.get("observed_x"),
+    )
     final_y = y_values.iat[final_row]
     final_x = x_values.iat[final_row]
-    if not np.isfinite(final_y) or not np.isfinite(final_x):
+    if (
+        not np.isfinite(final_y)
+        or not np.isfinite(final_x)
+        or not y_observed.iat[final_row]
+        or not x_observed.iat[final_row]
+    ):
         raise ValueError(
-            "Final prices must be available to force-liquidate an open position."
+            "Final prices must be genuine observed values to force-liquidate "
+            "an open position."
         )
 
     if hedge_ratio is None:
@@ -2320,6 +2585,10 @@ def force_liquidate_open_position(
             result.iat[final_row, result.columns.get_loc(column)] = 0.0
     if "rebalance" in result.columns:
         result.iat[final_row, result.columns.get_loc("rebalance")] = False
+    if "observed_y" in result.columns:
+        result.iat[final_row, result.columns.get_loc("observed_y")] = True
+    if "observed_x" in result.columns:
+        result.iat[final_row, result.columns.get_loc("observed_x")] = True
 
     _validated_position_schedule(result)
     result.index = position_schedule.index
@@ -2966,6 +3235,13 @@ def validate_backtest_invariants(
         raise TypeError("forced_liquidation_requested must be a bool.")
     if type(result.forced_liquidation_applied) is not bool:
         raise TypeError("forced_liquidation_applied must be a bool.")
+    if not isinstance(result.research_metadata, BacktestResearchMetadata):
+        raise TypeError("research_metadata must be BacktestResearchMetadata.")
+    if result.research_metadata.upstream_provenance_validated:
+        raise ValueError(
+            "Backtest invariant failed: upstream causal provenance cannot be "
+            "claimed by the execution runner."
+        )
 
     signals = result.signals
     positions = result.positions
@@ -3013,6 +3289,9 @@ def validate_backtest_invariants(
         "units_y",
         "units_x",
         "rebalance",
+        "rebalance_decision_row",
+        "observed_y",
+        "observed_x",
     }
     missing_positions = required_positions.difference(positions.columns)
     if missing_positions:
@@ -3076,6 +3355,26 @@ def validate_backtest_invariants(
             ]
         ]
     )
+    trade_or_rebalance = (
+        positions["execution_event"].ne(TradeEvent.NONE.value)
+        | positions["rebalance"].astype(bool)
+    )
+    if not bool(
+        positions.loc[
+            trade_or_rebalance,
+            ["observed_y", "observed_x"],
+        ].astype(bool).all().all()
+    ):
+        raise ValueError(
+            "Backtest invariant failed: execution used an imputed price."
+        )
+    for row_number in np.flatnonzero(positions["rebalance"].to_numpy(dtype=bool)):
+        decision_row = positions["rebalance_decision_row"].iat[row_number]
+        if not np.isfinite(decision_row) or int(decision_row) >= row_number:
+            raise ValueError(
+                "Backtest invariant failed: rebalance decision and execution "
+                "rows are not distinct."
+            )
     flat = actual_schedule["executed_state"].eq(PositionState.FLAT.name)
     if not bool(
         actual_schedule.loc[flat, ["units_y", "units_x"]].eq(0.0).all().all()
@@ -3195,13 +3494,23 @@ def run_pair_backtest(
     rebalance: bool = False,
     rebalance_threshold: float = 0.0,
     force_liquidation: bool = False,
+    observed_y: pd.Series | None = None,
+    observed_x: pd.Series | None = None,
+    hedge_ratio_lag: int = 1,
 ) -> BacktestResult:
     """Run the complete causal one-pair workflow through ledger reconciliation.
 
-    Exactly one of ``zscore`` and ``signals`` is required.  The implementation
-    delegates every stage to the existing signal, execution, P&L, cost,
-    liquidation, and ledger helpers.  Exposure detail is obtained from
-    :func:`build_pnl_schedule`; no accounting formula is duplicated here.
+    Exactly one of ``zscore`` and ``signals`` is required.  Supplied z-scores,
+    signals, and hedge ratios are assumed causal; this accounting runner cannot
+    prove how upstream arrays were estimated.  A dynamic hedge-ratio Series is
+    treated as close-derived and becomes execution-available only after
+    ``hedge_ratio_lag`` rows.  Beta-weighted gross-notional sizing is retained
+    and is not dollar-neutral unless beta equals one.
+
+    The implementation delegates every stage to the existing signal,
+    execution, P&L, cost, liquidation, and ledger helpers.  Forward-filled
+    prices may mark holdings but cannot execute when their observed masks are
+    supplied or attached by market-data cleaning.
     """
     if (zscore is None) == (signals is None):
         raise ValueError("Exactly one of zscore or signals must be supplied.")
@@ -3229,6 +3538,10 @@ def run_pair_backtest(
         hedge_ratio,
         target_gross_notional,
         execution_lag=lag,
+        observed_y=observed_y,
+        observed_x=observed_x,
+        hedge_ratio_lag=hedge_ratio_lag,
+        suppress_terminal_entries=force_liquidation,
     )
 
     accounting_kwargs = {
@@ -3244,6 +3557,9 @@ def run_pair_backtest(
         "hedge_ratio": hedge_ratio,
         "target_gross_notional": target_gross_notional,
         "rebalance_threshold": rebalance_threshold,
+        "observed_y": observed_y,
+        "observed_x": observed_x,
+        "hedge_ratio_lag": hedge_ratio_lag,
     }
     accounting = build_financed_pnl_schedule(
         base_positions,
@@ -3258,6 +3574,8 @@ def run_pair_backtest(
         price_x,
         hedge_ratio,
         force_liquidation=force_liquidation,
+        observed_y=observed_y,
+        observed_x=observed_x,
     )
     forced_applied = bool(
         not final_positions.empty
@@ -3283,6 +3601,9 @@ def run_pair_backtest(
         commission_bps=commission_bps,
         slippage_bps=slippage_bps,
         fixed_commission_per_leg=fixed_commission_per_leg,
+        observed_y=observed_y,
+        observed_x=observed_x,
+        hedge_ratio_lag=hedge_ratio_lag,
     )
     actual_schedule = rebalanced[
         [
@@ -3312,6 +3633,7 @@ def run_pair_backtest(
         "rebalance_beta",
         "rebalance_delta_units_y",
         "rebalance_delta_units_x",
+        "rebalance_decision_row",
     ):
         integrated_positions[column] = rebalanced[column]
     integrated_positions.index = price_y.index
@@ -3348,6 +3670,27 @@ def run_pair_backtest(
         accounting=integrated_accounting.copy(deep=True),
         ledger=ledger.copy(deep=True),
         reconciliation=reconciliation,
+        research_metadata=BacktestResearchMetadata(
+            upstream_inputs_assumed_causal=True,
+            upstream_provenance_validated=False,
+            warning=(
+                "Supplied z-scores, signals, and hedge ratios are assumed causal; "
+                "run_pair_backtest does not validate their upstream estimation "
+                "or selection provenance."
+            ),
+            price_policy=(
+                "Forward-filled prices may value holdings but genuine observed "
+                "prices on both legs are required for execution."
+            ),
+            hedge_ratio_policy=(
+                "Dynamic close-derived posterior beta values become available "
+                f"after {hedge_ratio_lag} row(s)."
+            ),
+            sizing_policy="beta_weighted_gross_notional",
+            dollar_neutrality_note=(
+                "Beta-weighted sizing is not dollar-neutral unless beta == 1."
+            ),
+        ),
         forced_liquidation_requested=force_liquidation,
         forced_liquidation_applied=forced_applied,
         execution_lag=lag,

@@ -13,10 +13,15 @@ from pairs_trading.analytics import (
     CorePerformanceMetrics,
     DrawdownEpisode,
     DrawdownMetrics,
+    TradePerformanceMetrics,
+    average_holding_period,
+    average_loser,
+    average_winner,
     annualized_return,
     annualized_volatility,
     calculate_drawdown_metrics,
     calculate_core_metrics,
+    calculate_trade_metrics,
     calmar_ratio,
     downside_deviation,
     drawdown_duration,
@@ -24,9 +29,15 @@ from pairs_trading.analytics import (
     drawdown_series,
     equity_curve_from_returns,
     maximum_drawdown,
+    median_holding_period,
+    payoff_ratio,
+    profit_factor,
     sharpe_ratio,
     sortino_ratio,
     total_return,
+    trade_expectancy,
+    turnover,
+    win_rate,
 )
 
 
@@ -868,3 +879,436 @@ def test_drawdown_prefix_is_unchanged_by_strictly_later_returns() -> None:
         original_prefix,
         12,
     ) == calculate_drawdown_metrics(changed_prefix, 12)
+
+
+def _trade_ledger(
+    net_pnl: list[Any] | None = None,
+    holding_periods: list[Any] | None = None,
+) -> pd.DataFrame:
+    """Return a minimal completed-trade ledger accepted by 7C analytics."""
+    if net_pnl is None:
+        net_pnl = [100.0, -50.0, 0.0, np.nan]
+    if holding_periods is None:
+        holding_periods = [3, 5, 4, 7][: len(net_pnl)]
+    count = len(net_pnl)
+    return pd.DataFrame(
+        {
+            "trade_id": np.arange(1, count + 1),
+            "net_pnl": net_pnl,
+            "holding_period_rows": holding_periods,
+            "entry_gross_notional": np.full(count, 1_000.0),
+        },
+        index=pd.Index([f"trade-{number}" for number in range(count)], name="row"),
+    )
+
+
+def _turnover_accounting() -> pd.DataFrame:
+    """Return entry, hold, rebalance, and exit traded-notional rows."""
+    return pd.DataFrame(
+        {
+            "traded_notional_y": [1_000.0, 0.0, 200.0, 1_000.0],
+            "traded_notional_x": [500.0, 0.0, 100.0, 500.0],
+        },
+        index=pd.Index(["entry", "hold", "rebalance", "exit"], name="event"),
+    )
+
+
+def test_win_rate_matches_manual_known_trade_classification() -> None:
+    ledger = _trade_ledger()
+
+    result = calculate_trade_metrics(ledger)
+
+    assert result.trades == 4
+    assert result.known_pnl_trades == 3
+    assert result.unknown_pnl_trades == 1
+    assert result.winning_trades == 1
+    assert result.losing_trades == 1
+    assert result.breakeven_trades == 1
+    assert result.win_rate == pytest.approx(1.0 / 3.0)
+    assert win_rate(ledger) == pytest.approx(1.0 / 3.0)
+
+
+def test_breakeven_tolerance_is_scale_aware_and_deterministic() -> None:
+    ledger = _trade_ledger([5e-13, -5e-13, 2e-12, -2e-12])
+
+    first = calculate_trade_metrics(ledger)
+    second = calculate_trade_metrics(ledger)
+
+    assert first.winning_trades == 1
+    assert first.losing_trades == 1
+    assert first.breakeven_trades == 2
+    assert first.winning_trades == second.winning_trades
+    assert first.losing_trades == second.losing_trades
+    assert first.breakeven_trades == second.breakeven_trades
+
+
+def test_average_winner_is_correct() -> None:
+    ledger = _trade_ledger([100.0, 50.0, -25.0, 0.0])
+
+    assert average_winner(ledger) == pytest.approx(75.0)
+
+
+def test_no_winners_returns_nan_average_winner() -> None:
+    ledger = _trade_ledger([-20.0, 0.0])
+
+    assert np.isnan(average_winner(ledger))
+
+
+def test_average_loser_is_correct_and_negative() -> None:
+    ledger = _trade_ledger([100.0, -50.0, -30.0, 0.0])
+
+    result = average_loser(ledger)
+
+    assert result == pytest.approx(-40.0)
+    assert result < 0.0
+
+
+def test_no_losers_returns_nan_average_loser() -> None:
+    ledger = _trade_ledger([20.0, 0.0])
+
+    assert np.isnan(average_loser(ledger))
+
+
+def test_payoff_ratio_matches_manual_calculation() -> None:
+    ledger = _trade_ledger([100.0, 50.0, -50.0, -25.0])
+
+    assert payoff_ratio(ledger) == pytest.approx(75.0 / 37.5)
+
+
+def test_no_loser_denominator_returns_nan_payoff_ratio() -> None:
+    ledger = _trade_ledger([100.0, 50.0, 0.0])
+
+    assert np.isnan(payoff_ratio(ledger))
+
+
+def test_expectancy_matches_probability_weighted_manual_calculation() -> None:
+    ledger = _trade_ledger([100.0, -50.0, 0.0])
+    expected = (1.0 / 3.0 * 100.0) + (1.0 / 3.0 * -50.0)
+
+    assert trade_expectancy(ledger) == pytest.approx(expected)
+
+
+def test_expectancy_matches_direct_mean_when_breakeven_is_zero() -> None:
+    ledger = _trade_ledger([100.0, -50.0, 0.0])
+
+    assert trade_expectancy(ledger) == pytest.approx(ledger["net_pnl"].mean())
+
+
+def test_profit_factor_and_gross_profit_loss_match_manual_values() -> None:
+    ledger = _trade_ledger([100.0, 50.0, -40.0, -10.0])
+
+    result = calculate_trade_metrics(ledger)
+
+    assert result.gross_profit == pytest.approx(150.0)
+    assert result.gross_loss == pytest.approx(50.0)
+    assert result.profit_factor == pytest.approx(3.0)
+    assert profit_factor(ledger) == pytest.approx(3.0)
+
+
+def test_no_losing_trades_returns_nan_profit_factor() -> None:
+    ledger = _trade_ledger([100.0, 50.0, 0.0])
+
+    assert np.isnan(profit_factor(ledger))
+    assert not np.isinf(profit_factor(ledger))
+
+
+def test_average_and_median_holding_period_are_correct() -> None:
+    ledger = _trade_ledger()
+
+    assert average_holding_period(ledger) == pytest.approx(4.75)
+    assert median_holding_period(ledger) == pytest.approx(4.5)
+
+
+def test_holding_periods_include_unknown_pnl_trades() -> None:
+    ledger = _trade_ledger([100.0, np.nan], [2, 10])
+
+    assert average_holding_period(ledger) == pytest.approx(6.0)
+    assert median_holding_period(ledger) == pytest.approx(6.0)
+
+
+@pytest.mark.parametrize("invalid", [True, np.bool_(False), -1, 1.5, 2.0, "2", np.nan])
+def test_invalid_holding_periods_are_rejected(invalid: Any) -> None:
+    ledger = _trade_ledger([10.0], [invalid])
+
+    with pytest.raises(ValueError, match="holding_period_rows"):
+        calculate_trade_metrics(ledger)
+
+
+def test_unknown_pnl_is_excluded_and_never_classified_as_breakeven() -> None:
+    ledger = _trade_ledger([100.0, -50.0, 0.0, np.nan])
+
+    result = calculate_trade_metrics(ledger)
+
+    assert result.known_pnl_trades == 3
+    assert result.unknown_pnl_trades == 1
+    assert result.breakeven_trades == 1
+    assert result.winning_trades + result.losing_trades + result.breakeven_trades == 3
+
+
+def test_all_unknown_pnl_returns_nan_denominator_statistics() -> None:
+    ledger = _trade_ledger([np.nan, np.nan], [2, 5])
+
+    result = calculate_trade_metrics(ledger)
+
+    assert result.trades == 2
+    assert result.known_pnl_trades == 0
+    assert result.unknown_pnl_trades == 2
+    assert result.winning_trades == result.losing_trades == result.breakeven_trades == 0
+    for value in (
+        result.win_rate,
+        result.average_winner,
+        result.average_loser,
+        result.payoff_ratio,
+        result.expectancy,
+        result.profit_factor,
+    ):
+        assert np.isnan(value)
+
+
+def test_total_net_pnl_is_unknown_if_any_trade_pnl_is_unknown() -> None:
+    unknown = calculate_trade_metrics(_trade_ledger())
+    known = calculate_trade_metrics(_trade_ledger([100.0, -50.0, 0.0]))
+
+    assert np.isnan(unknown.total_net_pnl)
+    assert known.total_net_pnl == pytest.approx(50.0)
+
+
+def test_empty_ledger_returns_documented_empty_metrics() -> None:
+    ledger = _trade_ledger([], [])
+
+    result = calculate_trade_metrics(ledger)
+
+    assert result.trades == 0
+    assert result.known_pnl_trades == 0
+    assert result.unknown_pnl_trades == 0
+    assert result.winning_trades == result.losing_trades == result.breakeven_trades == 0
+    assert result.gross_profit == 0.0
+    assert result.gross_loss == 0.0
+    assert result.total_net_pnl == 0.0
+    for value in (
+        result.win_rate,
+        result.average_winner,
+        result.average_loser,
+        result.payoff_ratio,
+        result.expectancy,
+        result.profit_factor,
+        result.average_holding_period,
+        result.median_holding_period,
+        result.turnover,
+    ):
+        assert np.isnan(value)
+
+
+def test_duplicate_trade_ids_are_rejected() -> None:
+    ledger = _trade_ledger([10.0, -5.0])
+    ledger["trade_id"] = [7, 7]
+
+    with pytest.raises(ValueError, match="trade_id.*unique"):
+        calculate_trade_metrics(ledger)
+
+
+@pytest.mark.parametrize(
+    "missing_column",
+    ["trade_id", "net_pnl", "holding_period_rows", "entry_gross_notional"],
+)
+def test_missing_required_trade_ledger_columns_are_rejected(
+    missing_column: str,
+) -> None:
+    ledger = _trade_ledger().drop(columns=missing_column)
+
+    with pytest.raises(ValueError, match="missing required columns"):
+        calculate_trade_metrics(ledger)
+
+
+@pytest.mark.parametrize("invalid", [True, "10", np.inf, -np.inf])
+def test_invalid_known_net_pnl_values_are_rejected(invalid: Any) -> None:
+    ledger = _trade_ledger([invalid])
+
+    with pytest.raises(ValueError, match="net_pnl"):
+        calculate_trade_metrics(ledger)
+
+
+@pytest.mark.parametrize("invalid", [True, "1000", 0.0, -1.0, np.nan, np.inf])
+def test_invalid_entry_gross_notional_values_are_rejected(invalid: Any) -> None:
+    ledger = _trade_ledger([10.0])
+    ledger["entry_gross_notional"] = ledger["entry_gross_notional"].astype(object)
+    ledger.loc["trade-0", "entry_gross_notional"] = invalid
+
+    with pytest.raises(ValueError, match="entry_gross_notional"):
+        calculate_trade_metrics(ledger)
+
+
+def test_trade_ledger_dataframe_and_index_contracts_are_enforced() -> None:
+    with pytest.raises(TypeError, match="pandas DataFrame"):
+        calculate_trade_metrics([1, 2])
+
+    ledger = _trade_ledger([10.0, -5.0])
+    ledger.index = pd.Index([0, 0])
+    with pytest.raises(ValueError, match="unique index"):
+        calculate_trade_metrics(ledger)
+
+
+def test_trade_metrics_do_not_mutate_input_ledger() -> None:
+    ledger = _trade_ledger()
+    ledger.attrs["source"] = "backtest-ledger"
+    before = ledger.copy(deep=True)
+
+    calculate_trade_metrics(ledger)
+
+    pd.testing.assert_frame_equal(ledger, before)
+    assert ledger.attrs == before.attrs
+
+
+def test_trade_metrics_are_deterministic() -> None:
+    ledger = _trade_ledger([100.0, -50.0, 0.0])
+    accounting = _turnover_accounting()
+
+    first = calculate_trade_metrics(
+        ledger,
+        accounting=accounting,
+        initial_capital=10_000.0,
+    )
+    second = calculate_trade_metrics(
+        ledger,
+        accounting=accounting,
+        initial_capital=10_000.0,
+    )
+
+    assert first == second
+
+
+def test_exact_turnover_uses_total_traded_notional_over_initial_capital() -> None:
+    accounting = _turnover_accounting()
+    expected = accounting[["traded_notional_y", "traded_notional_x"]].sum().sum()
+
+    assert turnover(accounting, 10_000.0) == pytest.approx(expected / 10_000.0)
+
+
+def test_entry_exit_and_rebalance_notional_all_contribute_to_turnover() -> None:
+    accounting = _turnover_accounting()
+
+    total = turnover(accounting, 10_000.0)
+    without_exit = turnover(accounting.iloc[:-1], 10_000.0)
+    without_rebalance = turnover(accounting.drop(index="rebalance"), 10_000.0)
+
+    assert total > without_exit
+    assert total > without_rebalance
+
+
+def test_zero_traded_notional_produces_zero_turnover() -> None:
+    accounting = pd.DataFrame(
+        {"traded_notional_y": [0.0, 0.0], "traded_notional_x": [0.0, 0.0]}
+    )
+
+    assert turnover(accounting, 10_000.0) == 0.0
+
+
+@pytest.mark.parametrize("invalid", [True, "10", -1.0, np.nan, np.inf, -np.inf])
+@pytest.mark.parametrize("column", ["traded_notional_y", "traded_notional_x"])
+def test_invalid_traded_notional_values_are_rejected(
+    invalid: Any,
+    column: str,
+) -> None:
+    accounting = _turnover_accounting().astype(object)
+    accounting.loc["entry", column] = invalid
+
+    with pytest.raises(ValueError, match=column):
+        turnover(accounting, 10_000.0)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [True, np.bool_(False), 0.0, -1.0, "10000", np.nan, np.inf, -np.inf],
+)
+def test_invalid_turnover_initial_capital_is_rejected(invalid: Any) -> None:
+    with pytest.raises((TypeError, ValueError), match="initial_capital"):
+        turnover(_turnover_accounting(), invalid)
+
+
+def test_turnover_dataframe_contract_is_enforced() -> None:
+    with pytest.raises(TypeError, match="pandas DataFrame"):
+        turnover([1, 2], 10_000.0)
+
+    missing = _turnover_accounting().drop(columns="traded_notional_x")
+    with pytest.raises(ValueError, match="missing required columns"):
+        turnover(missing, 10_000.0)
+
+    duplicated = _turnover_accounting()
+    duplicated.index = pd.Index([0, 0, 1, 2])
+    with pytest.raises(ValueError, match="unique index"):
+        turnover(duplicated, 10_000.0)
+
+
+def test_turnover_does_not_mutate_accounting_dataframe() -> None:
+    accounting = _turnover_accounting()
+    accounting.attrs["source"] = "financed-accounting"
+    before = accounting.copy(deep=True)
+
+    turnover(accounting, 10_000.0)
+
+    pd.testing.assert_frame_equal(accounting, before)
+    assert accounting.attrs == before.attrs
+
+
+def test_trade_performance_metrics_is_immutable() -> None:
+    result = calculate_trade_metrics(_trade_ledger([100.0, -50.0]))
+
+    assert isinstance(result, TradePerformanceMetrics)
+    with pytest.raises(FrozenInstanceError):
+        result.trades = 0  # type: ignore[misc]
+
+
+def test_calculate_trade_metrics_matches_individual_public_functions() -> None:
+    ledger = _trade_ledger([100.0, -50.0, 0.0])
+    accounting = _turnover_accounting()
+
+    result = calculate_trade_metrics(
+        ledger,
+        accounting=accounting,
+        initial_capital=10_000.0,
+    )
+
+    assert result.win_rate == pytest.approx(win_rate(ledger))
+    assert result.average_winner == pytest.approx(average_winner(ledger))
+    assert result.average_loser == pytest.approx(average_loser(ledger))
+    assert result.payoff_ratio == pytest.approx(payoff_ratio(ledger))
+    assert result.expectancy == pytest.approx(trade_expectancy(ledger))
+    assert result.profit_factor == pytest.approx(profit_factor(ledger))
+    assert result.average_holding_period == pytest.approx(
+        average_holding_period(ledger)
+    )
+    assert result.median_holding_period == pytest.approx(
+        median_holding_period(ledger)
+    )
+    assert result.turnover == pytest.approx(turnover(accounting, 10_000.0))
+
+
+def test_turnover_inputs_must_be_supplied_together() -> None:
+    ledger = _trade_ledger([100.0, -50.0])
+
+    with pytest.raises(ValueError, match="supplied together"):
+        calculate_trade_metrics(ledger, accounting=_turnover_accounting())
+    with pytest.raises(ValueError, match="supplied together"):
+        calculate_trade_metrics(ledger, initial_capital=10_000.0)
+
+
+def test_later_trades_do_not_change_explicit_ledger_prefix_metrics() -> None:
+    ledger = _trade_ledger([100.0, -50.0, 20.0, -10.0])
+    changed = ledger.copy(deep=True)
+    changed.loc["trade-2":, "net_pnl"] = [2_000.0, -1_000.0]
+    prefix = ledger.iloc[:2]
+    changed_prefix = changed.iloc[:2]
+    accounting_prefix = _turnover_accounting().iloc[:2]
+
+    original = calculate_trade_metrics(
+        prefix,
+        accounting=accounting_prefix,
+        initial_capital=10_000.0,
+    )
+    modified = calculate_trade_metrics(
+        changed_prefix,
+        accounting=accounting_prefix,
+        initial_capital=10_000.0,
+    )
+
+    assert original == modified

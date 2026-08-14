@@ -1,7 +1,7 @@
-"""Return, risk, and drawdown metrics for an already-computed return series.
+"""Return, drawdown, trade, and turnover analytics for strategy research.
 
-Trade statistics, benchmark analysis, portfolio aggregation, persistence, and
-plotting remain outside this module.
+Benchmark analysis, portfolio aggregation, persistence, and plotting remain
+outside this module.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ __all__ = [
     "CorePerformanceMetrics",
     "DrawdownEpisode",
     "DrawdownMetrics",
+    "TradePerformanceMetrics",
     "total_return",
     "annualized_return",
     "annualized_volatility",
@@ -32,6 +33,16 @@ __all__ = [
     "drawdown_duration",
     "calmar_ratio",
     "calculate_drawdown_metrics",
+    "win_rate",
+    "average_winner",
+    "average_loser",
+    "payoff_ratio",
+    "trade_expectancy",
+    "profit_factor",
+    "average_holding_period",
+    "median_holding_period",
+    "turnover",
+    "calculate_trade_metrics",
 ]
 
 
@@ -85,6 +96,30 @@ class DrawdownMetrics:
     observations: int
     current_drawdown: float
     underwater_observations: int
+
+
+@dataclass(frozen=True)
+class TradePerformanceMetrics:
+    """Immutable completed-trade statistics and optional exact turnover."""
+
+    trades: int
+    known_pnl_trades: int
+    unknown_pnl_trades: int
+    winning_trades: int
+    losing_trades: int
+    breakeven_trades: int
+    win_rate: float
+    average_winner: float
+    average_loser: float
+    payoff_ratio: float
+    expectancy: float
+    profit_factor: float
+    average_holding_period: float
+    median_holding_period: float
+    gross_profit: float
+    gross_loss: float
+    total_net_pnl: float
+    turnover: float
 
 
 def _validated_returns(
@@ -693,4 +728,331 @@ def calculate_drawdown_metrics(
         observations=len(equity),
         current_drawdown=float(drawdowns.iat[-1]),
         underwater_observations=int(drawdowns.lt(0.0).sum()),
+    )
+
+
+_REQUIRED_TRADE_LEDGER_COLUMNS = {
+    "trade_id",
+    "net_pnl",
+    "holding_period_rows",
+    "entry_gross_notional",
+}
+_REQUIRED_TURNOVER_COLUMNS = {"traded_notional_y", "traded_notional_x"}
+
+
+def _validated_trade_ledger(ledger: pd.DataFrame) -> pd.DataFrame:
+    """Return a defensive, validated copy of a completed-trade ledger.
+
+    ``net_pnl`` is the only required field permitted to be missing.  Missing
+    P&L remains unknown; it is never converted to zero.  Ledger row order is
+    preserved.
+    """
+    if not isinstance(ledger, pd.DataFrame):
+        raise TypeError("ledger must be a pandas DataFrame.")
+    if not ledger.index.is_unique:
+        raise ValueError("ledger must have a unique index.")
+    missing = _REQUIRED_TRADE_LEDGER_COLUMNS.difference(ledger.columns)
+    if missing:
+        raise ValueError(f"ledger is missing required columns: {sorted(missing)}.")
+
+    result = ledger.copy(deep=True)
+    trade_ids = result["trade_id"]
+    if bool(trade_ids.isna().any()):
+        raise ValueError("ledger trade_id values must not be missing.")
+    if bool(trade_ids.duplicated().any()):
+        raise ValueError("ledger trade_id values must be unique.")
+
+    pnl = result["net_pnl"]
+    known_pnl = pnl.loc[pnl.notna()]
+    numeric_pnl = known_pnl.map(
+        lambda value: isinstance(value, Real)
+        and not isinstance(value, (bool, np.bool_))
+    )
+    if not bool(numeric_pnl.all()):
+        raise ValueError("Known ledger net_pnl values must be real numeric values.")
+    try:
+        pnl_values = pnl.to_numpy(dtype=float, na_value=np.nan)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "Known ledger net_pnl values must be representable as floats."
+        ) from exc
+    if not np.isfinite(pnl_values[~np.isnan(pnl_values)]).all():
+        raise ValueError("Known ledger net_pnl values must be finite.")
+
+    holding = result["holding_period_rows"]
+    valid_holding = holding.map(
+        lambda value: isinstance(value, Integral)
+        and not isinstance(value, (bool, np.bool_))
+        and int(value) >= 0
+    )
+    if not bool(valid_holding.all()):
+        raise ValueError(
+            "ledger holding_period_rows values must be non-negative, "
+            "non-Boolean integers."
+        )
+
+    notionals = result["entry_gross_notional"]
+    numeric_notional = notionals.map(
+        lambda value: isinstance(value, Real)
+        and not isinstance(value, (bool, np.bool_))
+    )
+    if not bool(numeric_notional.all()):
+        raise ValueError(
+            "ledger entry_gross_notional values must be real numeric values."
+        )
+    try:
+        notional_values = notionals.to_numpy(dtype=float)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "ledger entry_gross_notional values must be representable as floats."
+        ) from exc
+    if not np.isfinite(notional_values).all() or bool((notional_values <= 0.0).any()):
+        raise ValueError(
+            "ledger entry_gross_notional values must be finite and strictly positive."
+        )
+
+    result["net_pnl"] = pd.Series(
+        pnl_values,
+        index=result.index,
+        dtype=float,
+    )
+    result["holding_period_rows"] = pd.Series(
+        [int(value) for value in holding],
+        index=result.index,
+        dtype="int64",
+    )
+    result["entry_gross_notional"] = pd.Series(
+        notional_values,
+        index=result.index,
+        dtype=float,
+    )
+    result.index = ledger.index
+    return result
+
+
+def _classified_trade_pnl(
+    ledger: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    """Return known, winning, losing, and breakeven P&L arrays plus tolerance."""
+    known = ledger["net_pnl"].dropna().to_numpy(dtype=float)
+    scale = max(1.0, float(np.max(np.abs(known)))) if len(known) else 1.0
+    tolerance = NEAR_ZERO_TOLERANCE * scale
+    winners = known[known > tolerance]
+    losers = known[known < -tolerance]
+    breakeven = known[np.abs(known) <= tolerance]
+    return known, winners, losers, breakeven, tolerance
+
+
+def win_rate(ledger: pd.DataFrame) -> float:
+    """Return winning known-P&L trades divided by all known-P&L trades.
+
+    Classification uses ``NEAR_ZERO_TOLERANCE * max(1, max(abs(net_pnl)))``.
+    Unknown P&L is excluded.  With no known trades, the result is NaN.
+    """
+    validated = _validated_trade_ledger(ledger)
+    known, winners, _, _, _ = _classified_trade_pnl(validated)
+    if not len(known):
+        return float("nan")
+    return float(len(winners) / len(known))
+
+
+def average_winner(ledger: pd.DataFrame) -> float:
+    """Return mean winning-trade net P&L, or NaN when there are no winners."""
+    validated = _validated_trade_ledger(ledger)
+    _, winners, _, _, _ = _classified_trade_pnl(validated)
+    return float(np.mean(winners)) if len(winners) else float("nan")
+
+
+def average_loser(ledger: pd.DataFrame) -> float:
+    """Return negative mean losing-trade net P&L, or NaN with no losers."""
+    validated = _validated_trade_ledger(ledger)
+    _, _, losers, _, _ = _classified_trade_pnl(validated)
+    return float(np.mean(losers)) if len(losers) else float("nan")
+
+
+def payoff_ratio(ledger: pd.DataFrame) -> float:
+    """Return average winner divided by absolute average loser.
+
+    Missing winner or loser groups and effectively zero loser denominators
+    produce NaN rather than zero or infinity.
+    """
+    validated = _validated_trade_ledger(ledger)
+    known, winners, losers, _, _ = _classified_trade_pnl(validated)
+    if not len(winners) or not len(losers):
+        return float("nan")
+    winner_mean = float(np.mean(winners))
+    loser_mean = float(np.mean(losers))
+    if _is_effectively_zero(loser_mean, known):
+        return float("nan")
+    return float(winner_mean / abs(loser_mean))
+
+
+def trade_expectancy(ledger: pd.DataFrame) -> float:
+    """Return probability-weighted expected P&L per known trade.
+
+    Winner and loser probabilities use all known-P&L trades as the denominator.
+    Breakeven trades contribute exactly zero, and unknown P&L is excluded.  No
+    known trades produces NaN.
+    """
+    validated = _validated_trade_ledger(ledger)
+    known, winners, losers, _, _ = _classified_trade_pnl(validated)
+    if not len(known):
+        return float("nan")
+    winner_term = (
+        len(winners) / len(known) * float(np.mean(winners))
+        if len(winners)
+        else 0.0
+    )
+    loser_term = (
+        len(losers) / len(known) * float(np.mean(losers))
+        if len(losers)
+        else 0.0
+    )
+    return float(winner_term + loser_term)
+
+
+def profit_factor(ledger: pd.DataFrame) -> float:
+    """Return gross winning P&L divided by absolute gross losing P&L.
+
+    No losing trades or an effectively zero gross loss produces NaN rather than
+    positive infinity.
+    """
+    validated = _validated_trade_ledger(ledger)
+    known, winners, losers, _, _ = _classified_trade_pnl(validated)
+    gross_profit = float(np.sum(winners)) if len(winners) else 0.0
+    gross_loss = abs(float(np.sum(losers))) if len(losers) else 0.0
+    if not len(losers) or _is_effectively_zero(gross_loss, known):
+        return float("nan")
+    return float(gross_profit / gross_loss)
+
+
+def average_holding_period(ledger: pd.DataFrame) -> float:
+    """Return mean holding-period rows across all trades, including unknown P&L."""
+    validated = _validated_trade_ledger(ledger)
+    if validated.empty:
+        return float("nan")
+    return float(validated["holding_period_rows"].mean())
+
+
+def median_holding_period(ledger: pd.DataFrame) -> float:
+    """Return median holding-period rows across all trades, including unknown P&L."""
+    validated = _validated_trade_ledger(ledger)
+    if validated.empty:
+        return float("nan")
+    return float(validated["holding_period_rows"].median())
+
+
+def _validated_initial_capital(initial_capital: Any) -> float:
+    """Return finite positive capital for turnover normalization."""
+    if isinstance(initial_capital, (bool, np.bool_)) or not isinstance(
+        initial_capital,
+        Real,
+    ):
+        raise TypeError("initial_capital must be a non-Boolean real number.")
+    result = float(initial_capital)
+    if not np.isfinite(result):
+        raise ValueError("initial_capital must be finite.")
+    if result <= 0.0:
+        raise ValueError("initial_capital must be strictly positive.")
+    return result
+
+
+def turnover(accounting: pd.DataFrame, initial_capital: float) -> float:
+    """Return exact non-annualized traded notional divided by initial capital.
+
+    Every row contributes ``traded_notional_y + traded_notional_x``.  This
+    includes entries, exits, and hedge rebalances already represented by the
+    accounting schedule.
+    """
+    if not isinstance(accounting, pd.DataFrame):
+        raise TypeError("accounting must be a pandas DataFrame.")
+    if not accounting.index.is_unique:
+        raise ValueError("accounting must have a unique index.")
+    missing = _REQUIRED_TURNOVER_COLUMNS.difference(accounting.columns)
+    if missing:
+        raise ValueError(
+            f"accounting is missing required columns: {sorted(missing)}."
+        )
+    capital = _validated_initial_capital(initial_capital)
+    copied = accounting.copy(deep=True)
+    arrays: list[np.ndarray] = []
+    for column in ("traded_notional_y", "traded_notional_x"):
+        values = copied[column]
+        numeric = values.map(
+            lambda value: isinstance(value, Real)
+            and not isinstance(value, (bool, np.bool_))
+        )
+        if not bool(numeric.all()):
+            raise ValueError(f"accounting {column} values must be real numeric values.")
+        try:
+            array = values.to_numpy(dtype=float)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"accounting {column} values must be representable as floats."
+            ) from exc
+        if not np.isfinite(array).all() or bool((array < 0.0).any()):
+            raise ValueError(
+                f"accounting {column} values must be finite and non-negative."
+            )
+        arrays.append(array)
+    with np.errstate(over="ignore", invalid="ignore"):
+        total_traded_notional = float(np.sum(arrays[0]) + np.sum(arrays[1]))
+        result = float(total_traded_notional / capital)
+    if not np.isfinite(total_traded_notional) or not np.isfinite(result):
+        raise ValueError("Turnover and total traded notional must remain finite.")
+    return result
+
+
+def calculate_trade_metrics(
+    ledger: pd.DataFrame,
+    *,
+    accounting: pd.DataFrame | None = None,
+    initial_capital: float | None = None,
+) -> TradePerformanceMetrics:
+    """Compose immutable trade statistics and optional exact turnover.
+
+    ``trades`` counts all ledger rows.  Classification statistics use only
+    known P&L, while holding periods use every trade.  If any P&L is unknown,
+    ``total_net_pnl`` is NaN.  Turnover is NaN when both optional turnover
+    inputs are omitted; otherwise both accounting and initial capital are
+    required.
+    """
+    if (accounting is None) != (initial_capital is None):
+        raise ValueError(
+            "accounting and initial_capital must be supplied together for turnover."
+        )
+    validated = _validated_trade_ledger(ledger)
+    known, winners, losers, breakeven, _ = _classified_trade_pnl(validated)
+    unknown_count = int(validated["net_pnl"].isna().sum())
+    gross_profit = float(np.sum(winners)) if len(winners) else 0.0
+    gross_loss = abs(float(np.sum(losers))) if len(losers) else 0.0
+    total_net_pnl = (
+        float("nan")
+        if unknown_count
+        else (float(np.sum(known)) if len(known) else 0.0)
+    )
+    turnover_value = (
+        float("nan")
+        if accounting is None
+        else turnover(accounting, initial_capital)
+    )
+    return TradePerformanceMetrics(
+        trades=len(validated),
+        known_pnl_trades=len(known),
+        unknown_pnl_trades=unknown_count,
+        winning_trades=len(winners),
+        losing_trades=len(losers),
+        breakeven_trades=len(breakeven),
+        win_rate=win_rate(ledger),
+        average_winner=average_winner(ledger),
+        average_loser=average_loser(ledger),
+        payoff_ratio=payoff_ratio(ledger),
+        expectancy=trade_expectancy(ledger),
+        profit_factor=profit_factor(ledger),
+        average_holding_period=average_holding_period(ledger),
+        median_holding_period=median_holding_period(ledger),
+        gross_profit=gross_profit,
+        gross_loss=gross_loss,
+        total_net_pnl=total_net_pnl,
+        turnover=turnover_value,
     )

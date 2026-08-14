@@ -1,7 +1,6 @@
-"""Return, drawdown, trade, and turnover analytics for strategy research.
+"""Return, drawdown, trade, rolling, and benchmark research analytics.
 
-Benchmark analysis, portfolio aggregation, persistence, and plotting remain
-outside this module.
+Portfolio aggregation, persistence, and plotting remain outside this module.
 """
 
 from __future__ import annotations
@@ -19,6 +18,8 @@ __all__ = [
     "DrawdownEpisode",
     "DrawdownMetrics",
     "TradePerformanceMetrics",
+    "BenchmarkMetrics",
+    "StrategyPerformanceReport",
     "total_return",
     "annualized_return",
     "annualized_volatility",
@@ -43,6 +44,17 @@ __all__ = [
     "median_holding_period",
     "turnover",
     "calculate_trade_metrics",
+    "rolling_volatility",
+    "rolling_sharpe_ratio",
+    "rolling_sortino_ratio",
+    "rolling_drawdown",
+    "benchmark_beta",
+    "benchmark_alpha",
+    "tracking_error",
+    "information_ratio",
+    "correlation_to_benchmark",
+    "calculate_benchmark_metrics",
+    "build_performance_report",
 ]
 
 
@@ -120,6 +132,31 @@ class TradePerformanceMetrics:
     gross_loss: float
     total_net_pnl: float
     turnover: float
+
+
+@dataclass(frozen=True)
+class BenchmarkMetrics:
+    """Immutable single-benchmark comparison statistics."""
+
+    beta: float
+    alpha: float
+    tracking_error: float
+    information_ratio: float
+    correlation: float
+    observations: int
+    periods_per_year: int
+
+
+@dataclass(frozen=True)
+class StrategyPerformanceReport:
+    """Immutable composition of strategy, trade, and benchmark analytics."""
+
+    core: CorePerformanceMetrics
+    drawdown: DrawdownMetrics
+    trades: TradePerformanceMetrics
+    benchmark: BenchmarkMetrics | None
+    report_observations: int
+    periods_per_year: int
 
 
 def _validated_returns(
@@ -1055,4 +1092,548 @@ def calculate_trade_metrics(
         gross_loss=gross_loss,
         total_net_pnl=total_net_pnl,
         turnover=turnover_value,
+    )
+
+
+def _validated_numeric_series_with_gaps(
+    values: pd.Series,
+    *,
+    argument_name: str,
+) -> pd.Series:
+    """Return a float copy while retaining every original row and missing value."""
+    if not isinstance(values, pd.Series):
+        raise TypeError(f"{argument_name} must be a pandas Series.")
+    if not values.index.is_unique:
+        raise ValueError(f"{argument_name} must have a unique index.")
+
+    copied = values.copy(deep=True)
+    present_mask = copied.notna()
+    present = copied.loc[present_mask]
+    numeric = present.map(
+        lambda value: isinstance(value, Real)
+        and not isinstance(value, (bool, np.bool_))
+    )
+    if not bool(numeric.all()):
+        raise ValueError(
+            f"Non-missing {argument_name} values must be real numeric values."
+        )
+    try:
+        present_values = present.to_numpy(dtype=float)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"Non-missing {argument_name} values must be representable as floats."
+        ) from exc
+    if not np.isfinite(present_values).all():
+        raise ValueError(f"Non-missing {argument_name} values must be finite.")
+
+    result_values = np.full(len(copied), np.nan, dtype=float)
+    result_values[present_mask.to_numpy(dtype=bool)] = present_values
+    result = pd.Series(
+        result_values,
+        index=values.index,
+        name=values.name,
+        dtype=float,
+    )
+    result.attrs = values.attrs.copy()
+    result.index = values.index
+    return result
+
+
+def _validated_rolling_window(
+    window: Any,
+    *,
+    observations: int,
+    minimum: int,
+) -> int:
+    """Return a valid row-count rolling window for one metric."""
+    if isinstance(window, (bool, np.bool_)) or not isinstance(window, Integral):
+        raise TypeError("window must be a non-Boolean integer.")
+    result = int(window)
+    if result < minimum:
+        qualifier = "strictly positive" if minimum == 1 else f"at least {minimum}"
+        raise ValueError(f"window must be {qualifier}.")
+    if observations < result:
+        raise ValueError(
+            "Insufficient rows for rolling window: "
+            f"received {observations}; require at least {result}."
+        )
+    return result
+
+
+def _finalize_rolling_result(
+    result: pd.Series,
+    source: pd.Series,
+    *,
+    name: str,
+) -> pd.Series:
+    """Restore exact index metadata and reject non-finite emitted metrics."""
+    result = result.astype(float).rename(name)
+    result.index = source.index
+    emitted = result.loc[result.notna()].to_numpy(dtype=float)
+    if not np.isfinite(emitted).all():
+        raise ValueError(f"Calculated {name} values must remain finite or NaN.")
+    return result
+
+
+def rolling_volatility(
+    returns: pd.Series,
+    window: int,
+    periods_per_year: int,
+) -> pd.Series:
+    """Return causal annualized sample volatility on complete row windows.
+
+    Unlike full-sample metrics, rolling output never drops rows.  Each value at
+    row ``t`` uses rows ``t-window+1`` through ``t``.  A missing value anywhere
+    in that window leaves the result missing; no observation is filled.
+    """
+    values = _validated_numeric_series_with_gaps(
+        returns,
+        argument_name="returns",
+    )
+    periods = _validated_periods_per_year(periods_per_year)
+    lookback = _validated_rolling_window(
+        window,
+        observations=len(values),
+        minimum=2,
+    )
+    with np.errstate(over="ignore", invalid="ignore"):
+        result = values.rolling(lookback, min_periods=lookback).std(ddof=1)
+        result = result * float(np.sqrt(periods))
+    return _finalize_rolling_result(result, returns, name="rolling_volatility")
+
+
+def rolling_sharpe_ratio(
+    returns: pd.Series,
+    window: int,
+    periods_per_year: int,
+    risk_free_rate: float = 0.0,
+) -> pd.Series:
+    """Return causal rolling Sharpe ratios on complete row windows.
+
+    The annual risk-free rate is converted to its geometric per-period
+    equivalent.  Sample excess-return volatility uses ``ddof=1``.  Complete
+    windows with an effectively zero denominator emit NaN, never infinity.
+    """
+    values = _validated_numeric_series_with_gaps(
+        returns,
+        argument_name="returns",
+    )
+    periods = _validated_periods_per_year(periods_per_year)
+    lookback = _validated_rolling_window(
+        window,
+        observations=len(values),
+        minimum=2,
+    )
+    period_rate = _period_risk_free_rate(risk_free_rate, periods)
+    excess = values - period_rate
+    rolling = excess.rolling(lookback, min_periods=lookback)
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        denominator = rolling.std(ddof=1)
+        scale = excess.abs().rolling(lookback, min_periods=lookback).max()
+        scale = scale.clip(lower=1.0)
+        result = rolling.mean() / denominator * float(np.sqrt(periods))
+    result = result.mask(
+        denominator.abs() <= NEAR_ZERO_TOLERANCE * scale,
+        np.nan,
+    )
+    return _finalize_rolling_result(result, returns, name="rolling_sharpe_ratio")
+
+
+def rolling_sortino_ratio(
+    returns: pd.Series,
+    window: int,
+    periods_per_year: int,
+    risk_free_rate: float = 0.0,
+) -> pd.Series:
+    """Return causal rolling Sortino ratios using 7A lower-partial deviation.
+
+    Every complete window uses ``sqrt(mean(min(excess, 0)**2))``.  Missing rows
+    are retained, poison only windows containing them, and are never filled.
+    """
+    values = _validated_numeric_series_with_gaps(
+        returns,
+        argument_name="returns",
+    )
+    periods = _validated_periods_per_year(periods_per_year)
+    lookback = _validated_rolling_window(
+        window,
+        observations=len(values),
+        minimum=1,
+    )
+    period_rate = _period_risk_free_rate(risk_free_rate, periods)
+    excess = values - period_rate
+    downside_squared = excess.clip(upper=0.0).pow(2)
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        numerator = excess.rolling(lookback, min_periods=lookback).mean()
+        denominator = np.sqrt(
+            downside_squared.rolling(lookback, min_periods=lookback).mean()
+        )
+        scale = excess.abs().rolling(lookback, min_periods=lookback).max()
+        scale = scale.clip(lower=1.0)
+        result = numerator / denominator * float(np.sqrt(periods))
+    result = result.mask(
+        denominator.abs() <= NEAR_ZERO_TOLERANCE * scale,
+        np.nan,
+    )
+    return _finalize_rolling_result(result, returns, name="rolling_sortino_ratio")
+
+
+def rolling_drawdown(
+    returns: pd.Series,
+    initial_equity: float = 1.0,
+) -> pd.Series:
+    """Return current causal drawdown while preserving the complete row index.
+
+    This is current drawdown, not maximum drawdown over a lookback.  Valid
+    observations follow :func:`drawdown_series` exactly.  A missing current
+    return emits NaN at that row; later valid observations resume the causal
+    equity path without inventing a return for the missing row.
+    """
+    values = _validated_numeric_series_with_gaps(
+        returns,
+        argument_name="returns",
+    )
+    retained = values.loc[values.notna()]
+    if retained.empty:
+        raise ValueError("rolling_drawdown requires at least one valid return.")
+    retained_drawdown = drawdown_series(
+        retained,
+        initial_equity,
+        missing_policy="drop",
+    )
+    result = retained_drawdown.reindex(values.index).rename("rolling_drawdown")
+    result.index = returns.index
+    return result.astype(float)
+
+
+def _validated_benchmark_pair(
+    strategy_returns: pd.Series,
+    benchmark_returns: pd.Series,
+    *,
+    missing_policy: str,
+    min_observations: int = 2,
+) -> pd.DataFrame:
+    """Return pairwise-valid strategy and benchmark returns on an exact index."""
+    if missing_policy != "drop":
+        raise ValueError("missing_policy must be 'drop'.")
+    strategy = _validated_numeric_series_with_gaps(
+        strategy_returns,
+        argument_name="strategy_returns",
+    )
+    benchmark = _validated_numeric_series_with_gaps(
+        benchmark_returns,
+        argument_name="benchmark_returns",
+    )
+    if not strategy_returns.index.equals(benchmark_returns.index):
+        raise ValueError(
+            "strategy_returns and benchmark_returns must have matching exact "
+            "indices and row order."
+        )
+    paired_mask = strategy.notna() & benchmark.notna()
+    paired = pd.DataFrame(
+        {
+            "strategy": strategy.loc[paired_mask].to_numpy(dtype=float),
+            "benchmark": benchmark.loc[paired_mask].to_numpy(dtype=float),
+        },
+        index=strategy.index[paired_mask],
+        dtype=float,
+    )
+    if len(paired) < min_observations:
+        raise ValueError(
+            "Insufficient paired return observations: "
+            f"received {len(paired)}; require at least {min_observations}."
+        )
+    return paired
+
+
+def _sample_standard_deviation(values: np.ndarray, *, label: str) -> float:
+    """Return a finite sample standard deviation for validated observations."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        result = float(np.std(values, ddof=1))
+    if not np.isfinite(result):
+        raise ValueError(f"{label} sample standard deviation must remain finite.")
+    return result
+
+
+def benchmark_beta(
+    strategy_returns: pd.Series,
+    benchmark_returns: pd.Series,
+    *,
+    missing_policy: str = "drop",
+) -> float:
+    """Return single-benchmark return beta from sample covariance/variance.
+
+    This market beta is unrelated to the pair hedge ratio estimated by the
+    statistical model.  Pairwise-missing rows are dropped without filling.
+    Effectively constant benchmark returns produce NaN.
+    """
+    paired = _validated_benchmark_pair(
+        strategy_returns,
+        benchmark_returns,
+        missing_policy=missing_policy,
+    )
+    strategy = paired["strategy"].to_numpy(dtype=float)
+    benchmark = paired["benchmark"].to_numpy(dtype=float)
+    benchmark_std = _sample_standard_deviation(
+        benchmark,
+        label="Benchmark return",
+    )
+    if _is_effectively_zero(benchmark_std, benchmark):
+        return float("nan")
+    with np.errstate(over="ignore", invalid="ignore"):
+        covariance = float(np.cov(strategy, benchmark, ddof=1)[0, 1])
+        variance = float(np.var(benchmark, ddof=1))
+        result = float(covariance / variance)
+    if not np.isfinite(result):
+        raise ValueError("Benchmark beta must remain finite or NaN.")
+    return result
+
+
+def benchmark_alpha(
+    strategy_returns: pd.Series,
+    benchmark_returns: pd.Series,
+    periods_per_year: int,
+    risk_free_rate: float = 0.0,
+    *,
+    missing_policy: str = "drop",
+) -> float:
+    """Return arithmetic annualized Jensen-style alpha for one benchmark.
+
+    The annual risk-free rate is converted geometrically to a per-period rate.
+    Periodic alpha is mean strategy excess return less beta times mean benchmark
+    excess return, then arithmetically multiplied by ``periods_per_year``.
+    """
+    periods = _validated_periods_per_year(periods_per_year)
+    period_rate = _period_risk_free_rate(risk_free_rate, periods)
+    paired = _validated_benchmark_pair(
+        strategy_returns,
+        benchmark_returns,
+        missing_policy=missing_policy,
+    )
+    beta = benchmark_beta(
+        strategy_returns,
+        benchmark_returns,
+        missing_policy=missing_policy,
+    )
+    if np.isnan(beta):
+        return float("nan")
+    strategy_excess = paired["strategy"].to_numpy(dtype=float) - period_rate
+    benchmark_excess = paired["benchmark"].to_numpy(dtype=float) - period_rate
+    with np.errstate(over="ignore", invalid="ignore"):
+        periodic_alpha = float(
+            np.mean(strategy_excess) - beta * np.mean(benchmark_excess)
+        )
+        result = float(periodic_alpha * periods)
+    if not np.isfinite(result):
+        raise ValueError("Annualized benchmark alpha must remain finite or NaN.")
+    return result
+
+
+def tracking_error(
+    strategy_returns: pd.Series,
+    benchmark_returns: pd.Series,
+    periods_per_year: int,
+    *,
+    missing_policy: str = "drop",
+) -> float:
+    """Return annualized sample volatility of pairwise-valid active returns."""
+    periods = _validated_periods_per_year(periods_per_year)
+    paired = _validated_benchmark_pair(
+        strategy_returns,
+        benchmark_returns,
+        missing_policy=missing_policy,
+    )
+    active = (
+        paired["strategy"].to_numpy(dtype=float)
+        - paired["benchmark"].to_numpy(dtype=float)
+    )
+    active_std = _sample_standard_deviation(active, label="Active return")
+    result = float(active_std * np.sqrt(periods))
+    if not np.isfinite(result):
+        raise ValueError("Tracking error must remain finite.")
+    return result
+
+
+def information_ratio(
+    strategy_returns: pd.Series,
+    benchmark_returns: pd.Series,
+    periods_per_year: int,
+    *,
+    missing_policy: str = "drop",
+) -> float:
+    """Return annualized mean active return divided by sample active volatility."""
+    periods = _validated_periods_per_year(periods_per_year)
+    paired = _validated_benchmark_pair(
+        strategy_returns,
+        benchmark_returns,
+        missing_policy=missing_policy,
+    )
+    active = (
+        paired["strategy"].to_numpy(dtype=float)
+        - paired["benchmark"].to_numpy(dtype=float)
+    )
+    active_std = _sample_standard_deviation(active, label="Active return")
+    if _is_effectively_zero(active_std, active):
+        return float("nan")
+    result = float(np.mean(active) / active_std * np.sqrt(periods))
+    if not np.isfinite(result):
+        raise ValueError("Information ratio must remain finite or NaN.")
+    return result
+
+
+def correlation_to_benchmark(
+    strategy_returns: pd.Series,
+    benchmark_returns: pd.Series,
+    *,
+    missing_policy: str = "drop",
+) -> float:
+    """Return pairwise Pearson correlation, or NaN for constant inputs."""
+    paired = _validated_benchmark_pair(
+        strategy_returns,
+        benchmark_returns,
+        missing_policy=missing_policy,
+    )
+    strategy = paired["strategy"].to_numpy(dtype=float)
+    benchmark = paired["benchmark"].to_numpy(dtype=float)
+    strategy_std = _sample_standard_deviation(strategy, label="Strategy return")
+    benchmark_std = _sample_standard_deviation(
+        benchmark,
+        label="Benchmark return",
+    )
+    if _is_effectively_zero(strategy_std, strategy) or _is_effectively_zero(
+        benchmark_std,
+        benchmark,
+    ):
+        return float("nan")
+    with np.errstate(over="ignore", invalid="ignore"):
+        result = float(np.corrcoef(strategy, benchmark)[0, 1])
+    if not np.isfinite(result):
+        raise ValueError("Benchmark correlation must remain finite or NaN.")
+    return result
+
+
+def calculate_benchmark_metrics(
+    strategy_returns: pd.Series,
+    benchmark_returns: pd.Series,
+    periods_per_year: int,
+    risk_free_rate: float = 0.0,
+    *,
+    missing_policy: str = "drop",
+) -> BenchmarkMetrics:
+    """Compose immutable single-benchmark metrics from paired observations."""
+    periods = _validated_periods_per_year(periods_per_year)
+    paired = _validated_benchmark_pair(
+        strategy_returns,
+        benchmark_returns,
+        missing_policy=missing_policy,
+    )
+    return BenchmarkMetrics(
+        beta=benchmark_beta(
+            strategy_returns,
+            benchmark_returns,
+            missing_policy=missing_policy,
+        ),
+        alpha=benchmark_alpha(
+            strategy_returns,
+            benchmark_returns,
+            periods,
+            risk_free_rate,
+            missing_policy=missing_policy,
+        ),
+        tracking_error=tracking_error(
+            strategy_returns,
+            benchmark_returns,
+            periods,
+            missing_policy=missing_policy,
+        ),
+        information_ratio=information_ratio(
+            strategy_returns,
+            benchmark_returns,
+            periods,
+            missing_policy=missing_policy,
+        ),
+        correlation=correlation_to_benchmark(
+            strategy_returns,
+            benchmark_returns,
+            missing_policy=missing_policy,
+        ),
+        observations=len(paired),
+        periods_per_year=periods,
+    )
+
+
+def build_performance_report(
+    returns: pd.Series,
+    ledger: pd.DataFrame,
+    *,
+    periods_per_year: int,
+    risk_free_rate: float = 0.0,
+    accounting: pd.DataFrame | None = None,
+    initial_capital: float | None = None,
+    benchmark_returns: pd.Series | None = None,
+) -> StrategyPerformanceReport:
+    """Compose existing core, drawdown, trade, and optional benchmark metrics.
+
+    Turnover remains optional but requires both an accounting DataFrame and an
+    explicit initial capital.  No capital base or annualization frequency is
+    inferred.  All nested summaries are calculated from the supplied inputs;
+    external later observations have no effect unless they are supplied.
+    """
+    if (accounting is None) != (initial_capital is None):
+        raise ValueError(
+            "accounting and initial_capital must be supplied together for turnover."
+        )
+    periods = _validated_periods_per_year(periods_per_year)
+    core = calculate_core_metrics(
+        returns,
+        periods,
+        risk_free_rate,
+        missing_policy="drop",
+    )
+    drawdown = calculate_drawdown_metrics(
+        returns,
+        periods,
+        missing_policy="drop",
+    )
+    trades = calculate_trade_metrics(
+        ledger,
+        accounting=accounting,
+        initial_capital=initial_capital,
+    )
+    benchmark = (
+        None
+        if benchmark_returns is None
+        else calculate_benchmark_metrics(
+            returns,
+            benchmark_returns,
+            periods,
+            risk_free_rate,
+            missing_policy="drop",
+        )
+    )
+
+    if core.observations != drawdown.observations:
+        raise RuntimeError("Core and drawdown observation counts are inconsistent.")
+    if trades.trades != len(ledger):
+        raise RuntimeError("Trade summary count is inconsistent with the ledger.")
+    if core.periods_per_year != periods:
+        raise RuntimeError("Core annualization frequency is inconsistent.")
+    if benchmark is not None and benchmark.periods_per_year != periods:
+        raise RuntimeError("Benchmark annualization frequency is inconsistent.")
+    if benchmark is not None and benchmark_returns is not None:
+        paired = _validated_benchmark_pair(
+            returns,
+            benchmark_returns,
+            missing_policy="drop",
+        )
+        if benchmark.observations != len(paired):
+            raise RuntimeError("Benchmark paired observation count is inconsistent.")
+
+    return StrategyPerformanceReport(
+        core=core,
+        drawdown=drawdown,
+        trades=trades,
+        benchmark=benchmark,
+        report_observations=core.observations,
+        periods_per_year=periods,
     )

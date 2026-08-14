@@ -1,4 +1,4 @@
-"""Focused tests for Milestone 7A core performance and risk metrics."""
+"""Focused tests for strategy performance and risk analytics."""
 
 from __future__ import annotations
 
@@ -10,15 +10,21 @@ import pandas as pd
 import pytest
 
 from pairs_trading.analytics import (
+    BenchmarkMetrics,
     CorePerformanceMetrics,
     DrawdownEpisode,
     DrawdownMetrics,
+    StrategyPerformanceReport,
     TradePerformanceMetrics,
     average_holding_period,
     average_loser,
     average_winner,
     annualized_return,
     annualized_volatility,
+    benchmark_alpha,
+    benchmark_beta,
+    build_performance_report,
+    calculate_benchmark_metrics,
     calculate_drawdown_metrics,
     calculate_core_metrics,
     calculate_trade_metrics,
@@ -28,13 +34,20 @@ from pairs_trading.analytics import (
     drawdown_episodes,
     drawdown_series,
     equity_curve_from_returns,
+    correlation_to_benchmark,
+    information_ratio,
     maximum_drawdown,
     median_holding_period,
     payoff_ratio,
     profit_factor,
+    rolling_drawdown,
+    rolling_sharpe_ratio,
+    rolling_sortino_ratio,
+    rolling_volatility,
     sharpe_ratio,
     sortino_ratio,
     total_return,
+    tracking_error,
     trade_expectancy,
     turnover,
     win_rate,
@@ -1309,6 +1322,607 @@ def test_later_trades_do_not_change_explicit_ledger_prefix_metrics() -> None:
         changed_prefix,
         accounting=accounting_prefix,
         initial_capital=10_000.0,
+    )
+
+    assert original == modified
+
+
+def _strategy_and_benchmark_returns() -> tuple[pd.Series, pd.Series]:
+    index = pd.Index(["a", "b", "c", "d", "e"], name="period")
+    benchmark = pd.Series([0.01, -0.005, 0.015, -0.01, 0.02], index=index)
+    strategy = pd.Series(
+        0.002 + 1.4 * benchmark.to_numpy(),
+        index=index,
+    )
+    return strategy, benchmark
+
+
+def test_rolling_volatility_matches_manual_sample_calculation() -> None:
+    returns = pd.Series([0.01, -0.02, 0.03, 0.005, -0.01])
+    expected = returns.iloc[-3:].std(ddof=1) * np.sqrt(252)
+
+    result = rolling_volatility(returns, 3, 252)
+
+    assert result.iloc[-1] == pytest.approx(expected)
+
+
+def test_rolling_metrics_first_window_minus_one_rows_are_nan() -> None:
+    returns = pd.Series([0.01, -0.02, 0.03, -0.01, 0.02])
+
+    for result in (
+        rolling_volatility(returns, 3, 252),
+        rolling_sharpe_ratio(returns, 3, 252),
+        rolling_sortino_ratio(returns, 3, 252),
+    ):
+        assert result.iloc[:2].isna().all()
+        assert result.iloc[2:].notna().any()
+
+
+def test_rolling_sharpe_matches_manual_periodic_risk_free_calculation() -> None:
+    returns = pd.Series([0.01, 0.02, -0.005, 0.015, -0.01])
+    annual_risk_free = 0.05
+    period_rate = np.expm1(np.log1p(annual_risk_free) / 12)
+    excess = returns.iloc[-4:].to_numpy() - period_rate
+    expected = np.mean(excess) / np.std(excess, ddof=1) * np.sqrt(12)
+
+    result = rolling_sharpe_ratio(returns, 4, 12, annual_risk_free)
+
+    assert result.iloc[-1] == pytest.approx(expected)
+
+
+def test_zero_rolling_volatility_produces_nan_sharpe() -> None:
+    returns = pd.Series([0.01, 0.01, 0.01, 0.01])
+
+    result = rolling_sharpe_ratio(returns, 3, 252)
+
+    assert result.iloc[-2:].isna().all()
+    assert not np.isinf(result.to_numpy(dtype=float)).any()
+
+
+def test_rolling_sortino_matches_manual_lower_partial_calculation() -> None:
+    returns = pd.Series([0.02, -0.01, 0.01, -0.03, 0.005])
+    window = returns.iloc[-4:].to_numpy()
+    downside = np.minimum(window, 0.0)
+    expected = np.mean(window) / np.sqrt(np.mean(np.square(downside))) * np.sqrt(12)
+
+    result = rolling_sortino_ratio(returns, 4, 12)
+
+    assert result.iloc[-1] == pytest.approx(expected)
+
+
+def test_zero_rolling_downside_deviation_produces_nan_sortino() -> None:
+    returns = pd.Series([0.01, 0.02, 0.03, 0.04])
+
+    result = rolling_sortino_ratio(returns, 3, 252)
+
+    assert result.iloc[-2:].isna().all()
+    assert not np.isinf(result.to_numpy(dtype=float)).any()
+
+
+def test_rolling_metrics_preserve_exact_index_and_timezone() -> None:
+    index = pd.date_range("2024-01-01", periods=5, tz="Europe/London", name="date")
+    returns = pd.Series([0.01, -0.02, 0.03, -0.01, 0.02], index=index)
+
+    for result in (
+        rolling_volatility(returns, 3, 252),
+        rolling_sharpe_ratio(returns, 3, 252),
+        rolling_sortino_ratio(returns, 3, 252),
+        rolling_drawdown(returns),
+    ):
+        assert result.index.identical(index)
+
+
+def test_missing_value_inside_rolling_window_makes_metric_nan() -> None:
+    returns = pd.Series([0.01, np.nan, 0.02, 0.03, 0.04])
+
+    result = rolling_volatility(returns, 3, 252)
+
+    assert result.iloc[:4].isna().all()
+    assert np.isfinite(result.iloc[4])
+
+
+def test_missing_rolling_observations_are_not_filled_or_compressed() -> None:
+    index = pd.Index(["r4", "r2", "r5", "r1", "r3"], name="unsorted")
+    returns = pd.Series([0.01, np.nan, -0.02, 0.03, 0.01], index=index)
+
+    result = rolling_sharpe_ratio(returns, 2, 252)
+
+    assert result.index.identical(index)
+    assert len(result) == len(returns)
+    assert result.iloc[1:3].isna().all()
+
+
+@pytest.mark.parametrize("invalid", [True, np.bool_(False), 0, -1, 2.5, "3"])
+def test_invalid_rolling_windows_are_rejected(invalid: Any) -> None:
+    returns = pd.Series([0.01, -0.02, 0.03])
+
+    with pytest.raises((TypeError, ValueError), match="window"):
+        rolling_volatility(returns, invalid, 252)
+
+
+def test_sample_rolling_metrics_reject_one_row_window() -> None:
+    returns = pd.Series([0.01, -0.02, 0.03])
+
+    with pytest.raises(ValueError, match="at least 2"):
+        rolling_volatility(returns, 1, 252)
+    with pytest.raises(ValueError, match="at least 2"):
+        rolling_sharpe_ratio(returns, 1, 252)
+
+
+def test_rolling_window_requires_enough_input_rows() -> None:
+    returns = pd.Series([0.01, -0.02, 0.03])
+
+    with pytest.raises(ValueError, match="Insufficient rows"):
+        rolling_sortino_ratio(returns, 4, 252)
+
+
+def test_rolling_metrics_are_deterministic_and_future_invariant() -> None:
+    returns = pd.Series([0.01, -0.02, 0.03, -0.01, 0.02, -0.005])
+    changed = returns.copy(deep=True)
+    changed.iloc[4:] = [0.80, -0.70]
+
+    calculators = (
+        lambda values: rolling_volatility(values, 3, 252),
+        lambda values: rolling_sharpe_ratio(values, 3, 252),
+        lambda values: rolling_sortino_ratio(values, 3, 252),
+        rolling_drawdown,
+    )
+    for calculate in calculators:
+        first = calculate(returns)
+        repeated = calculate(returns)
+        modified = calculate(changed)
+        pd.testing.assert_series_equal(first, repeated)
+        pd.testing.assert_series_equal(first.iloc[:4], modified.iloc[:4])
+
+
+def test_rolling_analytics_do_not_mutate_input() -> None:
+    index = pd.Index(["z", "x", "y", "w"], name="row")
+    returns = pd.Series([0.01, np.nan, -0.02, 0.03], index=index)
+    returns.attrs["source"] = "strategy"
+    before = returns.copy(deep=True)
+
+    rolling_volatility(returns, 2, 252)
+    rolling_sharpe_ratio(returns, 2, 252)
+    rolling_sortino_ratio(returns, 2, 252)
+    rolling_drawdown(returns)
+
+    pd.testing.assert_series_equal(returns, before)
+    assert returns.attrs == before.attrs
+
+
+def test_rolling_drawdown_matches_existing_causal_drawdown_series() -> None:
+    returns = pd.Series([0.05, -0.10, 0.03, -0.02, 0.08])
+
+    result = rolling_drawdown(returns)
+    expected = drawdown_series(returns).rename("rolling_drawdown")
+
+    pd.testing.assert_series_equal(result, expected)
+
+
+def test_rolling_drawdown_retains_missing_rows_without_filling() -> None:
+    returns = pd.Series([0.05, np.nan, -0.10, 0.03])
+    expected_valid = drawdown_series(returns.dropna()).rename("rolling_drawdown")
+
+    result = rolling_drawdown(returns)
+
+    assert np.isnan(result.iloc[1])
+    pd.testing.assert_series_equal(result.dropna(), expected_valid)
+
+
+def test_benchmark_beta_matches_manual_covariance_variance() -> None:
+    strategy, benchmark = _strategy_and_benchmark_returns()
+    expected = np.cov(strategy, benchmark, ddof=1)[0, 1] / np.var(
+        benchmark,
+        ddof=1,
+    )
+
+    assert benchmark_beta(strategy, benchmark) == pytest.approx(expected)
+
+
+def test_zero_variance_benchmark_returns_nan_beta() -> None:
+    strategy = pd.Series([0.01, -0.02, 0.03])
+    benchmark = pd.Series([0.01, 0.01, 0.01])
+
+    result = benchmark_beta(strategy, benchmark)
+
+    assert np.isnan(result)
+    assert not np.isinf(result)
+
+
+def test_benchmark_alpha_matches_manual_excess_return_calculation() -> None:
+    strategy, benchmark = _strategy_and_benchmark_returns()
+    periods = 12
+    annual_risk_free = 0.04
+    period_rate = np.expm1(np.log1p(annual_risk_free) / periods)
+    beta = np.cov(strategy, benchmark, ddof=1)[0, 1] / np.var(
+        benchmark,
+        ddof=1,
+    )
+    expected = (
+        np.mean(strategy.to_numpy() - period_rate)
+        - beta * np.mean(benchmark.to_numpy() - period_rate)
+    ) * periods
+
+    result = benchmark_alpha(
+        strategy,
+        benchmark,
+        periods,
+        annual_risk_free,
+    )
+
+    assert result == pytest.approx(expected)
+
+
+def test_tracking_error_matches_manual_active_return_calculation() -> None:
+    strategy, benchmark = _strategy_and_benchmark_returns()
+    active = strategy.to_numpy() - benchmark.to_numpy()
+
+    result = tracking_error(strategy, benchmark, 252)
+
+    assert result == pytest.approx(np.std(active, ddof=1) * np.sqrt(252))
+
+
+def test_information_ratio_matches_manual_active_return_calculation() -> None:
+    strategy, benchmark = _strategy_and_benchmark_returns()
+    active = strategy.to_numpy() - benchmark.to_numpy()
+    expected = np.mean(active) / np.std(active, ddof=1) * np.sqrt(252)
+
+    assert information_ratio(strategy, benchmark, 252) == pytest.approx(expected)
+
+
+def test_zero_tracking_error_returns_nan_information_ratio() -> None:
+    benchmark = pd.Series([0.01, -0.02, 0.03, 0.005])
+    strategy = benchmark + 0.001
+
+    assert tracking_error(strategy, benchmark, 252) == pytest.approx(0.0, abs=1e-15)
+    assert np.isnan(information_ratio(strategy, benchmark, 252))
+
+
+def test_benchmark_correlation_matches_pearson_correlation() -> None:
+    strategy, benchmark = _strategy_and_benchmark_returns()
+
+    assert correlation_to_benchmark(strategy, benchmark) == pytest.approx(
+        strategy.corr(benchmark)
+    )
+
+
+@pytest.mark.parametrize("constant_side", ["strategy", "benchmark"])
+def test_constant_series_returns_nan_benchmark_correlation(
+    constant_side: str,
+) -> None:
+    strategy, benchmark = _strategy_and_benchmark_returns()
+    if constant_side == "strategy":
+        strategy[:] = 0.01
+    else:
+        benchmark[:] = 0.01
+
+    result = correlation_to_benchmark(strategy, benchmark)
+
+    assert np.isnan(result)
+
+
+def test_benchmark_missing_observations_are_pairwise_dropped_only() -> None:
+    strategy = pd.Series([0.01, np.nan, 0.03, 0.04])
+    benchmark = pd.Series([0.005, 0.006, np.nan, 0.02])
+    expected_strategy = np.array([0.01, 0.04])
+    expected_benchmark = np.array([0.005, 0.02])
+    expected_beta = np.cov(expected_strategy, expected_benchmark, ddof=1)[0, 1] / np.var(
+        expected_benchmark,
+        ddof=1,
+    )
+
+    result = calculate_benchmark_metrics(strategy, benchmark, 252)
+
+    assert result.observations == 2
+    assert result.beta == pytest.approx(expected_beta)
+
+
+def test_benchmark_missing_values_are_not_filled_or_interpolated() -> None:
+    strategy = pd.Series([0.01, np.nan, 0.04, 0.02])
+    benchmark = pd.Series([0.005, 0.50, 0.02, 0.01])
+    dropped_strategy = strategy.dropna()
+    dropped_benchmark = benchmark.loc[dropped_strategy.index]
+
+    result = benchmark_beta(strategy, benchmark)
+    expected = benchmark_beta(dropped_strategy, dropped_benchmark)
+
+    assert result == pytest.approx(expected)
+
+
+def test_misaligned_benchmark_indices_are_rejected() -> None:
+    strategy = pd.Series([0.01, -0.02, 0.03], index=["a", "b", "c"])
+    reordered = pd.Series([0.01, -0.02, 0.03], index=["b", "a", "c"])
+
+    with pytest.raises(ValueError, match="matching exact indices"):
+        benchmark_beta(strategy, reordered)
+
+
+@pytest.mark.parametrize("side", ["strategy", "benchmark"])
+def test_duplicate_benchmark_input_indices_are_rejected(side: str) -> None:
+    strategy = pd.Series([0.01, -0.02, 0.03])
+    benchmark = pd.Series([0.005, -0.01, 0.02])
+    if side == "strategy":
+        strategy.index = [0, 0, 1]
+    else:
+        benchmark.index = [0, 0, 1]
+
+    with pytest.raises(ValueError, match="unique index"):
+        benchmark_beta(strategy, benchmark)
+
+
+@pytest.mark.parametrize("invalid", [True, "bad", np.inf, -np.inf])
+def test_invalid_benchmark_return_values_are_rejected(invalid: Any) -> None:
+    strategy = pd.Series([0.01, -0.02, 0.03], dtype=object)
+    benchmark = pd.Series([0.005, -0.01, 0.02], dtype=object)
+    benchmark.iloc[1] = invalid
+
+    with pytest.raises(ValueError, match="benchmark_returns"):
+        benchmark_beta(strategy, benchmark)
+
+
+def test_unsupported_benchmark_missing_policy_is_rejected() -> None:
+    strategy, benchmark = _strategy_and_benchmark_returns()
+
+    with pytest.raises(ValueError, match="missing_policy"):
+        benchmark_beta(strategy, benchmark, missing_policy="fill")
+
+
+def test_benchmark_metrics_is_immutable() -> None:
+    strategy, benchmark = _strategy_and_benchmark_returns()
+    result = calculate_benchmark_metrics(strategy, benchmark, 252)
+
+    assert isinstance(result, BenchmarkMetrics)
+    with pytest.raises(FrozenInstanceError):
+        result.beta = 0.0  # type: ignore[misc]
+
+
+def test_calculate_benchmark_metrics_matches_public_functions() -> None:
+    strategy, benchmark = _strategy_and_benchmark_returns()
+    result = calculate_benchmark_metrics(strategy, benchmark, 12, 0.03)
+
+    assert result.beta == pytest.approx(benchmark_beta(strategy, benchmark))
+    assert result.alpha == pytest.approx(
+        benchmark_alpha(strategy, benchmark, 12, 0.03)
+    )
+    assert result.tracking_error == pytest.approx(
+        tracking_error(strategy, benchmark, 12)
+    )
+    assert result.information_ratio == pytest.approx(
+        information_ratio(strategy, benchmark, 12)
+    )
+    assert result.correlation == pytest.approx(
+        correlation_to_benchmark(strategy, benchmark)
+    )
+    assert result.observations == len(strategy)
+    assert result.periods_per_year == 12
+
+
+def test_benchmark_analytics_do_not_mutate_inputs() -> None:
+    strategy, benchmark = _strategy_and_benchmark_returns()
+    strategy.attrs["kind"] = "strategy"
+    benchmark.attrs["kind"] = "benchmark"
+    strategy_before = strategy.copy(deep=True)
+    benchmark_before = benchmark.copy(deep=True)
+
+    calculate_benchmark_metrics(strategy, benchmark, 252)
+
+    pd.testing.assert_series_equal(strategy, strategy_before)
+    pd.testing.assert_series_equal(benchmark, benchmark_before)
+    assert strategy.attrs == strategy_before.attrs
+    assert benchmark.attrs == benchmark_before.attrs
+
+
+def test_explicit_benchmark_prefix_ignores_later_observations() -> None:
+    strategy, benchmark = _strategy_and_benchmark_returns()
+    changed_strategy = strategy.copy(deep=True)
+    changed_benchmark = benchmark.copy(deep=True)
+    changed_strategy.iloc[3:] = [0.80, -0.70]
+    changed_benchmark.iloc[3:] = [-0.60, 0.90]
+
+    original = calculate_benchmark_metrics(strategy.iloc[:3], benchmark.iloc[:3], 252)
+    modified = calculate_benchmark_metrics(
+        changed_strategy.iloc[:3],
+        changed_benchmark.iloc[:3],
+        252,
+    )
+
+    assert original == modified
+
+
+def test_performance_report_composes_existing_metric_summaries() -> None:
+    returns = pd.Series([0.02, -0.01, 0.015, -0.005, 0.01])
+    ledger = _trade_ledger([50.0, -20.0], [2, 3])
+    report = build_performance_report(
+        returns,
+        ledger,
+        periods_per_year=252,
+        accounting=_turnover_accounting(),
+        initial_capital=10_000.0,
+    )
+
+    assert report.core == calculate_core_metrics(returns, 252)
+    assert report.drawdown == calculate_drawdown_metrics(returns, 252)
+    assert report.trades == calculate_trade_metrics(
+        ledger,
+        accounting=_turnover_accounting(),
+        initial_capital=10_000.0,
+    )
+    assert report.report_observations == report.core.observations
+
+
+def test_performance_report_without_benchmark_sets_none() -> None:
+    returns = pd.Series([0.02, -0.01, 0.015])
+
+    report = build_performance_report(
+        returns,
+        _trade_ledger([10.0], [2]),
+        periods_per_year=252,
+    )
+
+    assert report.benchmark is None
+
+
+def test_performance_report_includes_correct_benchmark_metrics() -> None:
+    strategy, benchmark = _strategy_and_benchmark_returns()
+
+    report = build_performance_report(
+        strategy,
+        _trade_ledger([20.0, -5.0], [2, 4]),
+        periods_per_year=12,
+        risk_free_rate=0.03,
+        benchmark_returns=benchmark,
+    )
+
+    assert report.benchmark == calculate_benchmark_metrics(
+        strategy,
+        benchmark,
+        12,
+        0.03,
+    )
+
+
+def test_performance_report_turnover_matches_standalone_turnover() -> None:
+    returns = pd.Series([0.02, -0.01, 0.015])
+    accounting = _turnover_accounting()
+
+    report = build_performance_report(
+        returns,
+        _trade_ledger([10.0], [2]),
+        periods_per_year=252,
+        accounting=accounting,
+        initial_capital=10_000.0,
+    )
+
+    assert report.trades.turnover == pytest.approx(turnover(accounting, 10_000.0))
+
+
+def test_performance_report_turnover_inputs_must_be_supplied_together() -> None:
+    returns = pd.Series([0.02, -0.01, 0.015])
+    ledger = _trade_ledger([10.0], [2])
+
+    with pytest.raises(ValueError, match="supplied together"):
+        build_performance_report(
+            returns,
+            ledger,
+            periods_per_year=252,
+            accounting=_turnover_accounting(),
+        )
+    with pytest.raises(ValueError, match="supplied together"):
+        build_performance_report(
+            returns,
+            ledger,
+            periods_per_year=252,
+            initial_capital=10_000.0,
+        )
+
+
+def test_report_nested_periods_per_year_are_consistent() -> None:
+    strategy, benchmark = _strategy_and_benchmark_returns()
+
+    report = build_performance_report(
+        strategy,
+        _trade_ledger([20.0, -5.0], [2, 4]),
+        periods_per_year=12,
+        benchmark_returns=benchmark,
+    )
+
+    assert report.periods_per_year == 12
+    assert report.core.periods_per_year == 12
+    assert report.benchmark is not None
+    assert report.benchmark.periods_per_year == 12
+
+
+def test_strategy_performance_report_is_immutable() -> None:
+    report = build_performance_report(
+        pd.Series([0.02, -0.01, 0.015]),
+        _trade_ledger([10.0], [2]),
+        periods_per_year=252,
+    )
+
+    assert isinstance(report, StrategyPerformanceReport)
+    with pytest.raises(FrozenInstanceError):
+        report.periods_per_year = 12  # type: ignore[misc]
+
+
+def test_performance_report_does_not_mutate_any_input() -> None:
+    strategy, benchmark = _strategy_and_benchmark_returns()
+    ledger = _trade_ledger([20.0, -5.0], [2, 4])
+    accounting = _turnover_accounting()
+    originals = tuple(
+        value.copy(deep=True) for value in (strategy, benchmark, ledger, accounting)
+    )
+
+    build_performance_report(
+        strategy,
+        ledger,
+        periods_per_year=252,
+        accounting=accounting,
+        initial_capital=10_000.0,
+        benchmark_returns=benchmark,
+    )
+
+    pd.testing.assert_series_equal(strategy, originals[0])
+    pd.testing.assert_series_equal(benchmark, originals[1])
+    pd.testing.assert_frame_equal(ledger, originals[2])
+    pd.testing.assert_frame_equal(accounting, originals[3])
+
+
+def test_performance_reports_are_deterministic() -> None:
+    strategy, benchmark = _strategy_and_benchmark_returns()
+    ledger = _trade_ledger([20.0, -5.0], [2, 4])
+    accounting = _turnover_accounting()
+    kwargs = {
+        "periods_per_year": 252,
+        "accounting": accounting,
+        "initial_capital": 10_000.0,
+        "benchmark_returns": benchmark,
+    }
+
+    first = build_performance_report(strategy, ledger, **kwargs)
+    second = build_performance_report(strategy, ledger, **kwargs)
+
+    assert first == second
+
+
+def test_non_datetime_indices_are_supported_by_rolling_and_reports() -> None:
+    index = pd.Index(["four", "two", "one", "three"], name="row")
+    returns = pd.Series([0.02, -0.01, 0.015, -0.005], index=index)
+
+    rolling = rolling_volatility(returns, 2, 252)
+    report = build_performance_report(
+        returns,
+        _trade_ledger([10.0, -2.0], [2, 3]),
+        periods_per_year=252,
+    )
+
+    assert rolling.index.identical(index)
+    assert report.report_observations == 4
+
+
+def test_explicit_report_prefix_ignores_later_external_observations() -> None:
+    returns = pd.Series([0.02, -0.01, 0.015, -0.005, 0.50, -0.40])
+    benchmark = pd.Series([0.01, -0.005, 0.008, -0.002, -0.30, 0.60])
+    changed_returns = returns.copy(deep=True)
+    changed_benchmark = benchmark.copy(deep=True)
+    changed_returns.iloc[4:] = [-0.90, 1.20]
+    changed_benchmark.iloc[4:] = [0.80, -0.70]
+    ledger_prefix = _trade_ledger([10.0, -2.0], [2, 3])
+
+    original = build_performance_report(
+        returns.iloc[:4],
+        ledger_prefix,
+        periods_per_year=252,
+        accounting=_turnover_accounting().iloc[:2],
+        initial_capital=10_000.0,
+        benchmark_returns=benchmark.iloc[:4],
+    )
+    modified = build_performance_report(
+        changed_returns.iloc[:4],
+        ledger_prefix,
+        periods_per_year=252,
+        accounting=_turnover_accounting().iloc[:2],
+        initial_capital=10_000.0,
+        benchmark_returns=changed_benchmark.iloc[:4],
     )
 
     assert original == modified

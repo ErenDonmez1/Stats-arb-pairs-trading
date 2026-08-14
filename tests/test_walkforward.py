@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from typing import Any
 
 import numpy as np
@@ -10,9 +10,11 @@ import pandas as pd
 import pytest
 
 from pairs_trading.analytics import calculate_core_metrics
+from pairs_trading.data import OBSERVED_PRICE_MASK_ATTR, make_synthetic_universe
 from pairs_trading.screening import PairScreeningResult
 import pairs_trading.walkforward as walkforward_module
 from pairs_trading.walkforward import (
+    WalkForwardAnalyticsStatus,
     WalkForwardFold,
     WalkForwardFoldResult,
     WalkForwardResult,
@@ -128,7 +130,13 @@ def _run_fold(
     return run_walk_forward_fold(prices, fold, **parameters)
 
 
-def _run_analysis(prices: pd.DataFrame, **overrides: Any) -> WalkForwardResult:
+def _run_analysis(
+    prices: pd.DataFrame,
+    *,
+    formation_window: int = 60,
+    trading_window: int = 8,
+    **overrides: Any,
+) -> WalkForwardResult:
     parameters: dict[str, Any] = {
         "screening_min_observations": 50,
         "zscore_lookback": 5,
@@ -148,7 +156,12 @@ def _run_analysis(prices: pd.DataFrame, **overrides: Any) -> WalkForwardResult:
         "force_liquidation": True,
     }
     parameters.update(overrides)
-    return run_walk_forward_analysis(prices, 60, 8, **parameters)
+    return run_walk_forward_analysis(
+        prices,
+        formation_window,
+        trading_window,
+        **parameters,
+    )
 
 
 def test_fold_boundaries_are_generated_by_inclusive_row_position() -> None:
@@ -630,7 +643,7 @@ def test_overlapping_trading_windows_are_rejected_for_aggregation(
     prices = _prices()
     calls = _install_screening(monkeypatch)
 
-    with pytest.raises(ValueError, match="Overlapping trading windows"):
+    with pytest.raises(ValueError, match="overlapping trading windows"):
         _run_analysis(prices, step_size=4)
 
     assert calls == []
@@ -676,14 +689,11 @@ def test_aggregate_metrics_use_concatenated_returns_not_fold_averages(
     assert result.overall_performance_report.core.sharpe_ratio != pytest.approx(
         np.mean(fold_sharpes)
     )
-    assert result.overall_performance_report.trades.trades == sum(
-        fold.trade_count
-        for fold in result.folds
-        if fold.status is WalkForwardStatus.COMPLETED
-    )
+    assert result.aggregate_trade_dollar_metrics_available is False
+    assert not hasattr(result.overall_performance_report, "trades")
 
 
-def test_no_selection_fold_adds_no_fabricated_zero_returns(
+def test_no_selection_fold_is_cash_in_calendar_but_not_conditional(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     prices = _prices(76)
@@ -708,6 +718,23 @@ def test_no_selection_fold_adds_no_fabricated_zero_returns(
     assert result.no_selection_fold_count == 1
     assert result.total_oos_observations == 8
     assert len(result.oos_returns) == 8
+    assert len(result.conditional_oos_returns) == 8
+    assert len(result.calendar_oos_returns) == 16
+    assert result.calendar_oos_returns.iloc[8:].eq(0.0).all()
+    assert result.no_selection_oos_observations == 8
+    assert result.selection_coverage == pytest.approx(0.5)
+    assert result.folds[1].backtest is None
+    assert result.folds[1].trade_count == 0
+    assert result.calendar_performance_report is not None
+    assert result.conditional_performance_report is not None
+    assert result.calendar_performance_report.core == calculate_core_metrics(
+        result.calendar_oos_returns,
+        252,
+    )
+    assert result.conditional_performance_report.core == calculate_core_metrics(
+        result.conditional_oos_returns,
+        252,
+    )
 
 
 def test_walk_forward_status_counts_are_correct(
@@ -736,6 +763,428 @@ def test_walk_forward_status_counts_are_correct(
     assert result.completed_fold_count == 1
     assert result.no_selection_fold_count == 1
     assert result.insufficient_data_fold_count == 0
+
+
+def test_one_row_executed_fold_is_retained_when_analytics_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _prices(61)
+    _install_screening(monkeypatch)
+
+    result = _run_analysis(prices, trading_window=1)
+
+    assert result.completed_fold_count == 1
+    assert result.folds[0].status is WalkForwardStatus.COMPLETED
+    assert result.folds[0].analytics_status is WalkForwardAnalyticsStatus.UNAVAILABLE
+    assert result.folds[0].performance_report is None
+    assert len(result.folds[0].oos_returns) == 1
+    assert len(result.conditional_oos_returns) == 1
+    assert len(result.calendar_oos_returns) == 1
+
+
+def test_performance_report_failure_preserves_execution_returns_and_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _prices(68)
+    _install_screening(monkeypatch)
+
+    def fail_report(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("forced reporting failure")
+
+    monkeypatch.setattr(walkforward_module, "build_performance_report", fail_report)
+
+    result = _run_analysis(prices)
+    fold = result.folds[0]
+
+    assert fold.status is WalkForwardStatus.COMPLETED
+    assert fold.analytics_status is WalkForwardAnalyticsStatus.FAILED
+    assert fold.performance_report is None
+    assert "forced reporting failure" in str(fold.analytics_error)
+    assert fold.backtest is not None
+    assert len(fold.backtest.ledger) == 1
+    assert len(result.conditional_oos_returns) == 8
+    assert result.selected_oos_observations == 8
+
+
+def test_catastrophic_return_is_retained_and_aggregate_analytics_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _prices(68)
+    _install_screening(monkeypatch)
+    original_runner = walkforward_module.run_pair_backtest
+
+    def catastrophic_runner(*args: Any, **kwargs: Any) -> Any:
+        backtest = original_runner(*args, **kwargs)
+        accounting = backtest.accounting.copy(deep=True)
+        accounting.loc[accounting.index[-1], "net_return_after_carry"] = -1.0
+        return replace(backtest, accounting=accounting)
+
+    monkeypatch.setattr(
+        walkforward_module,
+        "run_pair_backtest",
+        catastrophic_runner,
+    )
+
+    result = _run_analysis(prices)
+
+    assert result.folds[0].status is WalkForwardStatus.COMPLETED
+    assert result.folds[0].analytics_status is WalkForwardAnalyticsStatus.UNAVAILABLE
+    assert result.conditional_oos_returns.iat[-1] == -1.0
+    assert result.calendar_oos_returns.iat[-1] == -1.0
+    assert result.conditional_performance_report is None
+    assert result.calendar_performance_report is None
+    assert result.conditional_analytics_status is WalkForwardAnalyticsStatus.UNAVAILABLE
+    assert "-100%" in str(result.conditional_analytics_error)
+
+
+def test_insufficient_data_rows_are_unavailable_not_cash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _prices(68)
+    prices.loc[prices.index[:60], ["BBB", "CCC"]] = np.nan
+    calls = _install_screening(monkeypatch)
+
+    result = _run_analysis(prices)
+
+    assert calls == []
+    assert result.insufficient_data_fold_count == 1
+    assert result.unavailable_oos_observations == 8
+    assert result.no_selection_oos_observations == 0
+    assert result.conditional_oos_returns.empty
+    assert result.calendar_oos_returns.isna().all()
+    assert result.calendar_performance_report is None
+    assert result.calendar_analytics_status is WalkForwardAnalyticsStatus.UNAVAILABLE
+
+
+def test_aggregate_analysis_rejects_gapped_windows_before_screening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _prices(datetime_index=True)
+    calls = _install_screening(monkeypatch)
+
+    with pytest.raises(ValueError, match="calendar gaps"):
+        _run_analysis(prices, step_size=12)
+
+    assert calls == []
+
+
+def test_aggregate_analysis_accepts_exactly_contiguous_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _prices(76)
+    _install_screening(monkeypatch)
+
+    result = _run_analysis(prices, step_size=8)
+
+    assert result.fold_count == 2
+    assert result.calendar_oos_returns.index.equals(prices.index[60:76])
+
+
+def test_equal_capital_reset_return_policy_does_not_claim_dollar_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _prices(76)
+    _install_screening(monkeypatch)
+    folds = generate_walk_forward_folds(prices.index, 60, 8)
+    templates = tuple(_run_fold(prices, fold) for fold in folds)
+    fold_returns = (-0.50, 0.10)
+    fold_dollar_pnl = (-50_000.0, 10_000.0)
+    calls = 0
+
+    def fixed_fold(*args: Any, **kwargs: Any) -> WalkForwardFoldResult:
+        nonlocal calls
+        fold = args[1]
+        template = templates[calls]
+        scheduled_index = prices.index[
+            fold.trading_start_position : fold.trading_end_position + 1
+        ]
+        returns = pd.Series(0.0, index=scheduled_index, name="oos_return")
+        returns.iat[0] = fold_returns[calls]
+        assert template.backtest is not None
+        accounting = template.backtest.accounting.copy(deep=True)
+        accounting["net_pnl_after_carry"] = 0.0
+        accounting.iloc[0, accounting.columns.get_loc("net_pnl_after_carry")] = (
+            fold_dollar_pnl[calls]
+        )
+        backtest = replace(template.backtest, accounting=accounting)
+        ending_capital = 100_000.0 + fold_dollar_pnl[calls]
+        calls += 1
+        return replace(
+            template,
+            fold=fold,
+            backtest=backtest,
+            oos_returns=returns,
+            performance_report=None,
+            analytics_status=WalkForwardAnalyticsStatus.UNAVAILABLE,
+            analytics_error="fixture",
+            ending_capital=ending_capital,
+        )
+
+    monkeypatch.setattr(walkforward_module, "run_walk_forward_fold", fixed_fold)
+
+    result = _run_analysis(prices)
+
+    assert result.capital_policy == "equal_capital_reset"
+    assert result.aggregate_return_policy == "time_weighted_equal_capital_reset"
+    assert result.aggregate_dollar_pnl_available is False
+    assert result.aggregate_trade_dollar_metrics_available is False
+    assert result.calendar_performance_report is not None
+    assert result.calendar_performance_report.core.total_return == pytest.approx(-0.45)
+    raw_fold_pnl = sum(
+        float(fold.backtest.accounting["net_pnl_after_carry"].sum())
+        for fold in result.folds
+        if fold.backtest is not None
+    )
+    assert raw_fold_pnl == pytest.approx(-40_000.0)
+    assert 100_000.0 * result.calendar_performance_report.core.total_return == pytest.approx(
+        -45_000.0
+    )
+
+
+def test_future_missingness_cannot_change_earlier_formation_eligibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _prices(76)
+    prices["LATE"] = np.nan
+    prices.loc[prices.index[60:], "LATE"] = np.linspace(20.0, 22.0, 16)
+    changed = prices.copy(deep=True)
+    changed.loc[changed.index[68:], "LATE"] = np.nan
+    calls = _install_screening(monkeypatch)
+    fold = generate_walk_forward_folds(prices.index, 60, 8)[0]
+
+    original = _run_fold(prices, fold)
+    modified = _run_fold(changed, fold)
+
+    assert original.eligible_symbols == modified.eligible_symbols
+    assert "LATE" not in original.eligible_symbols
+    assert "LATE" not in calls[0].columns
+    pd.testing.assert_frame_equal(calls[0], calls[1])
+
+
+def test_future_observed_mask_values_cannot_invalidate_earlier_fold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _prices(76)
+    mask = pd.DataFrame(True, index=prices.index, columns=prices.columns)
+    prices.attrs[OBSERVED_PRICE_MASK_ATTR] = mask
+    changed = prices.copy(deep=True)
+    changed_mask = mask.copy(deep=True).astype(object)
+    changed_mask.iloc[68:, :] = np.nan
+    changed.attrs[OBSERVED_PRICE_MASK_ATTR] = changed_mask
+    _install_screening(monkeypatch)
+    fold = generate_walk_forward_folds(prices.index, 60, 8)[0]
+
+    original = _run_fold(prices, fold)
+    modified = _run_fold(changed, fold)
+
+    assert original.status is WalkForwardStatus.COMPLETED
+    assert modified.status is WalkForwardStatus.COMPLETED
+    assert original.backtest is not None and modified.backtest is not None
+    pd.testing.assert_frame_equal(original.backtest.accounting, modified.backtest.accounting)
+
+
+def test_later_listed_symbol_becomes_eligible_only_in_later_fold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _prices(140)
+    prices["LATE"] = np.nan
+    prices.loc[prices.index[60:], "LATE"] = np.linspace(30.0, 35.0, 80)
+    calls = _install_screening(monkeypatch)
+    folds = generate_walk_forward_folds(prices.index, 60, 10)
+
+    early = _run_fold(prices, folds[0])
+    later = _run_fold(prices, folds[6])
+
+    assert "LATE" not in early.eligible_symbols
+    assert "LATE" in later.eligible_symbols
+    assert "LATE" not in calls[0].columns
+    assert "LATE" in calls[1].columns
+
+
+def test_per_fold_group_provider_changes_only_subsequent_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _prices(76)
+    seen: list[dict[str, tuple[str, ...]]] = []
+
+    def provider(fold: WalkForwardFold) -> dict[str, list[str]]:
+        return {
+            "sector": ["AAA", "BBB"] if fold.fold_id == 1 else ["AAA", "CCC"]
+        }
+
+    def screen(
+        formation: pd.DataFrame,
+        groups: Any = None,
+        **kwargs: Any,
+    ) -> tuple[PairScreeningResult, ...]:
+        snapshot = {group: tuple(symbols) for group, symbols in groups.items()}
+        seen.append(snapshot)
+        symbols = snapshot["sector"]
+        return (_screening_result(symbol_y=symbols[0], symbol_x=symbols[1]),)
+
+    monkeypatch.setattr(walkforward_module, "screen_pairs", screen)
+
+    result = _run_analysis(prices, groups=provider)
+
+    assert seen == [
+        {"sector": ("AAA", "BBB")},
+        {"sector": ("AAA", "CCC")},
+    ]
+    assert result.folds[0].group_snapshot == seen[0]
+    assert result.folds[1].group_snapshot == seen[1]
+    assert result.universe_provenance == "per_fold_groups_caller_supplied_unvalidated"
+    assert result.point_in_time_universe_validated is False
+
+
+def test_static_generator_groups_are_materialized_once_and_reused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _prices(76)
+    symbols = (symbol for symbol in ["CCC", "AAA", "BBB"])
+    groups: dict[str, Any] = {"sector": symbols}
+    original_value = groups["sector"]
+    seen: list[tuple[str, ...]] = []
+
+    def screen(
+        formation: pd.DataFrame,
+        snapshot: Any = None,
+        **kwargs: Any,
+    ) -> tuple[PairScreeningResult, ...]:
+        seen.append(tuple(snapshot["sector"]))
+        return (_screening_result(),)
+
+    monkeypatch.setattr(walkforward_module, "screen_pairs", screen)
+
+    result = _run_analysis(prices, groups=groups)
+
+    assert seen == [("AAA", "BBB", "CCC"), ("AAA", "BBB", "CCC")]
+    assert groups["sector"] is original_value
+    assert result.folds[0].group_snapshot == result.folds[1].group_snapshot
+    assert result.universe_provenance == "static_groups_caller_supplied_unvalidated"
+    assert result.point_in_time_universe_validated is False
+    assert any("Static groups" in warning for warning in result.provenance_warnings)
+
+
+@pytest.mark.parametrize(
+    "members",
+    [
+        ["CCC", "AAA", "BBB"],
+        ("CCC", "AAA", "BBB"),
+        {"CCC", "AAA", "BBB"},
+    ],
+)
+def test_group_iterable_order_does_not_change_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    members: Any,
+) -> None:
+    prices = _prices(68)
+    _install_screening(monkeypatch)
+
+    result = _run_analysis(prices, groups={"sector": members})
+
+    assert result.folds[0].group_snapshot == {
+        "sector": ("AAA", "BBB", "CCC")
+    }
+
+
+def test_result_frames_do_not_alias_source_or_intermediate_backtest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _prices(68)
+    _install_screening(monkeypatch)
+    original_runner = walkforward_module.run_pair_backtest
+    captured: list[Any] = []
+
+    def capture_runner(*args: Any, **kwargs: Any) -> Any:
+        backtest = original_runner(*args, **kwargs)
+        captured.append(backtest)
+        return backtest
+
+    monkeypatch.setattr(walkforward_module, "run_pair_backtest", capture_runner)
+    result = _run_analysis(prices)
+    conditional_before = result.conditional_oos_returns.copy(deep=True)
+    accounting_before = result.folds[0].backtest.accounting.copy(deep=True)  # type: ignore[union-attr]
+
+    prices.iloc[:, :] = 1.0
+    captured[0].accounting["net_return_after_carry"] = 999.0
+
+    pd.testing.assert_series_equal(result.conditional_oos_returns, conditional_before)
+    assert result.folds[0].backtest is not None
+    pd.testing.assert_frame_equal(result.folds[0].backtest.accounting, accounting_before)
+
+
+def test_fold_results_have_independent_mutable_pandas_copies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _prices(76)
+    _install_screening(monkeypatch)
+    result = _run_analysis(prices)
+    assert result.folds[0].backtest is not None
+    assert result.folds[1].backtest is not None
+    second_before = result.folds[1].backtest.accounting.copy(deep=True)
+
+    result.folds[0].backtest.accounting["net_return_after_carry"] = -777.0
+
+    pd.testing.assert_frame_equal(result.folds[1].backtest.accounting, second_before)
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected_discarded"),
+    [(76, 0), (79, 3)],
+)
+def test_terminal_horizon_metadata_reports_discarded_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: int,
+    expected_discarded: int,
+) -> None:
+    prices = _prices(rows)
+    _install_screening(monkeypatch)
+
+    result = _run_analysis(prices)
+
+    assert result.fold_count == 2
+    assert result.evaluated_start_position == 60
+    assert result.evaluated_end_position == 75
+    assert result.evaluated_start_label == prices.index[60]
+    assert result.evaluated_end_label == prices.index[75]
+    assert result.discarded_terminal_rows == expected_discarded
+
+
+def test_real_screening_is_formation_only_under_future_mutation() -> None:
+    prices, groups = make_synthetic_universe(n_days=400, seed=123)
+    fold = generate_walk_forward_folds(prices.index, 320, 40)[0]
+    changed = prices.copy(deep=True)
+    changed.iloc[fold.trading_start_position :, :] *= np.linspace(
+        1.1,
+        1.8,
+        len(changed) - fold.trading_start_position,
+    )[:, None]
+    parameters = {
+        "groups": groups,
+        "screening_min_observations": 100,
+        "fdr_threshold": 0.05,
+        "max_half_life": 100.0,
+        "hurst_threshold": 0.7,
+        "zscore_lookback": 20,
+        "entry_z": 1.0,
+        "exit_z": 0.25,
+        "stop_z": 50.0,
+        "target_gross_notional": 10_000.0,
+        "initial_capital": 100_000.0,
+    }
+
+    original = run_walk_forward_fold(prices, fold, **parameters)
+    modified = run_walk_forward_fold(changed, fold, **parameters)
+
+    assert original.status is WalkForwardStatus.COMPLETED
+    assert modified.status is WalkForwardStatus.COMPLETED
+    assert original.selected_symbol_y == modified.selected_symbol_y
+    assert original.selected_symbol_x == modified.selected_symbol_x
+    assert original.screening_rank == modified.screening_rank
+    assert original.corrected_pvalue == modified.corrected_pvalue
+    assert original.frozen_alpha == modified.frozen_alpha
+    assert original.frozen_beta == modified.frozen_beta
+    assert original.screening_results == modified.screening_results
 
 
 def test_repeated_walk_forward_runs_are_deterministic(

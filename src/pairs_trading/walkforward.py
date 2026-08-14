@@ -3,22 +3,32 @@
 Formation data is used for pair selection and frozen static parameters only.
 Signals, execution, accounting, and reported returns are restricted to the
 subsequent trading interval.  Milestone 8A intentionally resets every fold to
-flat with the same explicit capital base and rejects overlapping OOS windows
-when constructing an aggregate report.
+flat with the same explicit capital base.  Aggregate analysis requires
+contiguous, non-overlapping OOS windows and reports calendar and conditional
+percentage-return views separately.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from enum import Enum
 from numbers import Integral, Real
+from types import MappingProxyType
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from .analytics import StrategyPerformanceReport, build_performance_report
+from .analytics import (
+    CorePerformanceMetrics,
+    DrawdownMetrics,
+    StrategyPerformanceReport,
+    build_performance_report,
+    calculate_core_metrics,
+    calculate_drawdown_metrics,
+)
 from .backtest import BacktestResult, run_pair_backtest
 from .data import OBSERVED_PRICE_MASK_ATTR
 from .screening import PairScreeningResult, screen_pairs
@@ -28,8 +38,10 @@ from .stats import ADF_MIN_OBSERVATIONS
 
 __all__ = [
     "WalkForwardStatus",
+    "WalkForwardAnalyticsStatus",
     "WalkForwardFold",
     "WalkForwardFoldResult",
+    "WalkForwardReturnReport",
     "WalkForwardResult",
     "generate_walk_forward_folds",
     "run_walk_forward_fold",
@@ -43,6 +55,15 @@ class WalkForwardStatus(str, Enum):
     COMPLETED = "COMPLETED"
     NO_SELECTION = "NO_SELECTION"
     INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+
+
+class WalkForwardAnalyticsStatus(str, Enum):
+    """Availability of analytics calculated after an execution outcome."""
+
+    AVAILABLE = "AVAILABLE"
+    UNAVAILABLE = "UNAVAILABLE"
+    FAILED = "FAILED"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
 
 
 @dataclass(frozen=True)
@@ -62,7 +83,13 @@ class WalkForwardFold:
 
 @dataclass(frozen=True)
 class WalkForwardFoldResult:
-    """Immutable wrapper around one explicit formation/OOS evaluation."""
+    """Frozen wrapper around one formation/OOS evaluation.
+
+    Successful execution and optional analytics have separate statuses.  The
+    pandas objects held here are independent deep copies, but remain mutable
+    objects owned by the caller; freezing prevents field replacement rather
+    than making pandas internals immutable.
+    """
 
     fold: WalkForwardFold
     status: WalkForwardStatus
@@ -78,34 +105,122 @@ class WalkForwardFoldResult:
     frozen_beta: float | None
     backtest: BacktestResult | None
     performance_report: StrategyPerformanceReport | None
+    analytics_status: WalkForwardAnalyticsStatus
+    analytics_error: str | None
+    oos_returns: pd.Series
     formation_observations: int
     trading_observations: int
     trade_count: int
     starting_capital: float
     ending_capital: float
+    eligible_symbols: tuple[str, ...]
+    group_snapshot: Mapping[str, tuple[str, ...]] | None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "screening_results", tuple(self.screening_results))
+        object.__setattr__(self, "eligible_symbols", tuple(self.eligible_symbols))
+        if self.group_snapshot is not None:
+            copied_groups = {
+                str(group): tuple(symbols)
+                for group, symbols in self.group_snapshot.items()
+            }
+            object.__setattr__(
+                self,
+                "group_snapshot",
+                MappingProxyType(copied_groups),
+            )
+        copied_returns = self.oos_returns.copy(deep=True)
+        copied_returns.name = "oos_return"
+        object.__setattr__(self, "oos_returns", copied_returns)
+        if self.backtest is not None:
+            object.__setattr__(self, "backtest", _copy_backtest(self.backtest))
+
+    @property
+    def execution_status(self) -> WalkForwardStatus:
+        """Explicit compatibility name for the fold execution status."""
+        return self.status
+
+
+@dataclass(frozen=True)
+class WalkForwardReturnReport:
+    """Return-only analytics without cross-fold dollar trade aggregation."""
+
+    core: CorePerformanceMetrics
+    drawdown: DrawdownMetrics
+    report_observations: int
+    periods_per_year: int
 
 
 @dataclass(frozen=True)
 class WalkForwardResult:
-    """Immutable fold collection and non-overlapping aggregate OOS report."""
+    """Frozen walk-forward result with explicit calendar and conditional views.
+
+    Stored pandas objects are independently owned deep copies.  They remain
+    caller-mutable; the dataclass itself only prevents field replacement.
+    """
 
     folds: tuple[WalkForwardFoldResult, ...]
     fold_count: int
     completed_fold_count: int
     no_selection_fold_count: int
     insufficient_data_fold_count: int
-    total_oos_observations: int
-    oos_returns: pd.Series
-    overall_performance_report: StrategyPerformanceReport | None
+    scheduled_oos_observations: int
+    scheduled_eligible_oos_observations: int
+    selected_oos_observations: int
+    no_selection_oos_observations: int
+    unavailable_oos_observations: int
+    selection_coverage: float
+    conditional_oos_returns: pd.Series
+    calendar_oos_returns: pd.Series
+    conditional_performance_report: WalkForwardReturnReport | None
+    calendar_performance_report: WalkForwardReturnReport | None
+    conditional_analytics_status: WalkForwardAnalyticsStatus
+    calendar_analytics_status: WalkForwardAnalyticsStatus
+    conditional_analytics_error: str | None
+    calendar_analytics_error: str | None
+    capital_policy: str
+    aggregate_return_policy: str
+    inactive_capital_policy: str
+    selection_coverage_denominator: str
+    aggregate_dollar_pnl_available: bool
+    aggregate_trade_dollar_metrics_available: bool
+    universe_provenance: str
+    cleaning_provenance: str
+    point_in_time_universe_validated: bool
+    provenance_warnings: tuple[str, ...]
+    evaluated_start_position: int
+    evaluated_end_position: int
+    evaluated_start_label: Any
+    evaluated_end_label: Any
+    discarded_terminal_rows: int
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "folds", tuple(self.folds))
-        copied_returns = self.oos_returns.copy(deep=True)
-        copied_returns.name = "oos_return"
-        object.__setattr__(self, "oos_returns", copied_returns)
+        owned_folds = tuple(replace(fold) for fold in self.folds)
+        object.__setattr__(self, "folds", owned_folds)
+        conditional = self.conditional_oos_returns.copy(deep=True)
+        conditional.name = "conditional_oos_return"
+        calendar = self.calendar_oos_returns.copy(deep=True)
+        calendar.name = "calendar_oos_return"
+        object.__setattr__(self, "conditional_oos_returns", conditional)
+        object.__setattr__(self, "calendar_oos_returns", calendar)
+        object.__setattr__(self, "provenance_warnings", tuple(self.provenance_warnings))
+
+    @property
+    def total_oos_observations(self) -> int:
+        """Compatibility alias for selected/executed OOS observations."""
+        return self.selected_oos_observations
+
+    @property
+    def oos_returns(self) -> pd.Series:
+        """Compatibility copy of conditional returns under the former name."""
+        result = self.conditional_oos_returns.copy(deep=True)
+        result.name = "oos_return"
+        return result
+
+    @property
+    def overall_performance_report(self) -> WalkForwardReturnReport | None:
+        """Compatibility alias for the calendar-time return report."""
+        return self.calendar_performance_report
 
 
 def _positive_integer(value: Any, name: str, *, minimum: int = 1) -> int:
@@ -168,7 +283,171 @@ def _validated_prices(prices: pd.DataFrame) -> pd.DataFrame:
     if any(not isinstance(symbol, str) or not symbol.strip() for symbol in prices):
         raise ValueError("price column names must be non-empty strings.")
     _validated_index(prices.index)
-    return prices.copy(deep=True)
+    result = prices.copy(deep=True)
+    result.attrs = deepcopy(prices.attrs)
+    return result
+
+
+def _copy_backtest(backtest: BacktestResult) -> BacktestResult:
+    """Return a BacktestResult whose pandas frames share no mutable storage."""
+    return replace(
+        backtest,
+        signals=backtest.signals.copy(deep=True),
+        positions=backtest.positions.copy(deep=True),
+        accounting=backtest.accounting.copy(deep=True),
+        ledger=backtest.ledger.copy(deep=True),
+    )
+
+
+def _normalize_groups(
+    groups: Mapping[str, Iterable[str]] | None,
+    available_symbols: Iterable[str],
+) -> Mapping[str, tuple[str, ...]] | None:
+    """Materialize a group mapping once into deterministic immutable tuples."""
+    if groups is None:
+        return None
+    if not isinstance(groups, Mapping):
+        raise TypeError("groups must be a mapping or a per-fold callable.")
+
+    available = set(available_symbols)
+    invalid_groups = [
+        group for group in groups if not isinstance(group, str) or not group.strip()
+    ]
+    if invalid_groups:
+        raise ValueError("group names must be non-empty strings.")
+
+    normalized: dict[str, tuple[str, ...]] = {}
+    assigned: dict[str, str] = {}
+    for group in sorted(groups):
+        configured = groups[group]
+        if isinstance(configured, (str, bytes)) or not isinstance(
+            configured, Iterable
+        ):
+            raise ValueError(f"Group {group!r} symbols must be an iterable.")
+        materialized = tuple(configured)
+        if any(
+            not isinstance(symbol, str) or not symbol.strip()
+            for symbol in materialized
+        ):
+            raise ValueError(f"Group {group!r} contains an invalid symbol.")
+        if len(materialized) != len(set(materialized)):
+            raise ValueError(f"Group {group!r} contains duplicate symbols.")
+        unknown = sorted(set(materialized).difference(available))
+        if unknown:
+            raise ValueError(f"Group {group!r} contains unknown symbols: {unknown}.")
+        for symbol in materialized:
+            if symbol in assigned:
+                raise ValueError(
+                    f"Symbol {symbol!r} belongs to both {assigned[symbol]!r} "
+                    f"and {group!r}."
+                )
+            assigned[symbol] = group
+        normalized[group] = tuple(sorted(materialized))
+    return MappingProxyType(normalized)
+
+
+def _formation_eligible_symbols(
+    formation: pd.DataFrame,
+    minimum_observations: int,
+) -> tuple[str, ...]:
+    """Choose symbols using usable formation observations and no future rows."""
+    eligible: list[str] = []
+    for symbol in formation.columns:
+        series = formation[symbol]
+        usable = 0
+        malformed = False
+        for value in series.loc[series.notna()]:
+            if (
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, Real)
+                or not np.isfinite(float(value))
+                or float(value) <= 0.0
+            ):
+                malformed = True
+                break
+            usable += 1
+        if not malformed and usable >= minimum_observations:
+            eligible.append(symbol)
+    return tuple(eligible)
+
+
+def _formation_group_snapshot(
+    groups: Mapping[str, tuple[str, ...]] | None,
+    eligible_symbols: tuple[str, ...],
+) -> Mapping[str, tuple[str, ...]] | None:
+    """Restrict a validated group snapshot to formation-eligible symbols."""
+    if groups is None:
+        return None
+    eligible = set(eligible_symbols)
+    return MappingProxyType(
+        {
+            group: tuple(symbol for symbol in symbols if symbol in eligible)
+            for group, symbols in groups.items()
+        }
+    )
+
+
+def _has_candidate_pair(
+    eligible_symbols: tuple[str, ...],
+    groups: Mapping[str, tuple[str, ...]] | None,
+) -> bool:
+    if groups is None:
+        return len(eligible_symbols) >= 2
+    return any(len(symbols) >= 2 for symbols in groups.values())
+
+
+def _return_analytics(
+    returns: pd.Series,
+    *,
+    periods_per_year: int,
+    risk_free_rate: float,
+) -> tuple[
+    WalkForwardReturnReport | None,
+    WalkForwardAnalyticsStatus,
+    str | None,
+]:
+    """Build aggregate return-only analytics without changing membership."""
+    valid = returns.dropna()
+    if len(valid) < 2:
+        return (
+            None,
+            WalkForwardAnalyticsStatus.UNAVAILABLE,
+            "At least two available return observations are required.",
+        )
+    if bool(valid.le(-1.0).any()):
+        return (
+            None,
+            WalkForwardAnalyticsStatus.UNAVAILABLE,
+            "Returns at or below -100% cannot be geometrically compounded.",
+        )
+    try:
+        core = calculate_core_metrics(
+            returns,
+            periods_per_year,
+            risk_free_rate,
+            missing_policy="drop",
+        )
+        drawdown = calculate_drawdown_metrics(
+            returns,
+            periods_per_year,
+            missing_policy="drop",
+        )
+    except Exception as exc:  # Reporting must never remove executed observations.
+        return (
+            None,
+            WalkForwardAnalyticsStatus.FAILED,
+            f"{type(exc).__name__}: {exc}",
+        )
+    return (
+        WalkForwardReturnReport(
+            core=core,
+            drawdown=drawdown,
+            report_observations=core.observations,
+            periods_per_year=periods_per_year,
+        ),
+        WalkForwardAnalyticsStatus.AVAILABLE,
+        None,
+    )
 
 
 def generate_walk_forward_folds(
@@ -185,8 +464,8 @@ def generate_walk_forward_folds(
     Positions are zero-based and inclusive.  In fixed mode both windows advance
     by ``step_size``.  In expanding mode the formation start remains zero while
     its end advances.  ``step_size`` defaults to ``trading_window``; smaller
-    values explicitly create overlapping trading windows, which fold generation
-    permits but aggregate analysis rejects.
+    values explicitly create overlapping trading windows and larger values
+    create gaps.  Fold generation permits both; aggregate analysis rejects both.
     """
     validated_index = _validated_index(index)
     formation = _positive_integer(formation_window, "formation_window")
@@ -385,6 +664,7 @@ def _validate_run_parameters(
 def _screening_frame(formation: pd.DataFrame) -> pd.DataFrame:
     """Give screening a monotonic copy without reordering non-time labels."""
     result = formation.copy(deep=True)
+    result.attrs = {}
     if (
         not isinstance(result.index, pd.DatetimeIndex)
         and not result.index.is_monotonic_increasing
@@ -448,17 +728,21 @@ def _trading_observed_masks(
             "price observed-mask metadata is missing selected symbols: "
             f"{sorted(missing_columns)}."
         )
-    relevant = mask.loc[:, [symbol_y, symbol_x]]
-    if relevant.isna().any().any():
-        raise ValueError(
-            "price observed-mask metadata must not contain missing values."
-        )
-    valid = relevant.map(lambda value: isinstance(value, (bool, np.bool_)))
-    if not bool(valid.all().all()):
-        raise TypeError("price observed-mask metadata must contain Boolean values.")
     start = fold.trading_start_position
     stop = fold.trading_end_position + 1
-    sliced = relevant.iloc[start:stop].astype(bool)
+    sliced = mask.loc[:, [symbol_y, symbol_x]].iloc[start:stop].copy(deep=True)
+    if sliced.isna().any().any():
+        raise ValueError(
+            "price observed-mask metadata must not contain missing values "
+            "inside the fold trading interval."
+        )
+    valid = sliced.map(lambda value: isinstance(value, (bool, np.bool_)))
+    if not bool(valid.all().all()):
+        raise TypeError(
+            "price observed-mask metadata must contain Boolean values inside "
+            "the fold trading interval."
+        )
+    sliced = sliced.astype(bool)
     return sliced[symbol_y].copy(deep=True), sliced[symbol_x].copy(deep=True)
 
 
@@ -472,16 +756,9 @@ def _empty_fold_result(
     formation_observations: int,
     trading_observations: int,
     starting_capital: float,
-    backtest: BacktestResult | None = None,
+    eligible_symbols: tuple[str, ...] = (),
+    group_snapshot: Mapping[str, tuple[str, ...]] | None = None,
 ) -> WalkForwardFoldResult:
-    ending_capital = starting_capital
-    trade_count = 0
-    if backtest is not None:
-        trade_count = len(backtest.ledger)
-        if len(backtest.accounting):
-            ending_capital = float(
-                backtest.accounting["net_equity_after_carry"].iat[-1]
-            )
     return WalkForwardFoldResult(
         fold=fold,
         status=status,
@@ -495,13 +772,18 @@ def _empty_fold_result(
         selected_screening_result=selected,
         frozen_alpha=None if selected is None else selected.alpha,
         frozen_beta=None if selected is None else selected.beta,
-        backtest=backtest,
+        backtest=None,
         performance_report=None,
+        analytics_status=WalkForwardAnalyticsStatus.NOT_APPLICABLE,
+        analytics_error=None,
+        oos_returns=pd.Series(dtype=float, name="oos_return"),
         formation_observations=formation_observations,
         trading_observations=trading_observations,
-        trade_count=trade_count,
+        trade_count=0,
         starting_capital=starting_capital,
-        ending_capital=ending_capital,
+        ending_capital=starting_capital,
+        eligible_symbols=eligible_symbols,
+        group_snapshot=group_snapshot,
     )
 
 
@@ -572,6 +854,20 @@ def run_walk_forward_fold(
     trading = validated_prices.iloc[
         fold.trading_start_position : fold.trading_end_position + 1
     ].copy(deep=True)
+    # The full-frame observed mask is sliced explicitly below.  Keeping that
+    # DataFrame-valued attr on computational slices can make pandas concat try
+    # to compare masks with an ambiguous elementwise truth value.
+    formation.attrs = {}
+    trading.attrs = {}
+    normalized_groups = _normalize_groups(groups, validated_prices.columns)
+    eligible_symbols = _formation_eligible_symbols(
+        formation,
+        parameters["screening_min_observations"],
+    )
+    group_snapshot = _formation_group_snapshot(
+        normalized_groups,
+        eligible_symbols,
+    )
     if len(formation) < parameters["screening_min_observations"]:
         return _empty_fold_result(
             fold,
@@ -582,12 +878,31 @@ def run_walk_forward_fold(
             formation_observations=len(formation),
             trading_observations=len(trading),
             starting_capital=parameters["initial_capital"],
+            eligible_symbols=eligible_symbols,
+            group_snapshot=group_snapshot,
+        )
+
+    if not _has_candidate_pair(eligible_symbols, group_snapshot):
+        return _empty_fold_result(
+            fold,
+            status=WalkForwardStatus.INSUFFICIENT_DATA,
+            message=(
+                "Formation-local usable history produced fewer than two "
+                "candidate symbols within an allowed group."
+            ),
+            screening_results=(),
+            selected=None,
+            formation_observations=len(formation),
+            trading_observations=len(trading),
+            starting_capital=parameters["initial_capital"],
+            eligible_symbols=eligible_symbols,
+            group_snapshot=group_snapshot,
         )
 
     screening_results = tuple(
         screen_pairs(
-            _screening_frame(formation),
-            groups,
+            _screening_frame(formation.loc[:, list(eligible_symbols)]),
+            group_snapshot,
             min_observations=parameters["screening_min_observations"],
             fdr_threshold=parameters["fdr_threshold"],
             max_half_life=parameters["max_half_life"],
@@ -612,6 +927,8 @@ def run_walk_forward_fold(
             formation_observations=len(formation),
             trading_observations=len(trading),
             starting_capital=parameters["initial_capital"],
+            eligible_symbols=eligible_symbols,
+            group_snapshot=group_snapshot,
         )
 
     if (
@@ -630,10 +947,25 @@ def run_walk_forward_fold(
             formation_observations=len(formation),
             trading_observations=len(trading),
             starting_capital=parameters["initial_capital"],
+            eligible_symbols=eligible_symbols,
+            group_snapshot=group_snapshot,
         )
 
     symbol_y = selected.symbol_y
     symbol_x = selected.symbol_x
+    if symbol_y not in eligible_symbols or symbol_x not in eligible_symbols:
+        return _empty_fold_result(
+            fold,
+            status=WalkForwardStatus.INSUFFICIENT_DATA,
+            message="Selected pair is not formation-eligible in this fold.",
+            screening_results=screening_results,
+            selected=selected,
+            formation_observations=len(formation),
+            trading_observations=len(trading),
+            starting_capital=parameters["initial_capital"],
+            eligible_symbols=eligible_symbols,
+            group_snapshot=group_snapshot,
+        )
     history = pd.concat(
         [formation.loc[:, [symbol_y, symbol_x]], trading.loc[:, [symbol_y, symbol_x]]],
         axis=0,
@@ -658,7 +990,7 @@ def run_walk_forward_fold(
         trading_zscore = complete_zscore.iloc[-len(trading) :].copy(deep=True)
         trading_y, trading_x = _validated_pair_prices(trading, symbol_y, symbol_x)
         observed_y, observed_x = _trading_observed_masks(
-            prices,
+            validated_prices,
             fold,
             symbol_y,
             symbol_x,
@@ -673,6 +1005,8 @@ def run_walk_forward_fold(
             formation_observations=len(formation),
             trading_observations=len(trading),
             starting_capital=parameters["initial_capital"],
+            eligible_symbols=eligible_symbols,
+            group_snapshot=group_snapshot,
         )
 
     backtest = run_pair_backtest(
@@ -702,27 +1036,31 @@ def run_walk_forward_fold(
         observed_x=observed_x,
     )
     oos_returns = backtest.accounting["net_return_after_carry"].copy(deep=True)
-    try:
-        report = build_performance_report(
-            oos_returns,
-            backtest.ledger,
-            periods_per_year=parameters["periods_per_year"],
-            risk_free_rate=parameters["risk_free_rate"],
-            accounting=backtest.accounting,
-            initial_capital=parameters["initial_capital"],
+    report: StrategyPerformanceReport | None = None
+    analytics_status = WalkForwardAnalyticsStatus.UNAVAILABLE
+    analytics_error: str | None = None
+    valid_oos_returns = oos_returns.dropna()
+    if len(valid_oos_returns) < 2:
+        analytics_error = "At least two available OOS returns are required."
+    elif bool(valid_oos_returns.le(-1.0).any()):
+        analytics_error = (
+            "OOS returns at or below -100% cannot be geometrically compounded."
         )
-    except ValueError as exc:
-        return _empty_fold_result(
-            fold,
-            status=WalkForwardStatus.INSUFFICIENT_DATA,
-            message=f"OOS analytics could not be calculated: {exc}",
-            screening_results=screening_results,
-            selected=selected,
-            formation_observations=len(formation),
-            trading_observations=len(trading),
-            starting_capital=parameters["initial_capital"],
-            backtest=backtest,
-        )
+    else:
+        try:
+            report = build_performance_report(
+                oos_returns,
+                backtest.ledger,
+                periods_per_year=parameters["periods_per_year"],
+                risk_free_rate=parameters["risk_free_rate"],
+                accounting=backtest.accounting,
+                initial_capital=parameters["initial_capital"],
+            )
+        except Exception as exc:  # Execution membership survives reporting errors.
+            analytics_status = WalkForwardAnalyticsStatus.FAILED
+            analytics_error = f"{type(exc).__name__}: {exc}"
+        else:
+            analytics_status = WalkForwardAnalyticsStatus.AVAILABLE
 
     ending_capital = float(backtest.accounting["net_equity_after_carry"].iat[-1])
     return WalkForwardFoldResult(
@@ -740,55 +1078,37 @@ def run_walk_forward_fold(
         frozen_beta=float(selected.beta),
         backtest=backtest,
         performance_report=report,
+        analytics_status=analytics_status,
+        analytics_error=analytics_error,
+        oos_returns=oos_returns,
         formation_observations=len(formation),
         trading_observations=len(trading),
         trade_count=len(backtest.ledger),
         starting_capital=parameters["initial_capital"],
         ending_capital=ending_capital,
+        eligible_symbols=eligible_symbols,
+        group_snapshot=group_snapshot,
     )
 
 
-def _require_non_overlapping_trading_windows(
-    folds: tuple[WalkForwardFold, ...],
-) -> None:
-    for previous, current in zip(folds, folds[1:]):
-        if current.trading_start_position <= previous.trading_end_position:
-            raise ValueError(
-                "Overlapping trading windows are not supported for aggregate "
-                "OOS reporting."
-            )
-
-
-def _namespace_completed_ledgers(
-    results: tuple[WalkForwardFoldResult, ...],
-) -> pd.DataFrame:
-    frames: list[pd.DataFrame] = []
-    template: pd.DataFrame | None = None
-    for result in results:
-        if result.status is not WalkForwardStatus.COMPLETED or result.backtest is None:
-            continue
-        ledger = result.backtest.ledger.copy(deep=True)
-        if template is None:
-            template = ledger.iloc[:0].copy(deep=True)
-        if ledger.empty:
-            continue
-        ledger["trade_id"] = [
-            f"fold-{result.fold.fold_id}:trade-{trade_id}"
-            for trade_id in ledger["trade_id"]
-        ]
-        ledger.index = pd.MultiIndex.from_arrays(
-            [
-                np.full(len(ledger), result.fold.fold_id, dtype=int),
-                np.arange(len(ledger), dtype=int),
-            ],
-            names=["fold_id", "fold_trade_row"],
+def _validated_aggregate_step(
+    trading_window: Any,
+    step_size: Any,
+) -> int:
+    """Require contiguous non-overlapping windows for calendar aggregation."""
+    trading = _positive_integer(trading_window, "trading_window")
+    step = trading if step_size is None else _positive_integer(step_size, "step_size")
+    if step < trading:
+        raise ValueError(
+            "Aggregate walk-forward analysis rejects overlapping trading "
+            "windows: step_size must equal trading_window."
         )
-        frames.append(ledger)
-    if frames:
-        return pd.concat(frames, axis=0, copy=True)
-    if template is not None:
-        return template
-    raise RuntimeError("Cannot build a ledger without a completed fold.")
+    if step > trading:
+        raise ValueError(
+            "Aggregate walk-forward analysis rejects calendar gaps: "
+            "step_size must equal trading_window."
+        )
+    return step
 
 
 def run_walk_forward_analysis(
@@ -799,7 +1119,11 @@ def run_walk_forward_analysis(
     step_size: int | None = None,
     expanding: bool = False,
     minimum_observations: int | None = None,
-    groups: Mapping[str, Iterable[str]] | None = None,
+    groups: (
+        Mapping[str, Iterable[str]]
+        | Callable[[WalkForwardFold], Mapping[str, Iterable[str]] | None]
+        | None
+    ) = None,
     screening_min_observations: int = 100,
     fdr_threshold: float = 0.05,
     max_half_life: float = 60.0,
@@ -823,34 +1147,63 @@ def run_walk_forward_analysis(
     risk_free_rate: float = 0.0,
     force_liquidation: bool = True,
 ) -> WalkForwardResult:
-    """Run independent folds and aggregate non-overlapping OOS return rows.
+    """Run independent equal-capital folds over a contiguous OOS horizon.
 
-    Completed fold returns are concatenated in fold order; Sharpe and drawdown
-    are then recomputed from that combined Series rather than averaged across
-    folds.  NO_SELECTION and INSUFFICIENT_DATA folds remain visible but add no
-    fabricated zero returns.  Fold trade IDs are namespaced for combined trade
-    statistics; aggregate turnover is intentionally left undefined because
-    each fold resets its capital base.
+    Conditional returns contain executed folds only.  Calendar returns retain
+    every scheduled row: NO_SELECTION rows earn an explicit cash return of
+    zero, while pre-execution INSUFFICIENT_DATA rows remain unavailable (NaN).
+    Aggregate reports contain percentage-return analytics only because each
+    fold resets capital; per-fold ledgers retain their own dollar attribution.
+
+    A static group mapping is caller-supplied and not point-in-time verified.
+    A callable receives each fold and may supply a formation-date snapshot, but
+    its upstream provenance is still the caller's responsibility.
     """
     validated_prices = _validated_prices(prices)
     risk_free = _finite_real(risk_free_rate, "risk_free_rate")
     if risk_free <= -1.0:
         raise ValueError("risk_free_rate must be greater than -1.")
+    periods = _positive_integer(periods_per_year, "periods_per_year")
+    aggregate_step = _validated_aggregate_step(trading_window, step_size)
     folds = generate_walk_forward_folds(
         validated_prices.index,
         formation_window,
         trading_window,
-        step_size=step_size,
+        step_size=aggregate_step,
         expanding=expanding,
         minimum_observations=minimum_observations,
     )
-    _require_non_overlapping_trading_windows(folds)
 
-    results = tuple(
-        run_walk_forward_fold(
+    group_provider: (
+        Callable[[WalkForwardFold], Mapping[str, Iterable[str]] | None] | None
+    ) = None
+    normalized_static_groups: Mapping[str, tuple[str, ...]] | None = None
+    if groups is None:
+        universe_provenance = "price_columns_caller_supplied_unvalidated"
+    elif isinstance(groups, Mapping):
+        normalized_static_groups = _normalize_groups(
+            groups,
+            validated_prices.columns,
+        )
+        universe_provenance = "static_groups_caller_supplied_unvalidated"
+    elif callable(groups):
+        group_provider = groups
+        universe_provenance = "per_fold_groups_caller_supplied_unvalidated"
+    else:
+        raise TypeError("groups must be a mapping, per-fold callable, or None.")
+
+    result_items: list[WalkForwardFoldResult] = []
+    for fold in folds:
+        fold_groups = normalized_static_groups
+        if group_provider is not None:
+            fold_groups = _normalize_groups(
+                group_provider(fold),
+                validated_prices.columns,
+            )
+        result_items.append(run_walk_forward_fold(
             validated_prices,
             fold,
-            groups=groups,
+            groups=fold_groups,
             screening_min_observations=screening_min_observations,
             fdr_threshold=fdr_threshold,
             max_half_life=max_half_life,
@@ -873,32 +1226,109 @@ def run_walk_forward_analysis(
             periods_per_year=periods_per_year,
             risk_free_rate=risk_free,
             force_liquidation=force_liquidation,
-        )
-        for fold in folds
-    )
+        ))
+    results = tuple(result_items)
     completed = tuple(
         result for result in results if result.status is WalkForwardStatus.COMPLETED
     )
-    return_parts = [
-        result.backtest.accounting["net_return_after_carry"].copy(deep=True)
-        for result in completed
-        if result.backtest is not None
-    ]
-    if return_parts:
-        oos_returns = pd.concat(return_parts, axis=0, copy=True).rename("oos_return")
-        if not oos_returns.index.is_unique:
-            raise RuntimeError("Non-overlapping folds produced duplicate OOS labels.")
-    else:
-        oos_returns = pd.Series(dtype=float, name="oos_return")
+    conditional_parts: list[pd.Series] = []
+    calendar_parts: list[pd.Series] = []
+    selected_observations = 0
+    no_selection_observations = 0
+    unavailable_observations = 0
+    for result in results:
+        start = result.fold.trading_start_position
+        stop = result.fold.trading_end_position + 1
+        scheduled_index = validated_prices.index[start:stop]
+        if result.status is WalkForwardStatus.COMPLETED:
+            if not result.oos_returns.index.equals(scheduled_index):
+                raise RuntimeError(
+                    "Executed fold OOS returns do not match its trading index."
+                )
+            owned = result.oos_returns.copy(deep=True)
+            conditional_parts.append(owned)
+            calendar_parts.append(owned.copy(deep=True))
+            selected_observations += len(scheduled_index)
+        elif result.status is WalkForwardStatus.NO_SELECTION:
+            calendar_parts.append(
+                pd.Series(0.0, index=scheduled_index, dtype=float)
+            )
+            no_selection_observations += len(scheduled_index)
+        elif result.status is WalkForwardStatus.INSUFFICIENT_DATA:
+            calendar_parts.append(
+                pd.Series(np.nan, index=scheduled_index, dtype=float)
+            )
+            unavailable_observations += len(scheduled_index)
+        else:  # pragma: no cover - Enum exhaustiveness guard.
+            raise RuntimeError(f"Unsupported fold status: {result.status!r}.")
 
-    overall_report: StrategyPerformanceReport | None = None
-    if len(oos_returns.dropna()) >= 2 and completed:
-        combined_ledger = _namespace_completed_ledgers(results)
-        overall_report = build_performance_report(
-            oos_returns,
-            combined_ledger,
-            periods_per_year=_positive_integer(periods_per_year, "periods_per_year"),
+    if conditional_parts:
+        conditional_returns = pd.concat(
+            conditional_parts,
+            axis=0,
+            copy=True,
+        ).rename("conditional_oos_return")
+    else:
+        conditional_returns = pd.Series(
+            dtype=float,
+            name="conditional_oos_return",
+        )
+    calendar_returns = pd.concat(
+        calendar_parts,
+        axis=0,
+        copy=True,
+    ).rename("calendar_oos_return")
+    if not conditional_returns.index.is_unique:
+        raise RuntimeError("Contiguous folds produced duplicate conditional labels.")
+    if not calendar_returns.index.is_unique:
+        raise RuntimeError("Contiguous folds produced duplicate calendar labels.")
+
+    conditional_report, conditional_status, conditional_error = _return_analytics(
+        conditional_returns,
+        periods_per_year=periods,
+        risk_free_rate=risk_free,
+    )
+    if unavailable_observations:
+        calendar_report = None
+        calendar_status = WalkForwardAnalyticsStatus.UNAVAILABLE
+        calendar_error = (
+            "Calendar analytics are unavailable because scheduled rows have "
+            "INSUFFICIENT_DATA rather than investable cash returns."
+        )
+    else:
+        calendar_report, calendar_status, calendar_error = _return_analytics(
+            calendar_returns,
+            periods_per_year=periods,
             risk_free_rate=risk_free,
+        )
+
+    scheduled_observations = len(calendar_returns)
+    scheduled_eligible_observations = (
+        selected_observations + no_selection_observations
+    )
+    selection_coverage = (
+        float(selected_observations / scheduled_eligible_observations)
+        if scheduled_eligible_observations
+        else float("nan")
+    )
+    first_fold = folds[0]
+    last_fold = folds[-1]
+    discarded_terminal_rows = len(validated_prices) - (
+        last_fold.trading_end_position + 1
+    )
+    provenance_warnings = [
+        "Upstream cleaning, listing history, delistings, and survivorship "
+        "filters are caller-supplied and are not audited by walkforward.py."
+    ]
+    if isinstance(groups, Mapping):
+        provenance_warnings.append(
+            "Static groups are reused across folds and are caller-assumed, not "
+            "independently point-in-time verified."
+        )
+    elif group_provider is not None:
+        provenance_warnings.append(
+            "Per-fold group snapshots are structurally validated, but their "
+            "upstream causal provenance remains caller-supplied."
         )
 
     return WalkForwardResult(
@@ -911,7 +1341,35 @@ def run_walk_forward_analysis(
         insufficient_data_fold_count=sum(
             result.status is WalkForwardStatus.INSUFFICIENT_DATA for result in results
         ),
-        total_oos_observations=len(oos_returns),
-        oos_returns=oos_returns,
-        overall_performance_report=overall_report,
+        scheduled_oos_observations=scheduled_observations,
+        scheduled_eligible_oos_observations=scheduled_eligible_observations,
+        selected_oos_observations=selected_observations,
+        no_selection_oos_observations=no_selection_observations,
+        unavailable_oos_observations=unavailable_observations,
+        selection_coverage=selection_coverage,
+        conditional_oos_returns=conditional_returns,
+        calendar_oos_returns=calendar_returns,
+        conditional_performance_report=conditional_report,
+        calendar_performance_report=calendar_report,
+        conditional_analytics_status=conditional_status,
+        calendar_analytics_status=calendar_status,
+        conditional_analytics_error=conditional_error,
+        calendar_analytics_error=calendar_error,
+        capital_policy="equal_capital_reset",
+        aggregate_return_policy="time_weighted_equal_capital_reset",
+        inactive_capital_policy="zero_return_cash_for_no_selection_rows",
+        selection_coverage_denominator=(
+            "selected_plus_no_selection_scheduled_rows"
+        ),
+        aggregate_dollar_pnl_available=False,
+        aggregate_trade_dollar_metrics_available=False,
+        universe_provenance=universe_provenance,
+        cleaning_provenance="caller_supplied_prices_unvalidated",
+        point_in_time_universe_validated=False,
+        provenance_warnings=tuple(provenance_warnings),
+        evaluated_start_position=first_fold.trading_start_position,
+        evaluated_end_position=last_fold.trading_end_position,
+        evaluated_start_label=first_fold.trading_start_label,
+        evaluated_end_label=last_fold.trading_end_label,
+        discarded_terminal_rows=discarded_terminal_rows,
     )

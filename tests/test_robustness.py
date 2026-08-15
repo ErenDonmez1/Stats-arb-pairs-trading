@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -10,8 +10,13 @@ import pandas as pd
 import pytest
 
 from pairs_trading.analytics import calculate_core_metrics, calculate_drawdown_metrics
+from pairs_trading.data import make_synthetic_universe
 from pairs_trading.robustness import (
+    LocalNeighbor,
+    MetricAvailabilityStatus,
     MetricDistribution,
+    MetricFractionSummary,
+    ParameterAxisMetadata,
     ParameterScenario,
     RobustnessResult,
     ScenarioResult,
@@ -25,6 +30,7 @@ from pairs_trading.robustness import (
 )
 from pairs_trading.screening import PairScreeningResult
 from pairs_trading.walkforward import (
+    WalkForwardFold,
     WalkForwardAnalyticsStatus,
     WalkForwardResult,
     WalkForwardReturnReport,
@@ -216,6 +222,17 @@ def _install_fake_walk_forward(
     return calls
 
 
+@dataclass(frozen=True)
+class _CostBacktest:
+    accounting: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class _CostFold:
+    trade_count: int
+    backtest: _CostBacktest | None
+
+
 def test_cartesian_grid_and_scenario_ids_are_deterministic() -> None:
     baseline = _baseline()
     kwargs = {
@@ -260,6 +277,60 @@ def test_empty_parameter_lists_are_rejected(values_name: str) -> None:
 def test_duplicate_parameter_values_are_rejected() -> None:
     with pytest.raises(ValueError, match="duplicate"):
         generate_parameter_scenarios(_baseline(), entry_z_values=[1.0, 1.0])
+
+
+def test_distinct_ids_cannot_duplicate_parameter_configuration_before_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _install_fake_walk_forward(monkeypatch)
+    duplicate = replace(_baseline(), scenario_id="same-parameters")
+
+    with pytest.raises(ValueError, match="parameter tuples must be unique"):
+        run_sensitivity_analysis(
+            _prices(),
+            (_baseline(), duplicate),
+            "baseline",
+        )
+
+    assert calls == []
+
+
+def test_summary_rejects_duplicate_parameter_configurations() -> None:
+    metrics = robustness_module.PerformanceMetrics(
+        0.1, 0.1, 0.2, 1.0, 1.0, -0.1, 1.0, 4
+    )
+
+    def record(scenario: ParameterScenario) -> ScenarioResult:
+        return ScenarioResult(
+            scenario=scenario,
+            status=ScenarioStatus.COMPLETED,
+            error=None,
+            walk_forward_result=None,
+            calendar_metrics=metrics,
+            conditional_metrics=None,
+            common_horizon_metrics=metrics,
+            common_horizon_error=None,
+            calendar_oos_returns=pd.Series([0.0, 0.0]),
+            conditional_oos_returns=pd.Series(dtype=float),
+            common_horizon_returns=pd.Series([0.0, 0.0]),
+            evaluated_start_position=0,
+            evaluated_end_position=1,
+            scheduled_oos_observations=2,
+            available_oos_observations=2,
+            selected_oos_observations=2,
+            unavailable_oos_observations=0,
+            selection_coverage=1.0,
+            trade_count=0,
+            total_transaction_cost=0.0,
+            periods_per_year=252,
+            risk_free_rate=0.0,
+        )
+
+    with pytest.raises(ValueError, match="parameter tuples must be unique"):
+        summarize_sensitivity(
+            [record(_baseline()), record(replace(_baseline(), scenario_id="other"))],
+            "baseline",
+        )
 
 
 def test_scenario_limit_is_enforced_before_any_execution(
@@ -394,6 +465,84 @@ def test_insufficient_data_rows_remain_unavailable(
     assert result.calendar_oos_returns.isna().sum() == 2
 
 
+def test_partial_calendar_never_produces_primary_or_headline_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def factory(
+        prices: pd.DataFrame,
+        formation: int,
+        trading: int,
+        kwargs: Any,
+    ) -> WalkForwardResult:
+        values = (
+            [0.10, np.nan, np.nan, np.nan]
+            if kwargs["entry_z"] == 1.0
+            else [0.02, 0.0, 0.0, 0.0]
+        )
+        return _walk_forward_result(values)
+
+    _install_fake_walk_forward(monkeypatch, factory)
+    scenarios = generate_parameter_scenarios(
+        _baseline(),
+        entry_z_values=[1.0, 1.5],
+    )
+
+    result = run_sensitivity_analysis(_prices(), scenarios, "baseline")
+    partial = result.baseline_result
+
+    assert partial.calendar_oos_returns.tolist()[0] == pytest.approx(0.10)
+    assert partial.calendar_oos_returns.isna().sum() == 3
+    assert partial.scheduled_oos_observations == 4
+    assert partial.available_oos_observations == 1
+    assert partial.unavailable_oos_observations == 3
+    assert partial.calendar_metrics is None
+    assert (
+        partial.calendar_metrics_status
+        is MetricAvailabilityStatus.UNAVAILABLE_PARTIAL_CALENDAR
+    )
+    assert result.summary.scenario_count == 2
+    assert result.summary.unavailable_scenarios == 1
+    assert not result.summary.headline_metrics_available
+    assert result.summary.metric_distributions.total_return.observations == 0
+    assert result.summary.total_return_fraction.eligible_scenarios == 2
+    assert result.summary.total_return_fraction.defined_scenarios == 0
+    assert result.summary.total_return_fraction.undefined_scenarios == 2
+    assert np.isnan(result.summary.fraction_positive_total_return)
+
+
+def test_one_row_calendar_retains_raw_return_but_analytics_are_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_walk_forward(
+        monkeypatch,
+        lambda *args: _walk_forward_result([0.03]),
+    )
+
+    result = run_parameter_scenario(_prices(), _baseline())
+
+    assert result.calendar_oos_returns.tolist() == [0.03]
+    assert result.calendar_metrics is None
+    assert (
+        result.calendar_metrics_status
+        is MetricAvailabilityStatus.UNAVAILABLE_INSUFFICIENT_OBSERVATIONS
+    )
+
+
+def test_observed_only_partial_metrics_are_explicitly_secondary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_walk_forward(
+        monkeypatch,
+        lambda *args: _walk_forward_result([0.10, 0.02, np.nan, np.nan]),
+    )
+
+    result = run_parameter_scenario(_prices(), _baseline())
+
+    assert result.calendar_metrics is None
+    assert result.available_observations_metrics is not None
+    assert result.available_observations_metrics.total_return == pytest.approx(0.122)
+
+
 def test_all_unavailable_rows_produce_explicit_no_valid_folds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -437,7 +586,7 @@ def test_formation_window_changes_expose_different_native_horizons(
     assert starts == {50: 50, 60: 60}
 
 
-def test_common_horizon_uses_only_available_index_intersection(
+def test_common_horizon_uses_structural_scheduled_index_intersection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def factory(
@@ -466,9 +615,21 @@ def test_common_horizon_uses_only_available_index_intersection(
 
     result = run_sensitivity_analysis(_prices(), scenarios, "baseline")
 
-    assert result.common_horizon_index.tolist() == [52]
+    assert result.common_horizon_index.tolist() == [52, 53]
+    assert result.common_horizon_structurally_available
+    assert not result.common_horizon_fully_observed
     assert result.common_horizon_available is False
-    assert all(item.common_horizon_metrics is None for item in result.scenarios)
+    partial = next(
+        item for item in result.scenarios if item.scenario.formation_window == 60
+    )
+    complete = next(
+        item for item in result.scenarios if item.scenario.formation_window == 50
+    )
+    assert partial.common_horizon_returns.index.tolist() == [52, 53]
+    assert np.isnan(partial.common_horizon_returns.loc[53])
+    assert partial.common_horizon_metrics is None
+    assert complete.common_horizon_metrics is not None
+    assert result.summary.metric_distributions.total_return.observations == 0
 
 
 def test_common_horizon_metrics_use_exact_multirow_intersection(
@@ -500,6 +661,124 @@ def test_common_horizon_metrics_use_exact_multirow_intersection(
     for item in result.scenarios:
         assert item.common_horizon_returns.index.tolist() == [52, 53]
         assert item.common_horizon_metrics is not None
+
+
+def test_headline_distributions_use_common_not_opposing_native_horizons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def factory(
+        prices: pd.DataFrame,
+        formation: int,
+        trading: int,
+        kwargs: Any,
+    ) -> WalkForwardResult:
+        if formation == 50:
+            return _walk_forward_result(
+                [-0.50, 0.0, 0.10, 0.10],
+                index=pd.RangeIndex(50, 54),
+                evaluated_start=50,
+            )
+        return _walk_forward_result(
+            [0.10, 0.10, 0.10, 0.10],
+            index=pd.RangeIndex(52, 56),
+            evaluated_start=60,
+        )
+
+    _install_fake_walk_forward(monkeypatch, factory)
+    scenarios = generate_parameter_scenarios(
+        _baseline(),
+        formation_window_values=[50, 60],
+    )
+
+    result = run_sensitivity_analysis(_prices(), scenarios, "baseline")
+
+    native_totals = {
+        item.scenario.formation_window: item.calendar_metrics.total_return
+        for item in result.scenarios
+        if item.calendar_metrics is not None
+    }
+    assert native_totals[50] < 0.0 < native_totals[60]
+    assert result.summary.headline_metric_basis == (
+        "structural_common_scheduled_horizon"
+    )
+    assert result.summary.metric_distributions.total_return.median == pytest.approx(
+        0.21
+    )
+    assert result.summary.native_metric_distributions.total_return.median != (
+        result.summary.metric_distributions.total_return.median
+    )
+
+
+def test_loss_date_remains_in_structural_common_horizon_when_peer_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def factory(
+        prices: pd.DataFrame,
+        formation: int,
+        trading: int,
+        kwargs: Any,
+    ) -> WalkForwardResult:
+        values = [-0.40, 0.01, 0.01] if formation == 50 else [np.nan, 0.01, 0.01]
+        return _walk_forward_result(
+            values,
+            index=pd.Index([52, 53, 54]),
+            evaluated_start=formation,
+        )
+
+    _install_fake_walk_forward(monkeypatch, factory)
+    scenarios = generate_parameter_scenarios(
+        _baseline(),
+        formation_window_values=[50, 60],
+    )
+
+    result = run_sensitivity_analysis(_prices(), scenarios, "baseline")
+
+    assert result.common_horizon_index.tolist() == [52, 53, 54]
+    losing = next(
+        item for item in result.scenarios if item.scenario.formation_window == 50
+    )
+    missing = next(
+        item for item in result.scenarios if item.scenario.formation_window == 60
+    )
+    assert losing.common_horizon_returns.loc[52] == pytest.approx(-0.40)
+    assert np.isnan(missing.common_horizon_returns.loc[52])
+    assert result.common_horizon_structurally_available
+    assert not result.common_horizon_analytics_available
+
+
+def test_one_row_common_horizon_is_structural_but_analytically_insufficient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def factory(
+        prices: pd.DataFrame,
+        formation: int,
+        trading: int,
+        kwargs: Any,
+    ) -> WalkForwardResult:
+        start = 50 if formation == 50 else 53
+        return _walk_forward_result(
+            [0.01, 0.02, 0.03, 0.04],
+            index=pd.RangeIndex(start, start + 4),
+            evaluated_start=formation,
+        )
+
+    _install_fake_walk_forward(monkeypatch, factory)
+    scenarios = generate_parameter_scenarios(
+        _baseline(),
+        formation_window_values=[50, 60],
+    )
+
+    result = run_sensitivity_analysis(_prices(), scenarios, "baseline")
+
+    assert result.common_horizon_index.tolist() == [53]
+    assert result.common_horizon_structurally_available
+    assert result.common_horizon_fully_observed
+    assert not result.common_horizon_analytics_available
+    assert (
+        result.common_horizon_analytics_status
+        is MetricAvailabilityStatus.UNAVAILABLE_INSUFFICIENT_OBSERVATIONS
+    )
+    assert result.summary.metric_distributions.total_return.observations == 0
 
 
 def test_baseline_metrics_equal_direct_baseline_walk_forward_metrics(
@@ -575,6 +854,8 @@ def test_positive_sharpe_fraction_excludes_undefined_values() -> None:
     undefined = replace(defined, sharpe_ratio=float("nan"), total_return=-0.1)
     baseline = _baseline()
     other = replace(baseline, scenario_id="other", entry_z=1.5)
+    invalid_scenario = replace(baseline, scenario_id="invalid", entry_z=2.0)
+    failed_scenario = replace(baseline, scenario_id="failed", entry_z=2.5)
 
     def scenario_result(scenario: ParameterScenario, metrics: Any) -> ScenarioResult:
         return ScenarioResult(
@@ -584,11 +865,11 @@ def test_positive_sharpe_fraction_excludes_undefined_values() -> None:
             walk_forward_result=None,
             calendar_metrics=metrics,
             conditional_metrics=None,
-            common_horizon_metrics=None,
-            common_horizon_error="fixture",
+                common_horizon_metrics=metrics,
+                common_horizon_error=None,
             calendar_oos_returns=pd.Series([0.0, 0.0]),
             conditional_oos_returns=pd.Series(dtype=float),
-            common_horizon_returns=pd.Series(dtype=float),
+                common_horizon_returns=pd.Series([0.0, 0.0]),
             evaluated_start_position=0,
             evaluated_end_position=1,
             scheduled_oos_observations=2,
@@ -602,13 +883,35 @@ def test_positive_sharpe_fraction_excludes_undefined_values() -> None:
             risk_free_rate=0.0,
         )
 
+    invalid = replace(
+        scenario_result(invalid_scenario, None),
+        status=ScenarioStatus.INVALID_CONFIGURATION,
+    )
+    failed = replace(
+        scenario_result(failed_scenario, None),
+        status=ScenarioStatus.FAILED,
+    )
     summary = summarize_sensitivity(
-        [scenario_result(baseline, defined), scenario_result(other, undefined)],
+        [
+            scenario_result(baseline, defined),
+            scenario_result(other, undefined),
+            invalid,
+            failed,
+        ],
         "baseline",
     )
 
     assert summary.fraction_positive_sharpe == 1.0
     assert summary.metric_distributions.sharpe_ratio.observations == 1
+    assert isinstance(summary.sharpe_fraction, MetricFractionSummary)
+    assert summary.sharpe_fraction.eligible_scenarios == 2
+    assert summary.sharpe_fraction.defined_scenarios == 1
+    assert summary.sharpe_fraction.undefined_scenarios == 1
+    assert summary.sharpe_fraction.positive_scenarios == 1
+    assert summary.sharpe_fraction.invalid_scenarios == 1
+    assert summary.sharpe_fraction.failed_scenarios == 1
+    assert summary.sharpe_fraction.positive_fraction_defined == 1.0
+    assert summary.sharpe_fraction.positive_fraction_all_eligible == 0.5
 
 
 def test_baseline_neighbors_differ_by_exactly_one_parameter(
@@ -625,6 +928,8 @@ def test_baseline_neighbors_differ_by_exactly_one_parameter(
 
     assert summary.baseline_neighbor_count == 2
     assert summary.neighbor_metric_distributions.total_return.observations == 2
+    assert summary.one_parameter_variant_count == 2
+    assert summary.variant_metric_distributions.total_return.observations == 2
 
 
 def test_neighbor_sign_and_positive_sharpe_summary_is_reported(
@@ -650,6 +955,117 @@ def test_neighbor_sign_and_positive_sharpe_summary_is_reported(
     assert summary.baseline_neighbor_count == 2
     assert summary.fraction_neighbors_same_total_return_sign == pytest.approx(0.5)
     assert 0.0 <= summary.fraction_neighbors_positive_sharpe <= 1.0
+
+
+def test_only_immediately_adjacent_one_parameter_variants_are_local_neighbors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_walk_forward(monkeypatch)
+    scenarios = generate_parameter_scenarios(
+        _baseline(),
+        entry_z_values=[1.0, 1.5, 2.5],
+    )
+
+    summary = run_sensitivity_analysis(_prices(), scenarios, "baseline").summary
+
+    assert summary.one_parameter_variant_count == 2
+    assert summary.local_neighbor_count == 1
+    neighbor = summary.local_neighbors[0]
+    assert isinstance(neighbor, LocalNeighbor)
+    assert neighbor.changed_parameter == "entry_z"
+    assert neighbor.baseline_value == 1.0
+    assert neighbor.neighbor_value == 1.5
+    assert neighbor.absolute_distance == pytest.approx(0.5)
+    assert neighbor.relative_distance == pytest.approx(0.5)
+
+
+def test_local_neighbors_include_deterministic_lower_and_upper_adjacent_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_walk_forward(monkeypatch)
+    baseline = _baseline(entry_z=1.5)
+    scenarios = generate_parameter_scenarios(
+        baseline,
+        entry_z_values=[1.0, 1.5, 2.0, 2.75],
+    )
+
+    summary = run_sensitivity_analysis(_prices(), scenarios, "baseline").summary
+
+    assert [neighbor.neighbor_value for neighbor in summary.local_neighbors] == [
+        1.0,
+        2.0,
+    ]
+    assert all(
+        neighbor.absolute_distance == pytest.approx(0.5)
+        for neighbor in summary.local_neighbors
+    )
+    assert all(
+        neighbor.relative_distance == pytest.approx(1.0 / 3.0)
+        for neighbor in summary.local_neighbors
+    )
+
+
+def test_grid_density_and_dimension_scope_metadata_are_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_walk_forward(monkeypatch)
+    scenarios = generate_parameter_scenarios(
+        _baseline(),
+        entry_z_values=[1.0, 1.5, 2.5],
+        commission_bps_values=[2.0, 5.0],
+    )
+
+    result = run_sensitivity_analysis(_prices(), scenarios, "baseline")
+    axes = {axis.parameter: axis for axis in result.axis_metadata}
+
+    assert result.distribution_policy == "equal_weight_per_tested_grid_point"
+    assert "not confidence intervals" in result.grid_density_warning
+    assert isinstance(axes["entry_z"], ParameterAxisMetadata)
+    assert axes["entry_z"].tested_values == (1.0, 1.5, 2.5)
+    assert axes["entry_z"].count == 3
+    assert axes["entry_z"].numeric_spacing == (0.5, 1.0)
+    assert set(result.tested_dimensions) == {"entry_z", "commission_bps"}
+    assert "entry_z" not in result.untested_material_dimensions
+    assert "commission_bps" not in result.untested_material_dimensions
+    assert "fdr_threshold" in result.untested_material_dimensions
+    assert "execution_lag" in result.untested_material_dimensions
+    assert "hedge_estimation_policy" in result.untested_material_dimensions
+
+
+def test_denser_grid_changes_equal_weight_distribution_transparently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def factory(
+        prices: pd.DataFrame,
+        formation: int,
+        trading: int,
+        kwargs: Any,
+    ) -> WalkForwardResult:
+        return _walk_forward_result([kwargs["entry_z"] / 100.0, 0.0, 0.0])
+
+    _install_fake_walk_forward(monkeypatch, factory)
+    sparse = run_sensitivity_analysis(
+        _prices(),
+        generate_parameter_scenarios(
+            _baseline(), entry_z_values=[1.0, 2.0]
+        ),
+        "baseline",
+    )
+    dense = run_sensitivity_analysis(
+        _prices(),
+        generate_parameter_scenarios(
+            _baseline(), entry_z_values=[1.0, 1.5, 1.75, 2.0]
+        ),
+        "baseline",
+    )
+
+    assert sparse.summary.metric_distributions.total_return.median != (
+        dense.summary.metric_distributions.total_return.median
+    )
+    assert sparse.distribution_policy == dense.distribution_policy
+    assert next(
+        axis.count for axis in dense.axis_metadata if axis.parameter == "entry_z"
+    ) == 4
 
 
 def test_cost_axes_are_forwarded_without_changing_cost_formulas(
@@ -698,6 +1114,43 @@ def test_higher_real_costs_do_not_reduce_recorded_transaction_costs(
 
     assert costs[10.0] >= costs[0.0]
     assert costs[10.0] > 0.0
+
+
+@pytest.mark.parametrize(
+    ("costs", "expected_total", "known", "unknown"),
+    [
+        ([1.25, 2.75], 4.0, 2, 0),
+        ([1.25, np.nan], np.nan, 1, 1),
+        ([1.25, np.inf], np.nan, 1, 1),
+    ],
+)
+def test_equal_capital_reset_transaction_cost_total_requires_complete_components(
+    monkeypatch: pytest.MonkeyPatch,
+    costs: list[float],
+    expected_total: float,
+    known: int,
+    unknown: int,
+) -> None:
+    fold = _CostFold(
+        trade_count=0,
+        backtest=_CostBacktest(
+            pd.DataFrame({"transaction_cost": costs}, dtype=float)
+        ),
+    )
+    produced = replace(_walk_forward_result([0.01, 0.0]), folds=(fold,))
+    _install_fake_walk_forward(monkeypatch, lambda *args: produced)
+
+    result = run_parameter_scenario(_prices(), _baseline())
+
+    if np.isnan(expected_total):
+        assert np.isnan(result.equal_capital_reset_fold_transaction_cost_total)
+    else:
+        assert result.equal_capital_reset_fold_transaction_cost_total == pytest.approx(
+            expected_total
+        )
+    assert result.transaction_cost_known_components == known
+    assert result.transaction_cost_unknown_components == unknown
+    assert result.transaction_cost_basis == "equal_capital_reset_fold_dollar_total"
 
 
 def test_formation_window_variation_reruns_screening(
@@ -841,10 +1294,130 @@ def test_repeated_sensitivity_runs_are_deterministic(
     first = run_sensitivity_analysis(_prices(), scenarios, "baseline")
     second = run_sensitivity_analysis(_prices(), scenarios, "baseline")
 
-    assert first.summary == second.summary
+    pd.testing.assert_frame_equal(sensitivity_table(first), sensitivity_table(second))
     assert [item.status for item in first.scenarios] == [item.status for item in second.scenarios]
     for original, repeated in zip(first.scenarios, second.scenarios):
         pd.testing.assert_series_equal(original.calendar_oos_returns, repeated.calendar_oos_returns)
+
+
+def test_stateful_group_provider_is_snapshotted_by_fold_independent_of_scenario_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenarios = generate_parameter_scenarios(
+        _baseline(),
+        entry_z_values=[1.0, 1.5],
+    )
+
+    def execute(order: tuple[ParameterScenario, ...]) -> tuple[list[Any], int]:
+        provider_calls = 0
+        observed_snapshots: list[Any] = []
+
+        def provider(fold: WalkForwardFold) -> dict[str, list[str]]:
+            nonlocal provider_calls
+            provider_calls += 1
+            symbols = ["AAA", "BBB"] if provider_calls % 2 else ["AAA", "CCC"]
+            return {"group": symbols}
+
+        def factory(
+            prices: pd.DataFrame,
+            formation: int,
+            trading: int,
+            kwargs: Any,
+        ) -> WalkForwardResult:
+            fold = robustness_module.generate_walk_forward_folds(
+                prices.index,
+                formation,
+                trading,
+                step_size=trading,
+                minimum_observations=50,
+            )[0]
+            snapshot = kwargs["groups"](fold)
+            observed_snapshots.append(snapshot)
+            assert isinstance(snapshot["group"], tuple)
+            return _walk_forward_result([0.01, 0.0, 0.0, 0.0])
+
+        _install_fake_walk_forward(monkeypatch, factory)
+        run_sensitivity_analysis(_prices(), order, "baseline", groups=provider)
+        return observed_snapshots, provider_calls
+
+    forward, forward_calls = execute(scenarios)
+    reverse, reverse_calls = execute(tuple(reversed(scenarios)))
+
+    assert forward == reverse
+    assert forward[0] == forward[1]
+    # Three complete folds exist, and each boundary is materialized once per run.
+    assert forward_calls == reverse_calls == 3
+
+
+def test_group_provider_snapshot_owns_and_normalizes_caller_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shared_symbols = ["BBB", "AAA"]
+    observed: list[tuple[str, ...]] = []
+
+    def provider(fold: WalkForwardFold) -> dict[str, list[str]]:
+        return {"group": shared_symbols}
+
+    def factory(
+        prices: pd.DataFrame,
+        formation: int,
+        trading: int,
+        kwargs: Any,
+    ) -> WalkForwardResult:
+        fold = robustness_module.generate_walk_forward_folds(
+            prices.index,
+            formation,
+            trading,
+            step_size=trading,
+            minimum_observations=50,
+        )[0]
+        observed.append(kwargs["groups"](fold)["group"])
+        shared_symbols[:] = ["CCC"]
+        return _walk_forward_result([0.01, 0.0, 0.0, 0.0])
+
+    _install_fake_walk_forward(monkeypatch, factory)
+    run_sensitivity_analysis(
+        _prices(),
+        generate_parameter_scenarios(_baseline(), entry_z_values=[1.0, 1.5]),
+        "baseline",
+        groups=provider,
+    )
+
+    assert observed == [("AAA", "BBB"), ("AAA", "BBB")]
+
+
+def test_provenance_is_promoted_and_conflicts_are_conservative(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def factory(
+        prices: pd.DataFrame,
+        formation: int,
+        trading: int,
+        kwargs: Any,
+    ) -> WalkForwardResult:
+        baseline = kwargs["entry_z"] == 1.0
+        return replace(
+            _walk_forward_result([0.01, 0.0, 0.0, 0.0]),
+            universe_provenance="validated-feed" if baseline else "caller-feed",
+            cleaning_provenance="clean-v1" if baseline else "clean-v2",
+            point_in_time_universe_validated=baseline,
+            provenance_warnings=("caller warning",),
+        )
+
+    _install_fake_walk_forward(monkeypatch, factory)
+    scenarios = generate_parameter_scenarios(
+        _baseline(),
+        entry_z_values=[1.0, 1.5],
+    )
+
+    result = run_sensitivity_analysis(_prices(), scenarios, "baseline")
+
+    assert result.universe_provenance == ("caller-feed", "validated-feed")
+    assert result.cleaning_provenance == ("clean-v1", "clean-v2")
+    assert not result.point_in_time_universe_validated
+    assert any("conflicting universe" in warning for warning in result.provenance_warnings)
+    assert any("conflicting cleaning" in warning for warning in result.provenance_warnings)
+    assert any("conservatively not validated" in warning for warning in result.provenance_warnings)
 
 
 @pytest.mark.parametrize(
@@ -897,6 +1470,12 @@ def test_sensitivity_table_is_scenario_id_ordered_without_winner_labels(
     table = sensitivity_table(result)
 
     assert table["scenario_id"].tolist() == sorted(table["scenario_id"])
+    assert "headline_common_total_return" in table
+    assert "native_calendar_total_return" in table
+    assert "equal_capital_reset_fold_transaction_cost_total" in table
+    assert table["transaction_cost_basis"].eq(
+        "equal_capital_reset_fold_dollar_total"
+    ).all()
     assert not any(
         token in column.upper()
         for column in table.columns
@@ -930,31 +1509,84 @@ def test_scenario_analytics_unavailability_preserves_raw_returns(
     result = run_parameter_scenario(_prices(), _baseline())
 
     assert result.status is ScenarioStatus.ANALYTICS_UNAVAILABLE
-    assert result.calendar_metrics is not None
-    assert result.calendar_metrics.total_return == -1.0
-    assert np.isnan(result.calendar_metrics.sharpe_ratio)
+    assert result.calendar_metrics is None
+    assert (
+        result.calendar_metrics_status
+        is MetricAvailabilityStatus.UNAVAILABLE_INVALID_RETURNS
+    )
     assert result.calendar_oos_returns.tolist() == raw
 
+    combined = run_sensitivity_analysis(
+        _prices(),
+        (_baseline(),),
+        "baseline",
+    )
+    assert combined.common_horizon_structurally_available
+    assert combined.common_horizon_fully_observed
+    assert not combined.common_horizon_analytics_available
+    assert (
+        combined.common_horizon_analytics_status
+        is MetricAvailabilityStatus.UNAVAILABLE_INVALID_RETURNS
+    )
+    assert combined.baseline_result.common_horizon_returns.tolist() == raw
 
-def test_expected_scenario_failure_is_recorded_but_invariant_error_raises(
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("bad data"),
+        ValueError("causal accounting invariant"),
+        TypeError("programming defect"),
+        RuntimeError("invariant"),
+    ],
+)
+def test_unexpected_walk_forward_errors_propagate(
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> None:
+    monkeypatch.setattr(
+        robustness_module,
+        "run_walk_forward_analysis",
+        lambda *args, **kwargs: (_ for _ in ()).throw(error),
+    )
+    with pytest.raises(type(error), match=str(error)):
+        run_parameter_scenario(_prices(), _baseline())
+
+
+def test_high_cost_insolvency_cannot_disappear_as_a_failed_scenario(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         robustness_module,
         "run_walk_forward_analysis",
-        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("bad data")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ValueError("Net equity must remain strictly positive after costs")
+        ),
     )
-    failed = run_parameter_scenario(_prices(), _baseline())
-    assert failed.status is ScenarioStatus.FAILED
-    assert "bad data" in str(failed.error)
+    scenarios = generate_parameter_scenarios(
+        _baseline(),
+        commission_bps_values=[2.0, 10_000.0],
+    )
 
+    with pytest.raises(ValueError, match="strictly positive after costs"):
+        run_sensitivity_analysis(_prices(), scenarios, "baseline")
+
+
+def test_unexpected_common_analytics_value_error_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    produced = _walk_forward_result([0.01, 0.0, 0.0])
+    _install_fake_walk_forward(monkeypatch, lambda *args: produced)
     monkeypatch.setattr(
         robustness_module,
-        "run_walk_forward_analysis",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("invariant")),
+        "calculate_core_metrics",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ValueError("unexpected analytics invariant")
+        ),
     )
-    with pytest.raises(RuntimeError, match="invariant"):
-        run_parameter_scenario(_prices(), _baseline())
+
+    with pytest.raises(ValueError, match="unexpected analytics invariant"):
+        run_sensitivity_analysis(_prices(), (_baseline(),), "baseline")
 
 
 def test_summary_structures_have_typed_distribution_objects(
@@ -967,3 +1599,72 @@ def test_summary_structures_have_typed_distribution_objects(
     assert isinstance(result, RobustnessResult)
     assert isinstance(result.summary, SensitivitySummary)
     assert isinstance(result.summary.metric_distributions.total_return, MetricDistribution)
+
+
+def test_real_synthetic_walk_forward_hardening_regression_is_deterministic() -> None:
+    prices, groups = make_synthetic_universe(n_days=400, seed=123)
+    baseline = _baseline(
+        formation_window=320,
+        trading_window=40,
+        screening_min_observations=100,
+        zscore_lookback=20,
+        commission_bps=0.0,
+        slippage_bps=0.0,
+        financing_rate=0.0,
+        borrow_rate_y=0.0,
+        borrow_rate_x=0.0,
+    )
+    scenarios = generate_parameter_scenarios(
+        baseline,
+        formation_window_values=[300, 320],
+    )
+
+    def point_in_time_groups(
+        fold: WalkForwardFold,
+    ) -> dict[str, tuple[str, ...]]:
+        # First formation window runs normally; later folds are explicitly
+        # unavailable because their point-in-time universe has no candidate pair.
+        return groups if fold.formation_start_position == 0 else {"empty": ()}
+
+    kwargs = {
+        "fdr_threshold": 0.05,
+        "max_half_life": 100.0,
+        "hurst_threshold": 0.7,
+        "target_gross_notional": 10_000.0,
+        "initial_capital": 100_000.0,
+    }
+
+    first = run_sensitivity_analysis(
+        prices,
+        scenarios,
+        "baseline",
+        groups=point_in_time_groups,
+        walk_forward_kwargs=kwargs,
+    )
+    second = run_sensitivity_analysis(
+        prices,
+        tuple(reversed(scenarios)),
+        "baseline",
+        groups=point_in_time_groups,
+        walk_forward_kwargs=kwargs,
+    )
+
+    assert first.common_horizon_index.equals(second.common_horizon_index)
+    assert first.common_horizon_observations == 60
+    assert first.common_horizon_structurally_available
+    assert not first.common_horizon_fully_observed
+    assert not first.common_horizon_analytics_available
+    assert first.summary.total_return_fraction.eligible_scenarios == 2
+    assert first.summary.total_return_fraction.defined_scenarios == 0
+    assert first.summary.total_return_fraction.undefined_scenarios == 2
+    assert first.universe_provenance == (
+        "per_fold_groups_caller_supplied_unvalidated",
+    )
+    assert not first.point_in_time_universe_validated
+    pd.testing.assert_frame_equal(sensitivity_table(first), sensitivity_table(second))
+    for original, repeated in zip(first.scenarios, second.scenarios):
+        assert original.scenario == repeated.scenario
+        pd.testing.assert_series_equal(
+            original.calendar_oos_returns,
+            repeated.calendar_oos_returns,
+        )

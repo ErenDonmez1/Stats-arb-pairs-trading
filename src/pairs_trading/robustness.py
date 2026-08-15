@@ -10,12 +10,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from hashlib import sha256
 from itertools import product
 from math import prod
 from numbers import Integral, Real
+from types import MappingProxyType
 from typing import Any
 
 import numpy as np
@@ -25,8 +26,10 @@ from .analytics import calculate_core_metrics, calculate_drawdown_metrics
 from .stats import ADF_MIN_OBSERVATIONS
 from .walkforward import (
     WalkForwardFold,
+    WalkForwardAnalyticsStatus,
     WalkForwardResult,
     WalkForwardReturnReport,
+    generate_walk_forward_folds,
     run_walk_forward_analysis,
 )
 
@@ -34,10 +37,14 @@ from .walkforward import (
 __all__ = [
     "ParameterScenario",
     "ScenarioStatus",
+    "MetricAvailabilityStatus",
     "PerformanceMetrics",
     "MetricDistribution",
     "MetricDistributions",
+    "MetricFractionSummary",
     "ParameterRanges",
+    "ParameterAxisMetadata",
+    "LocalNeighbor",
     "ScenarioResult",
     "SensitivitySummary",
     "RobustnessResult",
@@ -55,6 +62,14 @@ NO_OPTIMIZATION_WARNING = (
     "to retrospectively promote the highest OOS Sharpe, return, or any other "
     "scenario to a production parameter choice."
 )
+DISTRIBUTION_POLICY = "equal_weight_per_tested_grid_point"
+GRID_DENSITY_WARNING = (
+    "Medians and quartiles describe equally weighted tested grid points; they "
+    "are not confidence intervals, and denser sampling of one region changes "
+    "the reported distribution."
+)
+TRANSACTION_COST_BASIS = "equal_capital_reset_fold_dollar_total"
+HEADLINE_METRIC_BASIS = "structural_common_scheduled_horizon"
 
 _PARAMETER_NAMES = (
     "entry_z",
@@ -81,6 +96,19 @@ _SCENARIO_CONTROLLED_ARGUMENTS = set(_PARAMETER_NAMES) | {
     "minimum_observations",
     "groups",
 }
+_ADDITIONAL_MATERIAL_DIMENSIONS = (
+    "fdr_threshold",
+    "half_life_threshold",
+    "hurst_threshold",
+    "execution_lag",
+    "maximum_holding_period",
+    "cooldown_period",
+    "target_notional_or_leverage",
+    "fixed_commission",
+    "forced_liquidation_policy",
+    "hedge_estimation_policy",
+)
+_MATERIAL_DIMENSIONS = _PARAMETER_NAMES + _ADDITIONAL_MATERIAL_DIMENSIONS
 
 
 def _integer(value: Any, name: str) -> int:
@@ -150,6 +178,20 @@ class ScenarioStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class MetricAvailabilityStatus(str, Enum):
+    """Why a native or common-horizon performance metric is (un)available."""
+
+    AVAILABLE = "AVAILABLE"
+    UNAVAILABLE_PARTIAL_CALENDAR = "UNAVAILABLE_PARTIAL_CALENDAR"
+    UNAVAILABLE_NO_OBSERVATIONS = "UNAVAILABLE_NO_OBSERVATIONS"
+    UNAVAILABLE_INSUFFICIENT_OBSERVATIONS = (
+        "UNAVAILABLE_INSUFFICIENT_OBSERVATIONS"
+    )
+    UNAVAILABLE_INVALID_RETURNS = "UNAVAILABLE_INVALID_RETURNS"
+    FAILED = "FAILED"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
 @dataclass(frozen=True)
 class PerformanceMetrics:
     """Return and risk metrics for one explicitly identified return series."""
@@ -188,6 +230,21 @@ class MetricDistributions:
 
 
 @dataclass(frozen=True)
+class MetricFractionSummary:
+    """Explicit numerator and denominator accounting for a headline fraction."""
+
+    criterion: str
+    eligible_scenarios: int
+    defined_scenarios: int
+    undefined_scenarios: int
+    positive_scenarios: int
+    invalid_scenarios: int
+    failed_scenarios: int
+    positive_fraction_defined: float
+    positive_fraction_all_eligible: float
+
+
+@dataclass(frozen=True)
 class ParameterRanges:
     """Deterministic parameter values represented by scenario records."""
 
@@ -203,6 +260,28 @@ class ParameterRanges:
     financing_rate: tuple[float, ...]
     borrow_rate_y: tuple[float, ...]
     borrow_rate_x: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class ParameterAxisMetadata:
+    """Deterministic grid-density metadata for one scenario parameter."""
+
+    parameter: str
+    tested_values: tuple[int | float, ...]
+    count: int
+    numeric_spacing: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class LocalNeighbor:
+    """An immediately adjacent one-axis baseline variation."""
+
+    scenario_id: str
+    changed_parameter: str
+    baseline_value: int | float
+    neighbor_value: int | float
+    absolute_distance: float
+    relative_distance: float
 
 
 @dataclass(frozen=True)
@@ -235,6 +314,20 @@ class ScenarioResult:
     total_transaction_cost: float
     periods_per_year: int
     risk_free_rate: float
+    available_observations_metrics: PerformanceMetrics | None = None
+    calendar_metrics_status: MetricAvailabilityStatus = (
+        MetricAvailabilityStatus.NOT_APPLICABLE
+    )
+    calendar_metrics_error: str | None = None
+    common_horizon_structurally_available: bool = False
+    common_horizon_fully_observed: bool = False
+    common_horizon_analytics_status: MetricAvailabilityStatus = (
+        MetricAvailabilityStatus.NOT_APPLICABLE
+    )
+    equal_capital_reset_fold_transaction_cost_total: float = 0.0
+    transaction_cost_known_components: int = 0
+    transaction_cost_unknown_components: int = 0
+    transaction_cost_basis: str = TRANSACTION_COST_BASIS
 
     def __post_init__(self) -> None:
         for field_name, series_name in (
@@ -278,6 +371,34 @@ class SensitivitySummary:
     neighbor_metric_distributions: MetricDistributions
     fraction_neighbors_same_total_return_sign: float
     fraction_neighbors_positive_sharpe: float
+    headline_metric_basis: str = HEADLINE_METRIC_BASIS
+    headline_metrics_available: bool = False
+    baseline_native_metrics: PerformanceMetrics | None = None
+    native_metric_distributions: MetricDistributions = field(
+        default_factory=lambda: _distributions(())
+    )
+    total_return_fraction: MetricFractionSummary = field(
+        default_factory=lambda: _empty_fraction("total_return > 0")
+    )
+    annualized_return_fraction: MetricFractionSummary = field(
+        default_factory=lambda: _empty_fraction("annualized_return > 0")
+    )
+    sharpe_fraction: MetricFractionSummary = field(
+        default_factory=lambda: _empty_fraction("sharpe_ratio > 0")
+    )
+    drawdown_fraction: MetricFractionSummary = field(
+        default_factory=lambda: _empty_fraction(
+            "maximum_drawdown >= drawdown_severity_threshold"
+        )
+    )
+    one_parameter_variant_count: int = 0
+    variant_metric_distributions: MetricDistributions = field(
+        default_factory=lambda: _distributions(())
+    )
+    variant_sign_agreement: float = float("nan")
+    variant_positive_sharpe_fraction: float = float("nan")
+    local_neighbor_count: int = 0
+    local_neighbors: tuple[LocalNeighbor, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -297,6 +418,22 @@ class RobustnessResult:
     common_horizon_error: str | None
     purpose: str
     warning: str
+    common_horizon_structurally_available: bool = False
+    common_horizon_fully_observed: bool = False
+    common_horizon_analytics_available: bool = False
+    common_horizon_analytics_status: MetricAvailabilityStatus = (
+        MetricAvailabilityStatus.NOT_APPLICABLE
+    )
+    common_horizon_analytics_error: str | None = None
+    distribution_policy: str = DISTRIBUTION_POLICY
+    grid_density_warning: str = GRID_DENSITY_WARNING
+    axis_metadata: tuple[ParameterAxisMetadata, ...] = ()
+    tested_dimensions: tuple[str, ...] = ()
+    untested_material_dimensions: tuple[str, ...] = ()
+    universe_provenance: tuple[str, ...] = ()
+    cleaning_provenance: tuple[str, ...] = ()
+    point_in_time_universe_validated: bool = False
+    provenance_warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         owned = tuple(replace(result) for result in self.scenarios)
@@ -309,6 +446,16 @@ class RobustnessResult:
         object.__setattr__(self, "baseline_result", baseline)
         object.__setattr__(self, "baseline_scenario", baseline.scenario)
         object.__setattr__(self, "common_horizon_index", self.common_horizon_index.copy())
+        object.__setattr__(self, "axis_metadata", tuple(self.axis_metadata))
+        object.__setattr__(self, "tested_dimensions", tuple(self.tested_dimensions))
+        object.__setattr__(
+            self,
+            "untested_material_dimensions",
+            tuple(self.untested_material_dimensions),
+        )
+        object.__setattr__(self, "universe_provenance", tuple(self.universe_provenance))
+        object.__setattr__(self, "cleaning_provenance", tuple(self.cleaning_provenance))
+        object.__setattr__(self, "provenance_warnings", tuple(self.provenance_warnings))
 
 
 def _configuration_error(scenario: ParameterScenario) -> str | None:
@@ -455,7 +602,10 @@ def generate_parameter_scenarios(
     return tuple(sorted(scenarios, key=lambda scenario: scenario.scenario_id))
 
 
-def _raw_total_return(returns: pd.Series) -> float:
+def _raw_total_return(returns: pd.Series, *, require_complete: bool = True) -> float:
+    """Compound returns without silently compressing a scheduled calendar."""
+    if returns.empty or (require_complete and bool(returns.isna().any())):
+        return float("nan")
     valid = returns.dropna()
     if valid.empty:
         return float("nan")
@@ -466,21 +616,8 @@ def _raw_total_return(returns: pd.Series) -> float:
 
 
 def _metrics_from_report(
-    returns: pd.Series,
-    report: WalkForwardReturnReport | None,
+    report: WalkForwardReturnReport,
 ) -> PerformanceMetrics:
-    total = _raw_total_return(returns)
-    if report is None:
-        return PerformanceMetrics(
-            total_return=total,
-            annualized_return=float("nan"),
-            annualized_volatility=float("nan"),
-            sharpe_ratio=float("nan"),
-            sortino_ratio=float("nan"),
-            maximum_drawdown=float("nan"),
-            calmar_ratio=float("nan"),
-            observations=int(returns.notna().sum()),
-        )
     return PerformanceMetrics(
         total_return=report.core.total_return,
         annualized_return=report.core.annualized_return,
@@ -497,26 +634,94 @@ def _metrics_from_returns(
     returns: pd.Series,
     periods_per_year: int,
     risk_free_rate: float,
-) -> PerformanceMetrics:
-    total = _raw_total_return(returns)
-    valid = returns.dropna()
-    if len(valid) < 2 or bool(valid.le(-1.0).any()):
-        return _metrics_from_report(returns, None)
-    try:
-        core = calculate_core_metrics(returns, periods_per_year, risk_free_rate)
-        drawdown = calculate_drawdown_metrics(returns, periods_per_year)
-    except (TypeError, ValueError, FloatingPointError, ArithmeticError):
-        return _metrics_from_report(returns, None)
-    return PerformanceMetrics(
-        total_return=core.total_return,
-        annualized_return=core.annualized_return,
-        annualized_volatility=core.annualized_volatility,
-        sharpe_ratio=core.sharpe_ratio,
-        sortino_ratio=core.sortino_ratio,
-        maximum_drawdown=drawdown.maximum_drawdown,
-        calmar_ratio=drawdown.calmar_ratio,
-        observations=core.observations,
+) -> tuple[PerformanceMetrics | None, MetricAvailabilityStatus, str | None]:
+    """Calculate metrics only for a complete, compoundable return horizon."""
+    if returns.empty:
+        return (
+            None,
+            MetricAvailabilityStatus.UNAVAILABLE_NO_OBSERVATIONS,
+            "No scheduled return observations are available.",
+        )
+    if bool(returns.isna().any()):
+        return (
+            None,
+            MetricAvailabilityStatus.UNAVAILABLE_PARTIAL_CALENDAR,
+            "Scheduled return observations contain unavailable values.",
+        )
+    values = returns.to_numpy(dtype=float)
+    if not np.isfinite(values).all():
+        return (
+            None,
+            MetricAvailabilityStatus.UNAVAILABLE_INVALID_RETURNS,
+            "Scheduled returns must be finite.",
+        )
+    if len(returns) < 2:
+        return (
+            None,
+            MetricAvailabilityStatus.UNAVAILABLE_INSUFFICIENT_OBSERVATIONS,
+            "At least two scheduled return observations are required.",
+        )
+    if bool(returns.le(-1.0).any()):
+        return (
+            None,
+            MetricAvailabilityStatus.UNAVAILABLE_INVALID_RETURNS,
+            "Returns at or below -100% cannot be geometrically compounded.",
+        )
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        compounded = np.cumprod(1.0 + values)
+        annualized = np.power(compounded[-1], periods_per_year / len(values)) - 1.0
+    if (
+        not np.isfinite(compounded).all()
+        or bool((compounded <= 0.0).any())
+        or not np.isfinite(annualized)
+    ):
+        return (
+            None,
+            MetricAvailabilityStatus.UNAVAILABLE_INVALID_RETURNS,
+            "Geometric return compounding is not finite and strictly positive.",
+        )
+    # Inputs now satisfy all documented analytics preconditions.  Any remaining
+    # exception is unexpected and must remain visible to the caller.
+    core = calculate_core_metrics(
+        returns,
+        periods_per_year,
+        risk_free_rate,
+        missing_policy="drop",
     )
+    drawdown = calculate_drawdown_metrics(
+        returns,
+        periods_per_year,
+        missing_policy="drop",
+    )
+    return (
+        PerformanceMetrics(
+            total_return=core.total_return,
+            annualized_return=core.annualized_return,
+            annualized_volatility=core.annualized_volatility,
+            sharpe_ratio=core.sharpe_ratio,
+            sortino_ratio=core.sortino_ratio,
+            maximum_drawdown=drawdown.maximum_drawdown,
+            calmar_ratio=drawdown.calmar_ratio,
+            observations=core.observations,
+        ),
+        MetricAvailabilityStatus.AVAILABLE,
+        None,
+    )
+
+
+def _available_observation_diagnostic(
+    returns: pd.Series,
+    periods_per_year: int,
+    risk_free_rate: float,
+) -> PerformanceMetrics | None:
+    """Secondary observed-only diagnostic; never used in headline summaries."""
+    observed = returns.dropna().copy(deep=True)
+    metrics, _, _ = _metrics_from_returns(
+        observed,
+        periods_per_year,
+        risk_free_rate,
+    )
+    return metrics
 
 
 def _empty_scenario_result(
@@ -550,6 +755,10 @@ def _empty_scenario_result(
         total_transaction_cost=0.0,
         periods_per_year=periods_per_year,
         risk_free_rate=risk_free_rate,
+        calendar_metrics_status=MetricAvailabilityStatus.NOT_APPLICABLE,
+        calendar_metrics_error=error,
+        common_horizon_analytics_status=MetricAvailabilityStatus.NOT_APPLICABLE,
+        equal_capital_reset_fold_transaction_cost_total=0.0,
     )
 
 
@@ -588,6 +797,99 @@ def _normalized_groups(
     return normalized
 
 
+def _require_unique_parameter_tuples(
+    scenarios: Iterable[ParameterScenario],
+) -> tuple[ParameterScenario, ...]:
+    """Reject duplicate configurations even when their IDs differ."""
+    materialized = tuple(scenarios)
+    seen: dict[tuple[Any, ...], str] = {}
+    for scenario in materialized:
+        values = scenario.parameter_tuple()
+        if values in seen:
+            raise ValueError(
+                "Scenario parameter tuples must be unique; "
+                f"{seen[values]!r} and {scenario.scenario_id!r} are duplicates."
+            )
+        seen[values] = scenario.scenario_id
+    return materialized
+
+
+def _fold_snapshot_key(fold: WalkForwardFold) -> tuple[int, int, str, str]:
+    """Identify the point-in-time universe by its formation boundary."""
+    return (
+        int(fold.formation_start_position),
+        int(fold.formation_end_position),
+        repr(fold.formation_start_label),
+        repr(fold.formation_end_label),
+    )
+
+
+def _normalize_group_snapshot(
+    groups: Mapping[str, Iterable[str]] | None,
+) -> Mapping[str, tuple[str, ...]] | None:
+    """Own and deterministically freeze one callable-provider response."""
+    if groups is None:
+        return None
+    if not isinstance(groups, Mapping):
+        raise TypeError("A group provider must return a mapping or None.")
+    if any(not isinstance(group, str) or not group.strip() for group in groups):
+        raise ValueError("Group names must be non-empty strings.")
+    normalized: dict[str, tuple[str, ...]] = {}
+    for group in sorted(groups):
+        symbols = groups[group]
+        if isinstance(symbols, (str, bytes)) or not isinstance(symbols, Iterable):
+            raise ValueError(f"Group {group!r} symbols must be an iterable.")
+        materialized = tuple(symbols)
+        if any(not isinstance(symbol, str) or not symbol.strip() for symbol in materialized):
+            raise ValueError(f"Group {group!r} contains an invalid symbol.")
+        normalized[group] = tuple(sorted(materialized))
+    return MappingProxyType(normalized)
+
+
+def _snapshotted_group_provider(
+    prices: pd.DataFrame,
+    scenarios: tuple[ParameterScenario, ...],
+    provider: Callable[
+        [WalkForwardFold], Mapping[str, Iterable[str]] | None
+    ],
+) -> Callable[[WalkForwardFold], Mapping[str, tuple[str, ...]] | None]:
+    """Materialize fold-universe snapshots before any scenario execution."""
+    representative_folds: dict[tuple[int, int, str, str], WalkForwardFold] = {}
+    for scenario in sorted(
+        scenarios,
+        key=lambda item: (item.parameter_tuple(), item.scenario_id),
+    ):
+        if _configuration_error(scenario) is not None:
+            continue
+        folds = generate_walk_forward_folds(
+            prices.index,
+            scenario.formation_window,
+            scenario.trading_window,
+            step_size=scenario.trading_window,
+            minimum_observations=scenario.screening_min_observations,
+        )
+        for fold in folds:
+            representative_folds.setdefault(_fold_snapshot_key(fold), fold)
+
+    snapshots = {
+        key: _normalize_group_snapshot(provider(representative_folds[key]))
+        for key in sorted(representative_folds)
+    }
+
+    def snapshot_for(
+        fold: WalkForwardFold,
+    ) -> Mapping[str, tuple[str, ...]] | None:
+        key = _fold_snapshot_key(fold)
+        if key not in snapshots:
+            raise RuntimeError(
+                "Walk-forward requested a group snapshot outside the "
+                "pre-materialized deterministic fold set."
+            )
+        return snapshots[key]
+
+    return snapshot_for
+
+
 def run_parameter_scenario(
     prices: pd.DataFrame,
     scenario: ParameterScenario,
@@ -619,69 +921,135 @@ def run_parameter_scenario(
 
     owned_prices = prices.copy(deep=True)
     owned_prices.attrs = deepcopy(prices.attrs)
-    try:
-        walk_forward = run_walk_forward_analysis(
-            owned_prices,
-            scenario.formation_window,
-            scenario.trading_window,
-            step_size=scenario.trading_window,
-            minimum_observations=scenario.screening_min_observations,
-            groups=groups,
-            screening_min_observations=scenario.screening_min_observations,
-            zscore_lookback=scenario.zscore_lookback,
-            entry_z=scenario.entry_z,
-            exit_z=scenario.exit_z,
-            stop_z=scenario.stop_z,
-            commission_bps=scenario.commission_bps,
-            slippage_bps=scenario.slippage_bps,
-            financing_rate=scenario.financing_rate,
-            borrow_rate_y=scenario.borrow_rate_y,
-            borrow_rate_x=scenario.borrow_rate_x,
-            **shared,
-        )
-    except (TypeError, ValueError) as exc:
-        return _empty_scenario_result(
-            scenario,
-            ScenarioStatus.FAILED,
-            f"{type(exc).__name__}: {exc}",
-            periods_per_year=periods,
-            risk_free_rate=risk_free,
-        )
+    # Unexpected execution, accounting, causality, or programming errors are
+    # deliberately allowed to propagate.  Only configuration combinations
+    # rejected above become nonfatal scenario records.
+    walk_forward = run_walk_forward_analysis(
+        owned_prices,
+        scenario.formation_window,
+        scenario.trading_window,
+        step_size=scenario.trading_window,
+        minimum_observations=scenario.screening_min_observations,
+        groups=groups,
+        screening_min_observations=scenario.screening_min_observations,
+        zscore_lookback=scenario.zscore_lookback,
+        entry_z=scenario.entry_z,
+        exit_z=scenario.exit_z,
+        stop_z=scenario.stop_z,
+        commission_bps=scenario.commission_bps,
+        slippage_bps=scenario.slippage_bps,
+        financing_rate=scenario.financing_rate,
+        borrow_rate_y=scenario.borrow_rate_y,
+        borrow_rate_x=scenario.borrow_rate_x,
+        **shared,
+    )
 
     calendar = walk_forward.calendar_oos_returns.copy(deep=True)
     conditional = walk_forward.conditional_oos_returns.copy(deep=True)
     available = int(calendar.notna().sum())
-    calendar_metrics = (
-        None
-        if available == 0
-        else _metrics_from_report(calendar, walk_forward.calendar_performance_report)
-    )
-    conditional_metrics = (
-        None
-        if conditional.notna().sum() == 0
-        else _metrics_from_report(
-            conditional,
-            walk_forward.conditional_performance_report,
+    calendar_is_complete = available == len(calendar) and len(calendar) > 0
+    if not calendar_is_complete:
+        calendar_metrics = None
+        if available == 0:
+            calendar_metrics_status = (
+                MetricAvailabilityStatus.UNAVAILABLE_NO_OBSERVATIONS
+            )
+            calendar_metrics_error = (
+                "No available calendar OOS observations were produced."
+            )
+        else:
+            calendar_metrics_status = (
+                MetricAvailabilityStatus.UNAVAILABLE_PARTIAL_CALENDAR
+            )
+            calendar_metrics_error = (
+                "Primary calendar analytics require every scheduled OOS "
+                "observation; at least one row is unavailable."
+            )
+    elif walk_forward.calendar_performance_report is not None:
+        calendar_metrics = _metrics_from_report(
+            walk_forward.calendar_performance_report
         )
+        calendar_metrics_status = MetricAvailabilityStatus.AVAILABLE
+        calendar_metrics_error = None
+    else:
+        calendar_metrics = None
+        if len(calendar) < 2:
+            calendar_metrics_status = (
+                MetricAvailabilityStatus.UNAVAILABLE_INSUFFICIENT_OBSERVATIONS
+            )
+        elif bool(calendar.le(-1.0).any()):
+            calendar_metrics_status = (
+                MetricAvailabilityStatus.UNAVAILABLE_INVALID_RETURNS
+            )
+        elif (
+            walk_forward.calendar_analytics_status
+            is WalkForwardAnalyticsStatus.FAILED
+        ):
+            calendar_metrics_status = MetricAvailabilityStatus.FAILED
+        else:
+            calendar_metrics_status = (
+                MetricAvailabilityStatus.UNAVAILABLE_INVALID_RETURNS
+            )
+        calendar_metrics_error = (
+            walk_forward.calendar_analytics_error
+            or "Calendar performance analytics are unavailable."
+        )
+
+    available_metrics = _available_observation_diagnostic(
+        calendar,
+        periods,
+        risk_free,
     )
+    if walk_forward.conditional_performance_report is not None:
+        conditional_metrics = _metrics_from_report(
+            walk_forward.conditional_performance_report
+        )
+    else:
+        conditional_metrics = _available_observation_diagnostic(
+            conditional,
+            periods,
+            risk_free,
+        )
     if available == 0:
         status = ScenarioStatus.NO_VALID_FOLDS
         error = "No available calendar OOS observations were produced."
-    elif walk_forward.calendar_performance_report is None:
+    elif calendar_metrics is None:
         status = ScenarioStatus.ANALYTICS_UNAVAILABLE
-        error = walk_forward.calendar_analytics_error
+        error = calendar_metrics_error
     else:
         status = ScenarioStatus.COMPLETED
         error = None
 
     trade_count = sum(fold.trade_count for fold in walk_forward.folds)
-    total_transaction_cost = 0.0
+    known_cost_components = 0
+    unknown_cost_components = 0
+    known_transaction_cost_total = 0.0
     for fold in walk_forward.folds:
-        if fold.backtest is None or "transaction_cost" not in fold.backtest.accounting:
+        if fold.backtest is None:
             continue
-        total_transaction_cost += float(
-            fold.backtest.accounting["transaction_cost"].sum(skipna=True)
+        accounting = fold.backtest.accounting
+        if "transaction_cost" not in accounting:
+            unknown_cost_components += max(len(accounting), 1)
+            continue
+        costs = pd.to_numeric(accounting["transaction_cost"], errors="coerce")
+        finite = pd.Series(
+            np.isfinite(costs.to_numpy(dtype=float)),
+            index=costs.index,
+            dtype=bool,
         )
+        known = costs.notna() & finite
+        if bool(costs.loc[known].lt(0.0).any()):
+            raise RuntimeError(
+                "Walk-forward accounting produced a negative transaction cost."
+            )
+        known_cost_components += int(known.sum())
+        unknown_cost_components += int((~known).sum())
+        known_transaction_cost_total += float(costs.loc[known].sum())
+    total_transaction_cost = (
+        float("nan")
+        if unknown_cost_components
+        else known_transaction_cost_total
+    )
     return ScenarioResult(
         scenario=scenario,
         status=status,
@@ -705,22 +1073,38 @@ def run_parameter_scenario(
         total_transaction_cost=total_transaction_cost,
         periods_per_year=periods,
         risk_free_rate=risk_free,
+        available_observations_metrics=available_metrics,
+        calendar_metrics_status=calendar_metrics_status,
+        calendar_metrics_error=calendar_metrics_error,
+        common_horizon_analytics_status=MetricAvailabilityStatus.NOT_APPLICABLE,
+        equal_capital_reset_fold_transaction_cost_total=total_transaction_cost,
+        transaction_cost_known_components=known_cost_components,
+        transaction_cost_unknown_components=unknown_cost_components,
     )
 
 
 def _common_horizon(
     results: tuple[ScenarioResult, ...],
-) -> tuple[tuple[ScenarioResult, ...], pd.Index, str | None, int]:
+) -> tuple[
+    tuple[ScenarioResult, ...],
+    pd.Index,
+    int,
+    bool,
+    bool,
+    bool,
+    str | None,
+]:
+    """Apply a structural scheduled-index intersection without dropna selection."""
     comparable = tuple(
         result
         for result in results
         if result.status
         not in {ScenarioStatus.INVALID_CONFIGURATION, ScenarioStatus.FAILED}
-        and bool(result.calendar_oos_returns.notna().any())
+        and len(result.calendar_oos_returns) > 0
     )
     empty_index = pd.Index([], dtype=object)
     if not comparable:
-        error = "No scenario has available calendar observations."
+        error = "No scenario has a scheduled calendar OOS horizon."
         return (
             tuple(
                 replace(
@@ -728,34 +1112,27 @@ def _common_horizon(
                     common_horizon_metrics=None,
                     common_horizon_error=error,
                     common_horizon_returns=pd.Series(dtype=float),
+                    common_horizon_structurally_available=False,
+                    common_horizon_fully_observed=False,
+                    common_horizon_analytics_status=(
+                        MetricAvailabilityStatus.NOT_APPLICABLE
+                    ),
                 )
                 for result in results
             ),
             empty_index,
-            error,
             0,
+            False,
+            False,
+            False,
+            error,
         )
 
-    common = comparable[0].calendar_oos_returns.dropna().index.copy()
+    # Membership depends only on scheduled labels, never on realized returns.
+    common = comparable[0].calendar_oos_returns.index.copy()
     for result in comparable[1:]:
-        available_index = result.calendar_oos_returns.dropna().index
-        common = common[common.isin(available_index)]
-    if len(common) < 2:
-        error = "Fewer than two calendar observations share a common horizon."
-        return (
-            tuple(
-                replace(
-                    result,
-                    common_horizon_metrics=None,
-                    common_horizon_error=error,
-                    common_horizon_returns=pd.Series(dtype=float),
-                )
-                for result in results
-            ),
-            common,
-            error,
-            len(comparable),
-        )
+        common = common[common.isin(result.calendar_oos_returns.index)]
+    structurally_available = len(common) > 0
 
     updated: list[ScenarioResult] = []
     comparable_ids = {result.scenario.scenario_id for result in comparable}
@@ -767,23 +1144,88 @@ def _common_horizon(
                     common_horizon_metrics=None,
                     common_horizon_error="Scenario is unavailable on the common horizon.",
                     common_horizon_returns=pd.Series(dtype=float),
+                    common_horizon_structurally_available=False,
+                    common_horizon_fully_observed=False,
+                    common_horizon_analytics_status=(
+                        MetricAvailabilityStatus.NOT_APPLICABLE
+                    ),
                 )
             )
             continue
-        common_returns = result.calendar_oos_returns.loc[common].copy(deep=True)
+        common_returns = result.calendar_oos_returns.reindex(common).copy(deep=True)
+        fully_observed = bool(len(common_returns)) and not bool(
+            common_returns.isna().any()
+        )
+        metrics, analytics_status, analytics_error = _metrics_from_returns(
+            common_returns,
+            result.periods_per_year,
+            result.risk_free_rate,
+        )
         updated.append(
             replace(
                 result,
-                common_horizon_metrics=_metrics_from_returns(
-                    common_returns,
-                    result.periods_per_year,
-                    result.risk_free_rate,
-                ),
-                common_horizon_error=None,
+                common_horizon_metrics=metrics,
+                common_horizon_error=analytics_error,
                 common_horizon_returns=common_returns,
+                common_horizon_structurally_available=structurally_available,
+                common_horizon_fully_observed=fully_observed,
+                common_horizon_analytics_status=analytics_status,
             )
         )
-    return tuple(updated), common, None, len(comparable)
+
+    comparable_updated = tuple(
+        result
+        for result in updated
+        if result.scenario.scenario_id in comparable_ids
+    )
+    fully_observed = structurally_available and all(
+        result.common_horizon_fully_observed for result in comparable_updated
+    )
+    analytics_available = (
+        len(common) >= 2
+        and fully_observed
+        and all(
+            result.common_horizon_analytics_status
+            is MetricAvailabilityStatus.AVAILABLE
+            for result in comparable_updated
+        )
+    )
+    if not structurally_available:
+        error = "Scenarios have no structurally common scheduled OOS observation."
+    elif len(common) < 2:
+        error = (
+            "The structural common horizon has fewer than two observations; "
+            "cross-scenario analytics are unavailable."
+        )
+    elif not fully_observed:
+        error = (
+            "At least one scenario is unavailable on the structural common "
+            "scheduled horizon."
+        )
+    elif not analytics_available:
+        reasons = sorted(
+            {
+                result.common_horizon_error
+                for result in comparable_updated
+                if result.common_horizon_error is not None
+            }
+        )
+        error = (
+            "Common-horizon analytics are unavailable: " + "; ".join(reasons)
+            if reasons
+            else "Common-horizon analytics are unavailable."
+        )
+    else:
+        error = None
+    return (
+        tuple(updated),
+        common,
+        len(comparable),
+        structurally_available,
+        fully_observed,
+        analytics_available,
+        error,
+    )
 
 
 def _distribution(values: Iterable[float]) -> MetricDistribution:
@@ -827,6 +1269,61 @@ def _defined_fraction(values: Iterable[float], predicate: Callable[[float], bool
     return float(np.mean([predicate(value) for value in defined]))
 
 
+def _empty_fraction(criterion: str) -> MetricFractionSummary:
+    return MetricFractionSummary(
+        criterion=criterion,
+        eligible_scenarios=0,
+        defined_scenarios=0,
+        undefined_scenarios=0,
+        positive_scenarios=0,
+        invalid_scenarios=0,
+        failed_scenarios=0,
+        positive_fraction_defined=float("nan"),
+        positive_fraction_all_eligible=float("nan"),
+    )
+
+
+def _fraction_summary(
+    results: tuple[ScenarioResult, ...],
+    metrics: tuple[PerformanceMetrics, ...],
+    attribute: str,
+    predicate: Callable[[float], bool],
+    criterion: str,
+) -> MetricFractionSummary:
+    eligible = sum(
+        result.status
+        not in {ScenarioStatus.INVALID_CONFIGURATION, ScenarioStatus.FAILED}
+        for result in results
+    )
+    defined_values = tuple(
+        float(getattr(metric, attribute))
+        for metric in metrics
+        if np.isfinite(float(getattr(metric, attribute)))
+    )
+    positive = sum(predicate(value) for value in defined_values)
+    invalid = sum(
+        result.status is ScenarioStatus.INVALID_CONFIGURATION for result in results
+    )
+    failed = sum(result.status is ScenarioStatus.FAILED for result in results)
+    return MetricFractionSummary(
+        criterion=criterion,
+        eligible_scenarios=eligible,
+        defined_scenarios=len(defined_values),
+        undefined_scenarios=eligible - len(defined_values),
+        positive_scenarios=positive,
+        invalid_scenarios=invalid,
+        failed_scenarios=failed,
+        positive_fraction_defined=(
+            float(positive / len(defined_values))
+            if defined_values
+            else float("nan")
+        ),
+        positive_fraction_all_eligible=(
+            float(positive / eligible) if eligible else float("nan")
+        ),
+    )
+
+
 def _parameter_ranges(results: tuple[ScenarioResult, ...]) -> ParameterRanges:
     values: dict[str, tuple[Any, ...]] = {}
     for name in _PARAMETER_NAMES:
@@ -836,12 +1333,74 @@ def _parameter_ranges(results: tuple[ScenarioResult, ...]) -> ParameterRanges:
     return ParameterRanges(**values)
 
 
-def _is_neighbor(candidate: ParameterScenario, baseline: ParameterScenario) -> bool:
-    differences = sum(
-        getattr(candidate, name) != getattr(baseline, name)
+def _changed_parameters(
+    candidate: ParameterScenario,
+    baseline: ParameterScenario,
+) -> tuple[str, ...]:
+    return tuple(
+        name
         for name in _PARAMETER_NAMES
+        if getattr(candidate, name) != getattr(baseline, name)
     )
-    return differences == 1
+
+
+def _axis_metadata(
+    ranges: ParameterRanges,
+) -> tuple[ParameterAxisMetadata, ...]:
+    axes: list[ParameterAxisMetadata] = []
+    for name in _PARAMETER_NAMES:
+        values = tuple(getattr(ranges, name))
+        spacing = tuple(
+            float(values[position + 1]) - float(values[position])
+            for position in range(len(values) - 1)
+        )
+        axes.append(
+            ParameterAxisMetadata(
+                parameter=name,
+                tested_values=values,
+                count=len(values),
+                numeric_spacing=spacing,
+            )
+        )
+    return tuple(axes)
+
+
+def _local_neighbors(
+    variants: tuple[ScenarioResult, ...],
+    baseline: ParameterScenario,
+    ranges: ParameterRanges,
+) -> tuple[LocalNeighbor, ...]:
+    local: list[LocalNeighbor] = []
+    for result in variants:
+        changed_parameter = _changed_parameters(result.scenario, baseline)[0]
+        values = tuple(getattr(ranges, changed_parameter))
+        baseline_value = getattr(baseline, changed_parameter)
+        baseline_position = values.index(baseline_value)
+        adjacent: set[int | float] = set()
+        if baseline_position > 0:
+            adjacent.add(values[baseline_position - 1])
+        if baseline_position + 1 < len(values):
+            adjacent.add(values[baseline_position + 1])
+        neighbor_value = getattr(result.scenario, changed_parameter)
+        if neighbor_value not in adjacent:
+            continue
+        absolute = abs(float(neighbor_value) - float(baseline_value))
+        relative = (
+            absolute / abs(float(baseline_value))
+            if float(baseline_value) != 0.0
+            else float("nan")
+        )
+        local.append(
+            LocalNeighbor(
+                scenario_id=result.scenario.scenario_id,
+                changed_parameter=changed_parameter,
+                baseline_value=baseline_value,
+                neighbor_value=neighbor_value,
+                absolute_distance=absolute,
+                relative_distance=relative,
+            )
+        )
+    return tuple(sorted(local, key=lambda item: (item.changed_parameter, item.neighbor_value, item.scenario_id)))
 
 
 def summarize_sensitivity(
@@ -850,12 +1409,16 @@ def summarize_sensitivity(
     *,
     drawdown_severity_threshold: float = -0.20,
 ) -> SensitivitySummary:
-    """Summarize medians, quartiles, coverage, and baseline neighbors."""
+    """Summarize comparable common-horizon diagnostics without selection."""
     results = tuple(scenario_results)
     if not results:
         raise ValueError("scenario_results must not be empty.")
     if any(not isinstance(result, ScenarioResult) for result in results):
         raise TypeError("scenario_results must contain ScenarioResult values.")
+    scenario_ids = tuple(result.scenario.scenario_id for result in results)
+    if len(scenario_ids) != len(set(scenario_ids)):
+        raise ValueError("Scenario result IDs must be unique.")
+    _require_unique_parameter_tuples(result.scenario for result in results)
     matches = [
         result for result in results if result.scenario.scenario_id == baseline_scenario_id
     ]
@@ -869,42 +1432,91 @@ def summarize_sensitivity(
         raise ValueError("drawdown_severity_threshold must lie in [-1, 0].")
 
     baseline_result = matches[0]
-    metric_values = tuple(
-        result.calendar_metrics
+    eligible_results = tuple(
+        result
         for result in results
-        if result.calendar_metrics is not None
-        and result.status
+        if result.status
         not in {ScenarioStatus.INVALID_CONFIGURATION, ScenarioStatus.FAILED}
     )
-    metrics = tuple(metric for metric in metric_values if metric is not None)
-    neighbors = tuple(
+    all_common_available = bool(eligible_results) and all(
+        result.common_horizon_metrics is not None
+        and result.common_horizon_analytics_status
+        in {
+            MetricAvailabilityStatus.AVAILABLE,
+            # Compatibility for explicitly constructed ScenarioResult fixtures.
+            MetricAvailabilityStatus.NOT_APPLICABLE,
+        }
+        for result in eligible_results
+    )
+    metrics = (
+        tuple(
+            result.common_horizon_metrics
+            for result in eligible_results
+            if result.common_horizon_metrics is not None
+        )
+        if all_common_available
+        else ()
+    )
+    native_metrics = tuple(
+        result.calendar_metrics
+        for result in eligible_results
+        if result.calendar_metrics is not None
+    )
+    variants = tuple(
         result
         for result in results
         if result.scenario.scenario_id != baseline_scenario_id
-        and _is_neighbor(result.scenario, baseline_result.scenario)
+        and len(_changed_parameters(result.scenario, baseline_result.scenario)) == 1
     )
-    neighbor_metrics = tuple(
-        result.calendar_metrics
-        for result in neighbors
-        if result.calendar_metrics is not None
-        and result.status
-        not in {ScenarioStatus.INVALID_CONFIGURATION, ScenarioStatus.FAILED}
+    variant_metrics = tuple(
+        result.common_horizon_metrics
+        for result in variants
+        if all_common_available and result.common_horizon_metrics is not None
     )
-    defined_neighbor_metrics = tuple(
-        metric for metric in neighbor_metrics if metric is not None
-    )
+    ranges = _parameter_ranges(results)
+    local = _local_neighbors(variants, baseline_result.scenario, ranges)
     baseline_total = (
         float("nan")
-        if baseline_result.calendar_metrics is None
-        else baseline_result.calendar_metrics.total_return
+        if not all_common_available
+        or baseline_result.common_horizon_metrics is None
+        else baseline_result.common_horizon_metrics.total_return
     )
     if np.isfinite(baseline_total):
         same_sign = _defined_fraction(
-            (metric.total_return for metric in defined_neighbor_metrics),
+            (metric.total_return for metric in variant_metrics),
             lambda value: np.sign(value) == np.sign(baseline_total),
         )
     else:
         same_sign = float("nan")
+
+    total_fraction = _fraction_summary(
+        results,
+        metrics,
+        "total_return",
+        lambda value: value > 0.0,
+        "total_return > 0",
+    )
+    annual_fraction = _fraction_summary(
+        results,
+        metrics,
+        "annualized_return",
+        lambda value: value > 0.0,
+        "annualized_return > 0",
+    )
+    sharpe_fraction = _fraction_summary(
+        results,
+        metrics,
+        "sharpe_ratio",
+        lambda value: value > 0.0,
+        "sharpe_ratio > 0",
+    )
+    drawdown_fraction = _fraction_summary(
+        results,
+        metrics,
+        "maximum_drawdown",
+        lambda value: value >= threshold,
+        "maximum_drawdown >= drawdown_severity_threshold",
+    )
 
     return SensitivitySummary(
         scenario_count=len(results),
@@ -923,34 +1535,88 @@ def summarize_sensitivity(
             result.status is ScenarioStatus.FAILED for result in results
         ),
         baseline_scenario_id=baseline_scenario_id,
-        baseline_metrics=baseline_result.calendar_metrics,
+        baseline_metrics=(
+            baseline_result.common_horizon_metrics
+            if all_common_available
+            else None
+        ),
         metric_distributions=_distributions(metrics),
-        fraction_positive_total_return=_defined_fraction(
-            (metric.total_return for metric in metrics),
-            lambda value: value > 0.0,
+        fraction_positive_total_return=total_fraction.positive_fraction_defined,
+        fraction_positive_annualized_return=(
+            annual_fraction.positive_fraction_defined
         ),
-        fraction_positive_annualized_return=_defined_fraction(
-            (metric.annualized_return for metric in metrics),
-            lambda value: value > 0.0,
-        ),
-        fraction_positive_sharpe=_defined_fraction(
-            (metric.sharpe_ratio for metric in metrics),
-            lambda value: value > 0.0,
-        ),
+        fraction_positive_sharpe=sharpe_fraction.positive_fraction_defined,
         drawdown_severity_threshold=threshold,
-        fraction_drawdown_no_worse_than_threshold=_defined_fraction(
-            (metric.maximum_drawdown for metric in metrics),
-            lambda value: value >= threshold,
+        fraction_drawdown_no_worse_than_threshold=(
+            drawdown_fraction.positive_fraction_defined
         ),
-        parameter_ranges=_parameter_ranges(results),
-        baseline_neighbor_count=len(neighbors),
-        neighbor_metric_distributions=_distributions(defined_neighbor_metrics),
+        parameter_ranges=ranges,
+        baseline_neighbor_count=len(variants),
+        neighbor_metric_distributions=_distributions(variant_metrics),
         fraction_neighbors_same_total_return_sign=same_sign,
         fraction_neighbors_positive_sharpe=_defined_fraction(
-            (metric.sharpe_ratio for metric in defined_neighbor_metrics),
+            (metric.sharpe_ratio for metric in variant_metrics),
             lambda value: value > 0.0,
         ),
+        headline_metrics_available=all_common_available,
+        baseline_native_metrics=baseline_result.calendar_metrics,
+        native_metric_distributions=_distributions(native_metrics),
+        total_return_fraction=total_fraction,
+        annualized_return_fraction=annual_fraction,
+        sharpe_fraction=sharpe_fraction,
+        drawdown_fraction=drawdown_fraction,
+        one_parameter_variant_count=len(variants),
+        variant_metric_distributions=_distributions(variant_metrics),
+        variant_sign_agreement=same_sign,
+        variant_positive_sharpe_fraction=_defined_fraction(
+            (metric.sharpe_ratio for metric in variant_metrics),
+            lambda value: value > 0.0,
+        ),
+        local_neighbor_count=len(local),
+        local_neighbors=local,
     )
+
+
+def _provenance_summary(
+    results: tuple[ScenarioResult, ...],
+) -> tuple[tuple[str, ...], tuple[str, ...], bool, tuple[str, ...]]:
+    walk_forward_results = tuple(
+        result.walk_forward_result
+        for result in results
+        if result.walk_forward_result is not None
+    )
+    universe = tuple(
+        sorted({result.universe_provenance for result in walk_forward_results})
+    )
+    cleaning = tuple(
+        sorted({result.cleaning_provenance for result in walk_forward_results})
+    )
+    validation_states = {
+        bool(result.point_in_time_universe_validated)
+        for result in walk_forward_results
+    }
+    validated = bool(walk_forward_results) and validation_states == {True}
+    warnings = {
+        warning
+        for result in walk_forward_results
+        for warning in result.provenance_warnings
+    }
+    if len(universe) > 1:
+        warnings.add(
+            "Scenarios report conflicting universe provenance states: "
+            f"{universe}."
+        )
+    if len(cleaning) > 1:
+        warnings.add(
+            "Scenarios report conflicting cleaning provenance states: "
+            f"{cleaning}."
+        )
+    if len(validation_states) > 1:
+        warnings.add(
+            "Scenarios conflict on point-in-time universe validation; the "
+            "top-level result is conservatively not validated."
+        )
+    return universe, cleaning, validated, tuple(sorted(warnings))
 
 
 def run_sensitivity_analysis(
@@ -979,6 +1645,7 @@ def run_sensitivity_analysis(
         raise ValueError("scenario IDs must be unique.")
     if ids.count(baseline_scenario_id) != 1:
         raise ValueError("baseline_scenario_id must identify exactly one scenario.")
+    _require_unique_parameter_tuples(scenario_tuple)
     baseline = scenario_tuple[ids.index(baseline_scenario_id)]
     baseline_error = _configuration_error(baseline)
     if baseline_error is not None:
@@ -988,6 +1655,15 @@ def run_sensitivity_analysis(
     shared = _normalized_shared_arguments(walk_forward_kwargs)
     owned_prices = prices.copy(deep=True)
     owned_prices.attrs = deepcopy(prices.attrs)
+    ordered_scenarios = tuple(
+        sorted(scenario_tuple, key=lambda scenario: scenario.scenario_id)
+    )
+    if callable(normalized_groups):
+        normalized_groups = _snapshotted_group_provider(
+            owned_prices,
+            ordered_scenarios,
+            normalized_groups,
+        )
     raw_results = tuple(
         run_parameter_scenario(
             owned_prices,
@@ -995,11 +1671,17 @@ def run_sensitivity_analysis(
             groups=normalized_groups,
             walk_forward_kwargs=shared,
         )
-        for scenario in scenario_tuple
+        for scenario in ordered_scenarios
     )
-    common_results, common_index, common_error, comparable_count = _common_horizon(
-        raw_results
-    )
+    (
+        common_results,
+        common_index,
+        comparable_count,
+        structurally_available,
+        fully_observed,
+        analytics_available,
+        common_error,
+    ) = _common_horizon(raw_results)
     summary = summarize_sensitivity(
         common_results,
         baseline_scenario_id,
@@ -1010,6 +1692,45 @@ def run_sensitivity_analysis(
         for result in common_results
         if result.scenario.scenario_id == baseline_scenario_id
     )
+    ranges = _parameter_ranges(common_results)
+    axes = _axis_metadata(ranges)
+    tested_dimensions = tuple(
+        axis.parameter for axis in axes if axis.count > 1
+    )
+    untested_dimensions = tuple(
+        dimension
+        for dimension in _MATERIAL_DIMENSIONS
+        if dimension not in tested_dimensions
+    )
+    universe, cleaning, point_in_time_validated, provenance_warnings = (
+        _provenance_summary(common_results)
+    )
+    if analytics_available:
+        common_analytics_status = MetricAvailabilityStatus.AVAILABLE
+    elif structurally_available and len(common_index) < 2:
+        common_analytics_status = (
+            MetricAvailabilityStatus.UNAVAILABLE_INSUFFICIENT_OBSERVATIONS
+        )
+    elif structurally_available and not fully_observed:
+        common_analytics_status = (
+            MetricAvailabilityStatus.UNAVAILABLE_PARTIAL_CALENDAR
+        )
+    elif structurally_available:
+        unavailable_statuses = tuple(
+            result.common_horizon_analytics_status
+            for result in common_results
+            if result.common_horizon_analytics_status
+            is not MetricAvailabilityStatus.AVAILABLE
+            and result.status
+            not in {ScenarioStatus.INVALID_CONFIGURATION, ScenarioStatus.FAILED}
+        )
+        common_analytics_status = (
+            unavailable_statuses[0]
+            if unavailable_statuses
+            else MetricAvailabilityStatus.NOT_APPLICABLE
+        )
+    else:
+        common_analytics_status = MetricAvailabilityStatus.NOT_APPLICABLE
     return RobustnessResult(
         scenarios=common_results,
         baseline_scenario_id=baseline_scenario_id,
@@ -1020,10 +1741,22 @@ def run_sensitivity_analysis(
         common_horizon_observations=len(common_index),
         common_horizon_scenario_count=comparable_count,
         common_horizon_excluded_scenarios=len(common_results) - comparable_count,
-        common_horizon_available=common_error is None,
+        common_horizon_available=analytics_available,
         common_horizon_error=common_error,
         purpose=PURPOSE,
         warning=NO_OPTIMIZATION_WARNING,
+        common_horizon_structurally_available=structurally_available,
+        common_horizon_fully_observed=fully_observed,
+        common_horizon_analytics_available=analytics_available,
+        common_horizon_analytics_status=common_analytics_status,
+        common_horizon_analytics_error=common_error,
+        axis_metadata=axes,
+        tested_dimensions=tested_dimensions,
+        untested_material_dimensions=untested_dimensions,
+        universe_provenance=universe,
+        cleaning_provenance=cleaning,
+        point_in_time_universe_validated=point_in_time_validated,
+        provenance_warnings=provenance_warnings,
     )
 
 
@@ -1037,7 +1770,8 @@ def sensitivity_table(result: RobustnessResult) -> pd.DataFrame:
         key=lambda item: item.scenario.scenario_id,
     ):
         scenario = scenario_result.scenario
-        metrics = scenario_result.calendar_metrics
+        metrics = scenario_result.common_horizon_metrics
+        native_metrics = scenario_result.calendar_metrics
         rows.append(
             {
                 "scenario_id": scenario.scenario_id,
@@ -1054,23 +1788,48 @@ def sensitivity_table(result: RobustnessResult) -> pd.DataFrame:
                 "borrow_rate_y": scenario.borrow_rate_y,
                 "borrow_rate_x": scenario.borrow_rate_x,
                 "status": scenario_result.status.value,
-                "calendar_total_return": (
+                "calendar_metrics_status": scenario_result.calendar_metrics_status.value,
+                "common_horizon_analytics_status": (
+                    scenario_result.common_horizon_analytics_status.value
+                ),
+                "headline_common_total_return": (
                     np.nan if metrics is None else metrics.total_return
                 ),
-                "annualized_return": (
+                "headline_common_annualized_return": (
                     np.nan if metrics is None else metrics.annualized_return
                 ),
-                "annualized_volatility": (
+                "headline_common_annualized_volatility": (
                     np.nan if metrics is None else metrics.annualized_volatility
                 ),
-                "sharpe_ratio": np.nan if metrics is None else metrics.sharpe_ratio,
-                "sortino_ratio": np.nan if metrics is None else metrics.sortino_ratio,
-                "maximum_drawdown": (
+                "headline_common_sharpe_ratio": (
+                    np.nan if metrics is None else metrics.sharpe_ratio
+                ),
+                "headline_common_sortino_ratio": (
+                    np.nan if metrics is None else metrics.sortino_ratio
+                ),
+                "headline_common_maximum_drawdown": (
                     np.nan if metrics is None else metrics.maximum_drawdown
                 ),
-                "calmar_ratio": np.nan if metrics is None else metrics.calmar_ratio,
+                "headline_common_calmar_ratio": (
+                    np.nan if metrics is None else metrics.calmar_ratio
+                ),
+                "native_calendar_total_return": (
+                    np.nan
+                    if native_metrics is None
+                    else native_metrics.total_return
+                ),
                 "trade_count": scenario_result.trade_count,
                 "total_transaction_cost": scenario_result.total_transaction_cost,
+                "equal_capital_reset_fold_transaction_cost_total": (
+                    scenario_result.equal_capital_reset_fold_transaction_cost_total
+                ),
+                "transaction_cost_known_components": (
+                    scenario_result.transaction_cost_known_components
+                ),
+                "transaction_cost_unknown_components": (
+                    scenario_result.transaction_cost_unknown_components
+                ),
+                "transaction_cost_basis": scenario_result.transaction_cost_basis,
                 "selection_coverage": scenario_result.selection_coverage,
                 "scheduled_oos_observations": (
                     scenario_result.scheduled_oos_observations

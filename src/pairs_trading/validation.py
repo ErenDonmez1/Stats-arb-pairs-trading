@@ -8,9 +8,11 @@ historical statistical evidence as proof of future profitability.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import date, datetime
 from enum import Enum
 from math import ceil
 from numbers import Integral, Real
+import sys
 from typing import Any
 
 import numpy as np
@@ -18,13 +20,14 @@ import pandas as pd
 from scipy.stats import kurtosis, norm, skew
 
 from .analytics import (
+    NEAR_ZERO_TOLERANCE,
     annualized_return,
     annualized_volatility,
     maximum_drawdown,
     sharpe_ratio,
     total_return,
 )
-from .robustness import RobustnessResult, ScenarioStatus
+from .robustness import MetricAvailabilityStatus, RobustnessResult, ScenarioStatus
 from .walkforward import WalkForwardResult, WalkForwardStatus
 
 
@@ -62,8 +65,12 @@ PSR_CONVENTION = (
 )
 BOOTSTRAP_INTERPRETATION = (
     "Percentile intervals are empirical moving-block resampling uncertainty "
-    "intervals conditional on the supplied OOS sample and block assumptions; "
-    "they are not parametric confidence intervals for future performance."
+    "intervals conditional on the supplied OOS sample and block assumptions. "
+    "Validity assumes the observed OOS history is informative about local "
+    "dependence, the caller-declared block length adequately represents that "
+    "dependence, and approximate stationarity/mixing conditions are reasonable. "
+    "Row adjacency, not elapsed calendar time, defines a block. These empirical "
+    "diagnostics are not guarantees of future performance."
 )
 REGIME_PROVENANCE_WARNING = (
     "Regime labels are caller-supplied and their causal provenance is not "
@@ -76,7 +83,8 @@ MULTIPLE_TESTING_WARNING = (
 )
 VALIDATION_WARNINGS = (
     "OOS data remain a finite historical sample.",
-    "The moving-block bootstrap assumes observed history contains useful information about future local dependence.",
+    "Moving-block inference assumes observed OOS history is informative about future local dependence, approximate stationarity/mixing is reasonable, and the caller-declared block length adequately represents row-adjacent dependence.",
+    "Bootstrap intervals are empirical resampling diagnostics and do not guarantee future performance.",
     "Parameter-grid scenarios are dependent, so multiplicity adjustments remain diagnostic.",
     "Repeated research iterations create researcher degrees of freedom not fully captured by the formal test count.",
     "Point-in-time universe and cleaning provenance remain caller-supplied under current project limitations.",
@@ -117,6 +125,10 @@ class BootstrapMetricResult:
     undefined_replicates: int
     valid_fraction: float
     error: str | None
+    conditional_bootstrap_median: float | None
+    conditional_interval: ConfidenceInterval | None
+    conditional_status: ValidationAvailability
+    primary_interval_is_unconditional: bool
 
 
 @dataclass(frozen=True)
@@ -131,6 +143,10 @@ class BootstrapPerformanceResult:
     random_seed: int
     confidence_level: float
     minimum_valid_fraction: float
+    possible_block_starts: int
+    effective_unique_replicates: int
+    inference_design_status: ValidationAvailability
+    inference_design_error: str | None
     total_return: BootstrapMetricResult
     annualized_return: BootstrapMetricResult
     annualized_volatility: BootstrapMetricResult
@@ -161,6 +177,8 @@ class ProbabilisticSharpeResult:
     skewness: float
     ordinary_kurtosis: float
     variance_term: float
+    statistic: float
+    one_sided_pvalue: float
     error: str | None
     convention: str = PSR_CONVENTION
 
@@ -193,6 +211,8 @@ class FoldPerformance:
     annualized_volatility: float
     sharpe_ratio: float
     trade_count: int
+    catastrophic: bool
+    invalid_return: bool
     error: str | None
 
 
@@ -200,6 +220,7 @@ class FoldPerformance:
 class FoldConsistencyMetrics:
     """Temporal fold dispersion and positive-contribution concentration."""
 
+    status: ValidationAvailability
     folds: tuple[FoldPerformance, ...]
     fold_count: int
     observable_fold_count: int
@@ -207,6 +228,12 @@ class FoldConsistencyMetrics:
     negative_return_fold_count: int
     zero_return_no_selection_fold_count: int
     unavailable_fold_count: int
+    analytically_available_fold_count: int
+    insufficient_data_fold_count: int
+    catastrophic_fold_count: int
+    catastrophic_fold_ids: tuple[int, ...]
+    invalid_return_fold_count: int
+    summaries_complete: bool
     fraction_observable_folds_positive: float
     median_fold_total_return: float
     lower_quartile_fold_total_return: float
@@ -250,6 +277,8 @@ class RegimeConsistencyMetrics:
     zero_regime_count: int
     worst_regime: Any | None
     strongest_regime_positive_contribution_concentration: float
+    contribution_basis: str
+    contribution_warning: str
     returns: pd.Series
     regime_labels: pd.Series
     point_in_time_regime_labels_validated: bool
@@ -295,6 +324,10 @@ class MultipleTestingDiagnostics:
     failed_configurations: int
     valid_pvalue_count: int
     unavailable_pvalue_count: int
+    eligible_hypothesis_count: int
+    finite_pvalue_count: int
+    unavailable_eligible_hypothesis_count: int
+    family_size: int
     tested_dimension_count: int
     parameter_axis_counts: tuple[ParameterAxisCount, ...]
     significance_level: float
@@ -372,18 +405,29 @@ def _validated_returns(returns: pd.Series) -> pd.Series:
     if not returns.index.is_unique:
         raise ValueError("returns must have a unique index.")
     nonmissing = returns.loc[returns.notna()]
-    if any(isinstance(value, (bool, np.bool_)) for value in nonmissing):
-        raise ValueError("Non-missing returns must be real numeric values.")
-    try:
-        numeric = pd.to_numeric(returns, errors="raise").astype(float)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Non-missing returns must be real numeric values.") from exc
+    if any(
+        isinstance(value, (bool, np.bool_)) or not isinstance(value, Real)
+        for value in nonmissing.tolist()
+    ):
+        raise ValueError(
+            "Non-missing returns must already be non-Boolean real numeric values."
+        )
+    numeric = returns.astype(float)
     finite = numeric.dropna().to_numpy(dtype=float)
     if not np.isfinite(finite).all():
         raise ValueError("Non-missing returns must be finite.")
     numeric.index = returns.index
     numeric.name = returns.name
     return numeric.copy(deep=True)
+
+
+def _require_bootstrap_chronology(returns: pd.Series) -> None:
+    """Require deterministic chronological row order without sorting input."""
+    if not returns.index.is_monotonic_increasing:
+        raise ValueError(
+            "Bootstrap returns must have a monotonically increasing index; "
+            "input is not silently sorted."
+        )
 
 
 def _unavailable_metric(
@@ -402,6 +446,10 @@ def _unavailable_metric(
         undefined_replicates=total_replicates,
         valid_fraction=0.0,
         error=error,
+        conditional_bootstrap_median=None,
+        conditional_interval=None,
+        conditional_status=ValidationAvailability.UNAVAILABLE,
+        primary_interval_is_unconditional=False,
     )
 
 
@@ -413,6 +461,7 @@ def moving_block_bootstrap(
 ) -> pd.DataFrame:
     """Return deterministic moving-block resamples using a local NumPy RNG."""
     values = _validated_returns(returns)
+    _require_bootstrap_chronology(values)
     if bool(values.isna().any()):
         raise ValueError("returns must not contain missing values for bootstrap inference.")
     if values.empty:
@@ -446,29 +495,49 @@ def _metric_values(
     periods_per_year: int,
     risk_free_rate: float,
 ) -> dict[str, float]:
-    functions = {
-        "total_return": lambda: total_return(returns, missing_policy="drop"),
-        "annualized_return": lambda: annualized_return(
-            returns, periods_per_year, missing_policy="drop"
-        ),
-        "annualized_volatility": lambda: annualized_volatility(
-            returns, periods_per_year, missing_policy="drop"
-        ),
-        "sharpe_ratio": lambda: sharpe_ratio(
-            returns, periods_per_year, risk_free_rate, missing_policy="drop"
-        ),
-        "maximum_drawdown": lambda: maximum_drawdown(
-            returns, missing_policy="drop"
-        ),
+    """Calculate metrics after handling only documented mathematical gaps."""
+    values = _validated_returns(returns)
+    if bool(values.isna().any()):
+        raise ValueError("Metric inputs must not contain missing observations.")
+    results = {name: float("nan") for name in _METRIC_NAMES}
+    if values.empty:
+        return results
+
+    compoundable = not bool(values.le(-1.0).any())
+    if compoundable:
+        results["total_return"] = float(
+            total_return(values, missing_policy="drop")
+        )
+        results["annualized_return"] = float(
+            annualized_return(
+                values,
+                periods_per_year,
+                missing_policy="drop",
+            )
+        )
+        results["maximum_drawdown"] = float(
+            maximum_drawdown(values, missing_policy="drop")
+        )
+    if len(values) >= 2:
+        results["annualized_volatility"] = float(
+            annualized_volatility(
+                values,
+                periods_per_year,
+                missing_policy="drop",
+            )
+        )
+        results["sharpe_ratio"] = float(
+            sharpe_ratio(
+                values,
+                periods_per_year,
+                risk_free_rate,
+                missing_policy="drop",
+            )
+        )
+    return {
+        name: value if np.isfinite(value) else float("nan")
+        for name, value in results.items()
     }
-    results: dict[str, float] = {}
-    for name, function in functions.items():
-        try:
-            value = float(function())
-        except (ValueError, FloatingPointError, ArithmeticError):
-            value = float("nan")
-        results[name] = value if np.isfinite(value) else float("nan")
-    return results
 
 
 def bootstrap_performance_metrics(
@@ -484,6 +553,7 @@ def bootstrap_performance_metrics(
 ) -> BootstrapPerformanceResult:
     """Estimate empirical metric uncertainty with moving contiguous blocks."""
     values = _validated_returns(returns)
+    _require_bootstrap_chronology(values)
     block = _integer(block_length, "block_length")
     replicates = _integer(n_bootstrap, "n_bootstrap")
     seed = _integer(random_seed, "random_seed", minimum=0)
@@ -524,6 +594,10 @@ def bootstrap_performance_metrics(
             random_seed=seed,
             confidence_level=confidence,
             minimum_valid_fraction=valid_minimum,
+            possible_block_starts=max(len(values) - block + 1, 0),
+            effective_unique_replicates=0,
+            inference_design_status=overall_status,
+            inference_design_error=error,
             original_returns=values,
             bootstrap_samples=empty_samples,
             replicate_metrics=empty_metrics,
@@ -533,6 +607,34 @@ def bootstrap_performance_metrics(
         raise ValueError("block_length must not exceed the number of observations.")
 
     samples = moving_block_bootstrap(values, block, replicates, seed)
+    possible_block_starts = len(values) - block + 1
+    effective_unique_replicates = int(
+        np.unique(samples.to_numpy(dtype=float), axis=0).shape[0]
+    )
+    if len(values) < 2:
+        design_status = ValidationAvailability.INSUFFICIENT_DATA
+        design_error = (
+            "At least two observations are required for bootstrap interval inference."
+        )
+    elif replicates < 2:
+        design_status = ValidationAvailability.UNAVAILABLE
+        design_error = (
+            "At least two bootstrap replicates are required for interval inference."
+        )
+    elif possible_block_starts < 2:
+        design_status = ValidationAvailability.UNAVAILABLE
+        design_error = (
+            "The block design has only one possible source block and no "
+            "inferential resampling diversity."
+        )
+    elif effective_unique_replicates < 2:
+        design_status = ValidationAvailability.UNAVAILABLE
+        design_error = (
+            "Generated replicates contain fewer than two distinct return paths."
+        )
+    else:
+        design_status = ValidationAvailability.AVAILABLE
+        design_error = None
     point = _metric_values(values, periods, risk_free)
     replicate_rows = []
     for row in samples.to_numpy(dtype=float):
@@ -548,8 +650,21 @@ def bootstrap_performance_metrics(
         valid_count = len(valid)
         undefined_count = replicates - valid_count
         point_estimate = point[name]
-        available = valid_count >= minimum_valid_count and np.isfinite(point_estimate)
-        if available:
+        enough_finite = valid_count >= minimum_valid_count
+        point_available = bool(np.isfinite(point_estimate))
+        primary_available = (
+            design_status is ValidationAvailability.AVAILABLE
+            and enough_finite
+            and point_available
+            and undefined_count == 0
+        )
+        conditional_available = (
+            design_status is ValidationAvailability.AVAILABLE
+            and enough_finite
+            and point_available
+            and undefined_count > 0
+        )
+        if primary_available:
             interval = ConfidenceInterval(
                 lower=float(valid.quantile(alpha)),
                 upper=float(valid.quantile(1.0 - alpha)),
@@ -561,12 +676,37 @@ def bootstrap_performance_metrics(
         else:
             interval = None
             median = float("nan")
-            status = ValidationAvailability.UNAVAILABLE
-            error = (
-                "The point estimate is undefined."
-                if not np.isfinite(point_estimate)
-                else "Too few valid bootstrap replicates for the requested minimum fraction."
+            status = (
+                ValidationAvailability.INSUFFICIENT_DATA
+                if design_status is ValidationAvailability.INSUFFICIENT_DATA
+                else ValidationAvailability.UNAVAILABLE
             )
+            if not point_available:
+                error = "The point estimate is undefined."
+            elif design_status is not ValidationAvailability.AVAILABLE:
+                error = design_error
+            elif undefined_count:
+                error = (
+                    "Primary inference is unavailable because one or more "
+                    "replicates have undefined metric values."
+                )
+            else:
+                error = (
+                    "Too few valid bootstrap replicates for the requested "
+                    "minimum fraction."
+                )
+        if conditional_available:
+            conditional_interval = ConfidenceInterval(
+                lower=float(valid.quantile(alpha)),
+                upper=float(valid.quantile(1.0 - alpha)),
+                confidence_level=confidence,
+            )
+            conditional_median = float(valid.median())
+            conditional_status = ValidationAvailability.AVAILABLE
+        else:
+            conditional_interval = None
+            conditional_median = None
+            conditional_status = ValidationAvailability.UNAVAILABLE
         metric_results[name] = BootstrapMetricResult(
             metric=name,
             point_estimate=point_estimate,
@@ -578,15 +718,20 @@ def bootstrap_performance_metrics(
             undefined_replicates=undefined_count,
             valid_fraction=float(valid_count / replicates),
             error=error,
+            conditional_bootstrap_median=conditional_median,
+            conditional_interval=conditional_interval,
+            conditional_status=conditional_status,
+            primary_interval_is_unconditional=primary_available,
         )
-    overall = (
-        ValidationAvailability.AVAILABLE
-        if all(
-            metric_results[name].status is ValidationAvailability.AVAILABLE
-            for name in _METRIC_NAMES
-        )
-        else ValidationAvailability.UNAVAILABLE
-    )
+    if all(
+        metric_results[name].status is ValidationAvailability.AVAILABLE
+        for name in _METRIC_NAMES
+    ):
+        overall = ValidationAvailability.AVAILABLE
+    elif design_status is ValidationAvailability.INSUFFICIENT_DATA:
+        overall = ValidationAvailability.INSUFFICIENT_DATA
+    else:
+        overall = ValidationAvailability.UNAVAILABLE
     return BootstrapPerformanceResult(
         status=overall,
         error=(None if overall is ValidationAvailability.AVAILABLE else "One or more bootstrap metrics are unavailable."),
@@ -596,6 +741,10 @@ def bootstrap_performance_metrics(
         random_seed=seed,
         confidence_level=confidence,
         minimum_valid_fraction=valid_minimum,
+        possible_block_starts=possible_block_starts,
+        effective_unique_replicates=effective_unique_replicates,
+        inference_design_status=design_status,
+        inference_design_error=design_error,
         original_returns=values,
         bootstrap_samples=samples,
         replicate_metrics=replicate_metrics,
@@ -621,6 +770,8 @@ def _unavailable_psr(
         skewness=float("nan"),
         ordinary_kurtosis=float("nan"),
         variance_term=float("nan"),
+        statistic=float("nan"),
+        one_sided_pvalue=float("nan"),
         error=error,
     )
 
@@ -639,6 +790,13 @@ def probabilistic_sharpe_ratio(
     risk_free = _finite_real(risk_free_rate, "risk_free_rate")
     if risk_free <= -1.0:
         raise ValueError("risk_free_rate must be greater than -1.")
+    if bool(values.le(-1.0).any()):
+        return _unavailable_psr(
+            len(values),
+            benchmark,
+            "PSR inference is unavailable because at least one return is at "
+            "or below -100%; catastrophic observations were retained.",
+        )
     if bool(values.isna().any()):
         return _unavailable_psr(
             len(values), benchmark,
@@ -654,7 +812,11 @@ def probabilistic_sharpe_ratio(
     period_risk_free = float(np.expm1(np.log1p(risk_free) / periods))
     excess = array - period_risk_free
     volatility = float(np.std(excess, ddof=1))
-    if not np.isfinite(volatility) or np.isclose(volatility, 0.0, rtol=1e-12, atol=1e-15):
+    scale = max(1.0, float(np.max(np.abs(excess))))
+    if (
+        not np.isfinite(volatility)
+        or abs(volatility) <= NEAR_ZERO_TOLERANCE * scale
+    ):
         return _unavailable_psr(len(values), benchmark, "Observed Sharpe is undefined because return volatility is zero.")
     observed_period = float(np.mean(excess) / volatility)
     benchmark_period = float(benchmark / np.sqrt(periods))
@@ -682,6 +844,8 @@ def probabilistic_sharpe_ratio(
             skewness=skewness,
             ordinary_kurtosis=ordinary_kurtosis,
             variance_term=variance_term,
+            statistic=float("nan"),
+            one_sided_pvalue=float("nan"),
             error="The PSR variance term must be finite and strictly positive.",
         )
     statistic = (
@@ -689,7 +853,24 @@ def probabilistic_sharpe_ratio(
         * float(np.sqrt(len(values) - 1))
         / float(np.sqrt(variance_term))
     )
+    if not np.isfinite(statistic):
+        return ProbabilisticSharpeResult(
+            status=ValidationAvailability.UNAVAILABLE,
+            probability=float("nan"),
+            observations=len(values),
+            observed_sharpe_per_period=observed_period,
+            observed_sharpe_annualized=observed_period * float(np.sqrt(periods)),
+            benchmark_sharpe_per_period=benchmark_period,
+            benchmark_sharpe_annualized=benchmark,
+            skewness=skewness,
+            ordinary_kurtosis=ordinary_kurtosis,
+            variance_term=variance_term,
+            statistic=float("nan"),
+            one_sided_pvalue=float("nan"),
+            error="The PSR statistic is not finite.",
+        )
     probability = float(norm.cdf(statistic))
+    one_sided_pvalue = float(norm.sf(statistic))
     return ProbabilisticSharpeResult(
         status=ValidationAvailability.AVAILABLE,
         probability=probability,
@@ -701,6 +882,8 @@ def probabilistic_sharpe_ratio(
         skewness=skewness,
         ordinary_kurtosis=ordinary_kurtosis,
         variance_term=variance_term,
+        statistic=float(statistic),
+        one_sided_pvalue=one_sided_pvalue,
         error=None,
     )
 
@@ -747,10 +930,31 @@ def minimum_track_record_length(
             benchmark_sharpe_annualized=benchmark,
             error="Observed Sharpe does not exceed the benchmark Sharpe.",
         )
-    required = max(
-        4,
-        int(ceil(1.0 + psr.variance_term * (float(norm.ppf(confidence)) / difference) ** 2)),
-    )
+    quantile = float(norm.ppf(confidence))
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        ratio = float(np.divide(quantile, difference))
+        theoretical_required = float(
+            1.0 + psr.variance_term * np.square(ratio)
+        )
+    if (
+        not np.isfinite(ratio)
+        or not np.isfinite(theoretical_required)
+        or theoretical_required > sys.maxsize
+    ):
+        return MinimumTrackRecordResult(
+            status=ValidationAvailability.UNAVAILABLE,
+            current_observations=psr.observations,
+            estimated_required_observations=None,
+            sufficient_track_record=None,
+            confidence_level=confidence,
+            observed_sharpe_annualized=psr.observed_sharpe_annualized,
+            benchmark_sharpe_annualized=benchmark,
+            error=(
+                "The theoretical minimum track record is numerically unbounded "
+                "or exceeds the safely representable integer range."
+            ),
+        )
+    required = max(4, int(ceil(theoretical_required)))
     return MinimumTrackRecordResult(
         status=ValidationAvailability.AVAILABLE,
         current_observations=psr.observations,
@@ -767,15 +971,90 @@ def _safe_fold_metrics(
     returns: pd.Series,
     periods_per_year: int,
     risk_free_rate: float,
-) -> tuple[float, float, float, float, str | None]:
+) -> tuple[
+    ValidationAvailability,
+    float,
+    float,
+    float,
+    float,
+    bool,
+    bool,
+    str | None,
+]:
     values = _validated_returns(returns)
     if values.empty or bool(values.isna().any()):
-        return (float("nan"),) * 4 + ("Fold returns are empty or unavailable.",)
+        return (
+            ValidationAvailability.UNAVAILABLE,
+            *(float("nan"),) * 4,
+            False,
+            False,
+            "Fold returns are empty or unavailable.",
+        )
+    catastrophic = bool(values.eq(-1.0).any())
+    invalid_return = bool(values.lt(-1.0).any())
     metrics = _metric_values(values, periods_per_year, risk_free_rate)
     total = metrics["total_return"]
+    mean = float(values.mean())
+    volatility = metrics["annualized_volatility"]
+    sharpe = metrics["sharpe_ratio"]
+    if invalid_return:
+        return (
+            ValidationAvailability.UNAVAILABLE,
+            float("nan"),
+            mean,
+            volatility,
+            sharpe,
+            False,
+            True,
+            "A fold return below -100% is invalid under portfolio-return semantics.",
+        )
+    if catastrophic:
+        return (
+            ValidationAvailability.UNAVAILABLE,
+            float("nan"),
+            mean,
+            volatility,
+            sharpe,
+            True,
+            False,
+            "The fold contains an exactly -100% catastrophic return.",
+        )
+    if (
+        len(values) < 2
+        or not np.isfinite(volatility)
+        or not np.isfinite(sharpe)
+    ):
+        return (
+            ValidationAvailability.INSUFFICIENT_DATA,
+            total,
+            mean,
+            volatility,
+            sharpe,
+            False,
+            False,
+            "Fold risk analytics require at least two observations and non-zero volatility.",
+        )
     if not np.isfinite(total):
-        return (float("nan"), float(values.mean()), metrics["annualized_volatility"], metrics["sharpe_ratio"], "Fold total return is undefined.")
-    return total, float(values.mean()), metrics["annualized_volatility"], metrics["sharpe_ratio"], None
+        return (
+            ValidationAvailability.UNAVAILABLE,
+            float("nan"),
+            mean,
+            volatility,
+            sharpe,
+            False,
+            False,
+            "Fold total return is undefined.",
+        )
+    return (
+        ValidationAvailability.AVAILABLE,
+        total,
+        mean,
+        volatility,
+        sharpe,
+        False,
+        False,
+        None,
+    )
 
 
 def analyze_fold_consistency(
@@ -804,6 +1083,8 @@ def analyze_fold_consistency(
                 annualized_volatility=0.0,
                 sharpe_ratio=float("nan"),
                 trade_count=0,
+                catastrophic=False,
+                invalid_return=False,
                 error=None,
             ))
             continue
@@ -815,26 +1096,49 @@ def analyze_fold_consistency(
                 observations=fold_result.trading_observations,
                 total_return=float("nan"), mean_return=float("nan"),
                 annualized_volatility=float("nan"), sharpe_ratio=float("nan"),
-                trade_count=0, error=fold_result.message,
+                trade_count=0, catastrophic=False, invalid_return=False,
+                error=fold_result.message,
             ))
             continue
-        total, mean, volatility, sharpe, error = _safe_fold_metrics(
+        (
+            availability,
+            total,
+            mean,
+            volatility,
+            sharpe,
+            catastrophic,
+            invalid_return,
+            error,
+        ) = _safe_fold_metrics(
             fold_result.oos_returns, periods, risk_free
         )
         records.append(FoldPerformance(
             fold_id=fold_result.fold.fold_id,
             selection_status=fold_result.status.value,
-            availability=(ValidationAvailability.AVAILABLE if error is None else ValidationAvailability.UNAVAILABLE),
+            availability=availability,
             observations=len(fold_result.oos_returns),
             total_return=total, mean_return=mean,
             annualized_volatility=volatility, sharpe_ratio=sharpe,
-            trade_count=fold_result.trade_count, error=error,
+            trade_count=fold_result.trade_count,
+            catastrophic=catastrophic,
+            invalid_return=invalid_return,
+            error=error,
         ))
-    observable = tuple(record for record in records if record.availability is ValidationAvailability.AVAILABLE and np.isfinite(record.total_return))
+    observable = tuple(
+        record for record in records if np.isfinite(record.total_return)
+    )
+    analytically_available = tuple(
+        record
+        for record in records
+        if record.availability is ValidationAvailability.AVAILABLE
+    )
+    catastrophic_records = tuple(record for record in records if record.catastrophic)
+    invalid_records = tuple(record for record in records if record.invalid_return)
     totals = np.asarray([record.total_return for record in observable], dtype=float)
     positive = totals[totals > 0.0]
     positive_sum = float(positive.sum())
-    if len(positive):
+    summaries_complete = not catastrophic_records and not invalid_records
+    if len(positive) and summaries_complete:
         top_count = int(ceil(0.20 * len(positive)))
         ordered_positive = np.sort(positive)[::-1]
         strongest_one = float(ordered_positive[0] / positive_sum)
@@ -843,24 +1147,67 @@ def analyze_fold_consistency(
         top_count = 0
         strongest_one = float("nan")
         strongest_twenty = float("nan")
-    quantiles = np.quantile(totals, [0.25, 0.50, 0.75]) if len(totals) else np.full(3, np.nan)
+    quantiles = (
+        np.quantile(totals, [0.25, 0.50, 0.75])
+        if len(totals) and summaries_complete
+        else np.full(3, np.nan)
+    )
+    unavailable_count = sum(
+        record.availability is not ValidationAvailability.AVAILABLE
+        for record in records
+    )
+    insufficient_count = sum(
+        record.availability is ValidationAvailability.INSUFFICIENT_DATA
+        for record in records
+    )
+    if any(
+        record.availability is ValidationAvailability.UNAVAILABLE
+        for record in records
+    ):
+        overall_status = ValidationAvailability.UNAVAILABLE
+    elif insufficient_count:
+        overall_status = ValidationAvailability.INSUFFICIENT_DATA
+    else:
+        overall_status = ValidationAvailability.AVAILABLE
+    adverse_special_count = len(catastrophic_records) + len(invalid_records)
+    evidence_count = len(totals) + adverse_special_count
     return FoldConsistencyMetrics(
+        status=overall_status,
         folds=tuple(records), fold_count=len(records), observable_fold_count=len(observable),
         positive_return_fold_count=int((totals > 0.0).sum()),
-        negative_return_fold_count=int((totals < 0.0).sum()),
+        negative_return_fold_count=int((totals < 0.0).sum()) + adverse_special_count,
         zero_return_no_selection_fold_count=sum(record.selection_status == WalkForwardStatus.NO_SELECTION.value for record in records),
-        unavailable_fold_count=len(records) - len(observable),
-        fraction_observable_folds_positive=(float((totals > 0.0).mean()) if len(totals) else float("nan")),
+        unavailable_fold_count=unavailable_count,
+        analytically_available_fold_count=len(analytically_available),
+        insufficient_data_fold_count=insufficient_count,
+        catastrophic_fold_count=len(catastrophic_records),
+        catastrophic_fold_ids=tuple(record.fold_id for record in catastrophic_records),
+        invalid_return_fold_count=len(invalid_records),
+        summaries_complete=summaries_complete,
+        fraction_observable_folds_positive=(
+            float((totals > 0.0).sum() / evidence_count)
+            if evidence_count else float("nan")
+        ),
         median_fold_total_return=float(quantiles[1]),
         lower_quartile_fold_total_return=float(quantiles[0]),
         upper_quartile_fold_total_return=float(quantiles[2]),
-        worst_fold_return=(float(totals.min()) if len(totals) else float("nan")),
-        strongest_fold_return=(float(totals.max()) if len(totals) else float("nan")),
+        worst_fold_return=(
+            float(totals.min())
+            if len(totals) and summaries_complete else float("nan")
+        ),
+        strongest_fold_return=(
+            float(totals.max())
+            if len(totals) and summaries_complete else float("nan")
+        ),
         strongest_single_positive_fold_concentration=strongest_one,
         strongest_twenty_percent_positive_folds_concentration=strongest_twenty,
         strongest_twenty_percent_positive_fold_count=top_count,
         contribution_basis="equal_capital_reset_fold_total_return_positive_contributions",
-        warning="Fold contributions describe independently reset folds and are not additive self-financing portfolio P&L.",
+        warning=(
+            "Fold contributions describe independently reset folds and are not "
+            "additive self-financing portfolio P&L. Aggregate return summaries "
+            "are incomplete when catastrophic or invalid-return folds exist."
+        ),
     )
 
 
@@ -884,20 +1231,74 @@ def analyze_regime_consistency(
     risk_free = _finite_real(risk_free_rate, "risk_free_rate")
     if risk_free <= -1.0:
         raise ValueError("risk_free_rate must be greater than -1.")
-    if bool(labels.isna().any()):
-        raise ValueError("regime_labels must not be missing on evaluated rows.")
-    try:
-        unique_labels = tuple(dict.fromkeys(labels.tolist()))
-    except TypeError as exc:
-        raise ValueError("regime labels must be hashable values.") from exc
+    normalized_labels: list[Any] = []
+    for label in labels.tolist():
+        if label is None or label is pd.NA or label is pd.NaT:
+            raise ValueError("regime_labels must not be missing on evaluated rows.")
+        if isinstance(label, (bool, np.bool_)):
+            raise ValueError(
+                "regime labels must be stable immutable scalar values."
+            )
+        if isinstance(label, Real):
+            if not np.isfinite(float(label)):
+                raise ValueError(
+                    "Numeric regime labels must be finite and non-missing."
+                )
+            normalized_labels.append(label)
+            continue
+        if isinstance(label, np.datetime64):
+            if np.isnat(label):
+                raise ValueError(
+                    "regime_labels must not be missing on evaluated rows."
+                )
+            normalized_labels.append(label)
+            continue
+        if isinstance(label, (str, Enum, date, datetime, pd.Timestamp)):
+            normalized_labels.append(label)
+            continue
+        raise ValueError(
+            "regime labels must be immutable scalar strings, finite numerics, "
+            "enums, or timestamp-like values; nested mutable objects are rejected."
+        )
+    labels = pd.Series(
+        normalized_labels,
+        index=labels.index.copy(),
+        name=labels.name,
+    )
+    unique_labels = tuple(dict.fromkeys(normalized_labels))
     if values.empty:
-        raise ValueError("returns must contain at least one observation.")
+        return RegimeConsistencyMetrics(
+            status=ValidationAvailability.INSUFFICIENT_DATA,
+            regimes=(),
+            regime_count=0,
+            observations=0,
+            positive_regime_count=0,
+            negative_regime_count=0,
+            zero_regime_count=0,
+            worst_regime=None,
+            strongest_regime_positive_contribution_concentration=float("nan"),
+            contribution_basis="arithmetic_return_sum_diagnostic",
+            contribution_warning=(
+                "Regime contributions are arithmetic return-sum diagnostics, "
+                "not compounded portfolio wealth attribution."
+            ),
+            returns=values,
+            regime_labels=labels,
+            point_in_time_regime_labels_validated=False,
+            provenance_warning=REGIME_PROVENANCE_WARNING,
+            error="Regime analysis requires at least one aligned observation.",
+        )
     if bool(values.isna().any()):
         return RegimeConsistencyMetrics(
             status=ValidationAvailability.UNAVAILABLE, regimes=(), regime_count=len(unique_labels),
             observations=len(values), positive_regime_count=0, negative_regime_count=0,
             zero_regime_count=0, worst_regime=None,
             strongest_regime_positive_contribution_concentration=float("nan"),
+            contribution_basis="arithmetic_return_sum_diagnostic",
+            contribution_warning=(
+                "Regime contributions are arithmetic return-sum diagnostics, "
+                "not compounded portfolio wealth attribution."
+            ),
             returns=values, regime_labels=labels,
             point_in_time_regime_labels_validated=False,
             provenance_warning=REGIME_PROVENANCE_WARNING,
@@ -908,7 +1309,22 @@ def analyze_regime_consistency(
         subset = values.loc[labels == label]
         metrics = _metric_values(subset, periods, risk_free)
         total = metrics["total_return"]
-        availability = ValidationAvailability.AVAILABLE if np.isfinite(total) else ValidationAvailability.UNAVAILABLE
+        if bool(subset.le(-1.0).any()) or not np.isfinite(total):
+            availability = ValidationAvailability.UNAVAILABLE
+            error = "Geometric regime analytics are unavailable."
+        elif (
+            len(subset) < 2
+            or not np.isfinite(metrics["annualized_volatility"])
+            or not np.isfinite(metrics["sharpe_ratio"])
+        ):
+            availability = ValidationAvailability.INSUFFICIENT_DATA
+            error = (
+                "Regime risk analytics require at least two observations and "
+                "non-zero volatility."
+            )
+        else:
+            availability = ValidationAvailability.AVAILABLE
+            error = None
         regimes.append(RegimePerformance(
             regime_label=label, availability=availability, observations=len(subset),
             total_return=total, mean_return=float(subset.mean()),
@@ -916,7 +1332,7 @@ def analyze_regime_consistency(
             sharpe_ratio=metrics["sharpe_ratio"], maximum_drawdown=metrics["maximum_drawdown"],
             fraction_positive_observations=float(subset.gt(0.0).mean()),
             arithmetic_return_contribution=float(subset.sum()),
-            error=(None if availability is ValidationAvailability.AVAILABLE else "Geometric regime analytics are unavailable."),
+            error=error,
         ))
     contributions = np.asarray([item.arithmetic_return_contribution for item in regimes], dtype=float)
     positive_contributions = contributions[contributions > 0.0]
@@ -925,26 +1341,50 @@ def analyze_regime_consistency(
         if len(positive_contributions) else float("nan")
     )
     worst_position = int(np.argmin(contributions))
+    if any(
+        item.availability is ValidationAvailability.UNAVAILABLE
+        for item in regimes
+    ):
+        overall_status = ValidationAvailability.UNAVAILABLE
+    elif any(
+        item.availability is ValidationAvailability.INSUFFICIENT_DATA
+        for item in regimes
+    ):
+        overall_status = ValidationAvailability.INSUFFICIENT_DATA
+    else:
+        overall_status = ValidationAvailability.AVAILABLE
     return RegimeConsistencyMetrics(
-        status=(ValidationAvailability.AVAILABLE if all(item.availability is ValidationAvailability.AVAILABLE for item in regimes) else ValidationAvailability.UNAVAILABLE),
+        status=overall_status,
         regimes=tuple(regimes), regime_count=len(regimes), observations=len(values),
         positive_regime_count=int((contributions > 0.0).sum()),
         negative_regime_count=int((contributions < 0.0).sum()),
         zero_regime_count=int((contributions == 0.0).sum()),
         worst_regime=regimes[worst_position].regime_label,
         strongest_regime_positive_contribution_concentration=concentration,
+        contribution_basis="arithmetic_return_sum_diagnostic",
+        contribution_warning=(
+            "Regime contributions are arithmetic return-sum diagnostics, not "
+            "compounded portfolio wealth attribution."
+        ),
         returns=values, regime_labels=labels,
         point_in_time_regime_labels_validated=False,
         provenance_warning=REGIME_PROVENANCE_WARNING, error=None,
     )
 
 
-def _benjamini_hochberg(pvalues: dict[str, float]) -> dict[str, float]:
+def _benjamini_hochberg(
+    pvalues: dict[str, float],
+    family_size: int | None = None,
+) -> dict[str, float]:
+    """Adjust finite p-values using the full predefined eligible family size."""
     ordered = sorted(pvalues.items(), key=lambda item: (item[1], item[0]))
-    count = len(ordered)
-    adjusted = [0.0] * count
+    finite_count = len(ordered)
+    count = finite_count if family_size is None else family_size
+    if count < finite_count:
+        raise ValueError("family_size must not be smaller than finite p-value count.")
+    adjusted = [0.0] * finite_count
     running = 1.0
-    for position in range(count - 1, -1, -1):
+    for position in range(finite_count - 1, -1, -1):
         rank = position + 1
         candidate = min(ordered[position][1] * count / rank, 1.0)
         running = min(running, candidate)
@@ -961,19 +1401,48 @@ def multiple_testing_diagnostics(
     """Apply diagnostic scenario-level Bonferroni and BH corrections."""
     if not isinstance(robustness_result, RobustnessResult):
         raise TypeError("robustness_result must be a RobustnessResult.")
+    scenario_ids = [
+        result.scenario.scenario_id for result in robustness_result.scenarios
+    ]
+    if len(scenario_ids) != len(set(scenario_ids)):
+        raise ValueError(
+            "Scenario IDs must be unique before multiple-testing diagnostics."
+        )
     benchmark = _finite_real(benchmark_sharpe, "benchmark_sharpe")
     alpha = _confidence_level(significance_level, "significance_level")
     raw: dict[str, float] = {}
     psr_results: dict[str, ProbabilisticSharpeResult] = {}
-    structural_comparison = (
-        robustness_result.common_horizon_structurally_available
-        and robustness_result.common_horizon_fully_observed
+    invalid = sum(
+        result.status is ScenarioStatus.INVALID_CONFIGURATION
+        for result in robustness_result.scenarios
     )
+    failed = sum(
+        result.status is ScenarioStatus.FAILED
+        for result in robustness_result.scenarios
+    )
+    eligible_results = tuple(
+        result
+        for result in robustness_result.scenarios
+        if result.status
+        not in {ScenarioStatus.INVALID_CONFIGURATION, ScenarioStatus.FAILED}
+    )
+    eligible_count = len(eligible_results)
     for result in robustness_result.scenarios:
-        if (
-            structural_comparison
-            and result.status not in {ScenarioStatus.INVALID_CONFIGURATION, ScenarioStatus.FAILED}
+        structurally_eligible = result.status not in {
+            ScenarioStatus.INVALID_CONFIGURATION,
+            ScenarioStatus.FAILED,
+        }
+        inferentially_available = (
+            structurally_eligible
+            and robustness_result.common_horizon_structurally_available
+            and result.common_horizon_structurally_available
+            and result.common_horizon_fully_observed
+            and result.common_horizon_analytics_status
+            is MetricAvailabilityStatus.AVAILABLE
             and len(result.common_horizon_returns) > 0
+        )
+        if (
+            inferentially_available
         ):
             psr = probabilistic_sharpe_ratio(
                 result.common_horizon_returns,
@@ -982,16 +1451,34 @@ def multiple_testing_diagnostics(
                 risk_free_rate=result.risk_free_rate,
             )
         else:
+            if structurally_eligible:
+                reason = (
+                    "Scenario is structurally eligible but lacks fully observed, "
+                    "available common-horizon analytics."
+                )
+            else:
+                reason = (
+                    "Scenario is invalid or failed and is not an eligible hypothesis."
+                )
             psr = _unavailable_psr(
                 len(result.common_horizon_returns), benchmark,
-                "Scenario lacks a complete structurally comparable common OOS horizon.",
+                reason,
             )
         psr_results[result.scenario.scenario_id] = psr
-        if psr.status is ValidationAvailability.AVAILABLE and np.isfinite(psr.probability):
-            raw[result.scenario.scenario_id] = float(1.0 - psr.probability)
-    valid_tests = len(raw)
-    bonferroni = {scenario_id: min(pvalue * valid_tests, 1.0) for scenario_id, pvalue in raw.items()}
-    bh = _benjamini_hochberg(raw)
+        if (
+            structurally_eligible
+            and psr.status is ValidationAvailability.AVAILABLE
+            and np.isfinite(psr.one_sided_pvalue)
+            and 0.0 <= psr.one_sided_pvalue <= 1.0
+        ):
+            raw[result.scenario.scenario_id] = float(psr.one_sided_pvalue)
+    finite_count = len(raw)
+    unavailable_eligible = eligible_count - finite_count
+    bonferroni = {
+        scenario_id: min(pvalue * eligible_count, 1.0)
+        for scenario_id, pvalue in raw.items()
+    }
+    bh = _benjamini_hochberg(raw, eligible_count)
     scenario_rows = tuple(
         ScenarioPValue(
             scenario_id=result.scenario.scenario_id,
@@ -1004,23 +1491,26 @@ def multiple_testing_diagnostics(
         )
         for result in sorted(robustness_result.scenarios, key=lambda item: item.scenario.scenario_id)
     )
-    invalid = sum(result.status is ScenarioStatus.INVALID_CONFIGURATION for result in robustness_result.scenarios)
-    failed = sum(result.status is ScenarioStatus.FAILED for result in robustness_result.scenarios)
-    unavailable = len(robustness_result.scenarios) - invalid - failed - valid_tests
     axes = tuple(ParameterAxisCount(axis.parameter, axis.count) for axis in robustness_result.axis_metadata)
     return MultipleTestingDiagnostics(
         scenario_pvalues=scenario_rows,
         total_tested_configurations=len(robustness_result.scenarios),
-        valid_comparable_configurations=valid_tests,
+        valid_comparable_configurations=eligible_count,
         invalid_configurations=invalid,
-        analytically_unavailable_configurations=unavailable,
+        analytically_unavailable_configurations=unavailable_eligible,
         failed_configurations=failed,
-        valid_pvalue_count=valid_tests,
-        unavailable_pvalue_count=len(robustness_result.scenarios) - valid_tests,
+        valid_pvalue_count=finite_count,
+        unavailable_pvalue_count=(
+            len(robustness_result.scenarios) - finite_count
+        ),
+        eligible_hypothesis_count=eligible_count,
+        finite_pvalue_count=finite_count,
+        unavailable_eligible_hypothesis_count=unavailable_eligible,
+        family_size=eligible_count,
         tested_dimension_count=len(robustness_result.tested_dimensions),
         parameter_axis_counts=axes,
         significance_level=alpha,
-        bonferroni_valid_test_count=valid_tests,
+        bonferroni_valid_test_count=eligible_count,
         raw_threshold_exceedance_count=sum(value <= alpha for value in raw.values()),
         bonferroni_threshold_exceedance_count=sum(value <= alpha for value in bonferroni.values()),
         benjamini_hochberg_discovery_count=sum(value <= alpha for value in bh.values()),
@@ -1030,9 +1520,16 @@ def multiple_testing_diagnostics(
 
 def _empty_fold_consistency() -> FoldConsistencyMetrics:
     return FoldConsistencyMetrics(
+        status=ValidationAvailability.INSUFFICIENT_DATA,
         folds=(), fold_count=0, observable_fold_count=0,
         positive_return_fold_count=0, negative_return_fold_count=0,
         zero_return_no_selection_fold_count=0, unavailable_fold_count=0,
+        analytically_available_fold_count=0,
+        insufficient_data_fold_count=0,
+        catastrophic_fold_count=0,
+        catastrophic_fold_ids=(),
+        invalid_return_fold_count=0,
+        summaries_complete=False,
         fraction_observable_folds_positive=float("nan"),
         median_fold_total_return=float("nan"), lower_quartile_fold_total_return=float("nan"),
         upper_quartile_fold_total_return=float("nan"), worst_fold_return=float("nan"),

@@ -20,6 +20,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 
+from .data import OBSERVED_PRICE_MASK_ATTR
 from .screening import PairScreeningResult
 
 
@@ -59,6 +60,7 @@ SCREENING_RESULT_COLUMNS = (
     "cointegration_statistic",
     "cointegration_pvalue",
     "corrected_pvalue",
+    "cointegration_critical_values",
     "adf_statistic",
     "adf_pvalue",
     "half_life",
@@ -92,6 +94,56 @@ _SCREENING_FLOAT_COLUMNS = (
     "half_life",
     "hurst",
 )
+_REQUIRED_SCHEMA_COLUMNS = {
+    "prices": {
+        "date": "DATE",
+        "symbol": "VARCHAR",
+        "adjusted_close": "DOUBLE",
+        "observed": "BOOLEAN",
+        "source": "VARCHAR",
+        "loaded_at": "TIMESTAMP",
+    },
+    "data_quality_reports": {
+        "run_id": "VARCHAR",
+        "symbol": "VARCHAR",
+        "total_observations": "BIGINT",
+        "valid_observations": "BIGINT",
+        "missing_or_invalid": "BIGINT",
+        "non_positive": "BIGINT",
+        "coverage": "DOUBLE",
+        "stale_fraction": "DOUBLE",
+        "first_valid": "TIMESTAMP",
+        "last_valid": "TIMESTAMP",
+        "forward_filled": "BIGINT",
+        "retained": "BOOLEAN",
+        "loaded_at": "TIMESTAMP",
+    },
+    "pair_screening_results": {
+        "run_id": "VARCHAR",
+        "formation_start": "DATE",
+        "formation_end": "DATE",
+        "symbol_y": "VARCHAR",
+        "symbol_x": "VARCHAR",
+        "group_name": "VARCHAR",
+        "observations": "BIGINT",
+        "alpha": "DOUBLE",
+        "beta": "DOUBLE",
+        "spread_standard_deviation": "DOUBLE",
+        "cointegration_statistic": "DOUBLE",
+        "cointegration_pvalue": "DOUBLE",
+        "corrected_pvalue": "DOUBLE",
+        "cointegration_critical_values": "VARCHAR",
+        "adf_statistic": "DOUBLE",
+        "adf_pvalue": "DOUBLE",
+        "half_life": "DOUBLE",
+        "hurst": "DOUBLE",
+        "selected": "BOOLEAN",
+        "rank": "BIGINT",
+        "rejection_reasons": "VARCHAR",
+        "loaded_at": "TIMESTAMP",
+        "half_life_was_infinite": "BOOLEAN",
+    },
+}
 
 __all__ = [
     "connect_database",
@@ -146,6 +198,33 @@ def _connection_scope(database: DatabaseTarget) -> Iterator[duckdb.DuckDBPyConne
 
 
 @contextmanager
+def _read_connection_scope(
+    database: DatabaseTarget,
+) -> Iterator[duckdb.DuckDBPyConnection]:
+    """Open an existing database for reading without creating paths or schema."""
+    if isinstance(database, duckdb.DuckDBPyConnection):
+        yield database
+        return
+    if isinstance(database, bool) or not isinstance(database, (str, os.PathLike)):
+        raise TypeError("database must be a filesystem path or DuckDB connection.")
+    raw_path = os.fspath(database)
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError("database path must not be empty.")
+    if raw_path == ":memory:":
+        raise ValueError(
+            "Read operations require an existing connection for an in-memory database."
+        )
+    path = Path(raw_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"Database file does not exist: {path}")
+    connection = duckdb.connect(database=str(path), read_only=True)
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+@contextmanager
 def _transaction(connection: duckdb.DuckDBPyConnection) -> Iterator[None]:
     """Commit one unit of work or roll it back without hiding its failure."""
     transaction_started = False
@@ -186,17 +265,58 @@ def _ensure_schema(connection: duckdb.DuckDBPyConnection) -> None:
           )
         """
     ).fetchone()[0]
-    if existing_count == 3:
-        return
-    with _transaction(connection):
-        connection.execute(_load_schema())
+    if existing_count == 0:
+        with _transaction(connection):
+            connection.execute(_load_schema())
+    elif existing_count != len(_REQUIRED_SCHEMA_COLUMNS):
+        raise RuntimeError(
+            "Database contains a partial research schema; explicit migration or "
+            "recreation is required."
+        )
+    _validate_schema(connection)
+
+
+def _validate_schema(connection: duckdb.DuckDBPyConnection) -> None:
+    """Reject missing or legacy schema shapes without inventing provenance."""
+    existing_tables = {
+        row[0]
+        for row in connection.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = current_schema()"
+        ).fetchall()
+    }
+    missing_tables = sorted(set(_REQUIRED_SCHEMA_COLUMNS) - existing_tables)
+    if missing_tables:
+        raise RuntimeError(
+            f"Database schema is missing required tables: {missing_tables}."
+        )
+    for table, required in _REQUIRED_SCHEMA_COLUMNS.items():
+        actual = {
+            row[1]: str(row[2]).upper()
+            for row in connection.execute(f"PRAGMA table_info('{table}')").fetchall()
+        }
+        missing_columns = sorted(set(required) - set(actual))
+        if missing_columns:
+            raise RuntimeError(
+                f"Database table {table!r} is incompatible; missing columns "
+                f"{missing_columns}. Recreate or explicitly migrate the database."
+            )
+        incompatible = {
+            column: (actual[column], expected)
+            for column, expected in required.items()
+            if actual[column] != expected
+        }
+        if incompatible:
+            raise RuntimeError(
+                f"Database table {table!r} has incompatible column types: "
+                f"{incompatible}."
+            )
 
 
 def initialise_database(database: DatabaseTarget) -> None:
     """Create the current research schema; repeated calls are harmless."""
     with _connection_scope(database) as connection:
-        with _transaction(connection):
-            connection.execute(_load_schema())
+        _ensure_schema(connection)
 
 
 def _normalise_non_empty_string(value: Any, field: str) -> str:
@@ -309,7 +429,7 @@ def _normalise_price_frame(
     prices: pd.DataFrame,
     source: Any,
     loaded_at: Any | None,
-) -> list[tuple[date, str, float, str, datetime]]:
+) -> list[tuple[date, str, float, bool, str, datetime]]:
     if not isinstance(prices, pd.DataFrame):
         raise TypeError("prices must be a pandas DataFrame.")
     if prices.empty or prices.shape[1] == 0:
@@ -322,6 +442,37 @@ def _normalise_price_frame(
         raise ValueError("prices index must contain unique timestamps.")
     if prices.columns.duplicated().any():
         raise ValueError("prices must contain unique symbol columns.")
+
+    mask_value = prices.attrs.get(OBSERVED_PRICE_MASK_ATTR)
+    if mask_value is None:
+        if "valuation_policy" in prices.attrs:
+            raise ValueError(
+                "A price frame declaring a valuation policy must include an "
+                "observed_price_mask."
+            )
+        observed_mask = pd.DataFrame(
+            True,
+            index=prices.index.copy(),
+            columns=prices.columns.copy(),
+            dtype=bool,
+        )
+    else:
+        if not isinstance(mask_value, pd.DataFrame):
+            raise TypeError("observed_price_mask must be a pandas DataFrame.")
+        if not mask_value.index.equals(prices.index):
+            raise ValueError("observed_price_mask index must align exactly with prices.")
+        if not mask_value.columns.equals(prices.columns):
+            raise ValueError(
+                "observed_price_mask columns must align exactly with prices."
+            )
+        if bool(mask_value.isna().to_numpy(dtype=bool).any()):
+            raise ValueError("observed_price_mask must not contain missing values.")
+        if any(
+            not isinstance(value, (bool, np.bool_))
+            for value in mask_value.to_numpy(dtype=object).ravel()
+        ):
+            raise TypeError("observed_price_mask must contain only Boolean values.")
+        observed_mask = mask_value.astype(bool).copy(deep=True)
 
     symbols = [
         _normalise_symbol(column, f"prices column {position}")
@@ -355,7 +506,7 @@ def _normalise_price_frame(
 
     normalised_source = _normalise_non_empty_string(source, "source")
     batch_loaded_at = _normalise_loaded_at(loaded_at)
-    records: list[tuple[date, str, float, str, datetime]] = []
+    records: list[tuple[date, str, float, bool, str, datetime]] = []
     for row_position, timestamp in enumerate(database_dates):
         for column_position, symbol in enumerate(symbols):
             records.append(
@@ -363,6 +514,7 @@ def _normalise_price_frame(
                     timestamp.date(),
                     symbol,
                     values[row_position, column_position],
+                    bool(observed_mask.iloc[row_position, column_position]),
                     normalised_source,
                     batch_loaded_at,
                 )
@@ -379,15 +531,19 @@ def store_prices(
 ) -> int:
     """Upsert a complete wide price frame and return its relational row count.
 
-    A repeated ``(date, symbol, source)`` key replaces ``adjusted_close`` and
-    ``loaded_at``.  Other sources remain independent.
+    A repeated ``(date, symbol, source)`` key replaces the price, observation
+    provenance, and load timestamp atomically. Frames without cleaning metadata
+    are explicitly treated as raw, fully observed inputs.
     """
     records = _normalise_price_frame(prices, source, loaded_at)
     statement = """
-        INSERT INTO prices (date, symbol, adjusted_close, source, loaded_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO prices (
+            date, symbol, adjusted_close, observed, source, loaded_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT (date, symbol, source) DO UPDATE SET
             adjusted_close = EXCLUDED.adjusted_close,
+            observed = EXCLUDED.observed,
             loaded_at = EXCLUDED.loaded_at
     """
     with _connection_scope(database) as connection:
@@ -409,9 +565,12 @@ def _normalise_symbol_filter(symbols: Iterable[str] | str | None) -> tuple[str, 
             raw_symbols = tuple(symbols)
         except TypeError as exc:
             raise TypeError("symbols must be an iterable of strings.") from exc
-    normalised = tuple(
-        sorted({_normalise_symbol(symbol, "symbols entry") for symbol in raw_symbols})
+    normalised_values = tuple(
+        _normalise_symbol(symbol, "symbols entry") for symbol in raw_symbols
     )
+    if len(normalised_values) != len(set(normalised_values)):
+        raise ValueError("symbols must not contain duplicates after normalisation.")
+    normalised = normalised_values
     if not normalised:
         raise ValueError("symbols must not be empty when supplied.")
     return normalised
@@ -424,6 +583,15 @@ def _empty_prices(symbols: tuple[str, ...] | None = None) -> pd.DataFrame:
         dtype=float,
     )
     frame.columns.name = None
+    frame.attrs[OBSERVED_PRICE_MASK_ATTR] = pd.DataFrame(
+        False,
+        index=frame.index.copy(),
+        columns=frame.columns.copy(),
+        dtype=bool,
+    )
+    frame.attrs["valuation_policy"] = (
+        "database_observed_provenance; execution_requires_observed"
+    )
     return frame
 
 
@@ -434,6 +602,7 @@ def load_prices(
     symbols: Iterable[str] | str | None = None,
     start: Any | None = None,
     end: Any | None = None,
+    strict: bool = True,
 ) -> pd.DataFrame:
     """Load one source into a date-by-symbol adjusted-close frame.
 
@@ -442,6 +611,8 @@ def load_prices(
     """
     normalised_source = _normalise_non_empty_string(source, "source")
     normalised_symbols = _normalise_symbol_filter(symbols)
+    if not isinstance(strict, (bool, np.bool_)):
+        raise TypeError("strict must be Boolean.")
     start_date = None if start is None else _normalise_date_filter(start, "start")
     end_date = None if end is None else _normalise_date_filter(end, "end")
     if start_date is not None and end_date is not None and start_date > end_date:
@@ -461,22 +632,56 @@ def load_prices(
         parameters.append(end_date)
 
     query = f"""
-        SELECT date, symbol, adjusted_close
+        SELECT date, symbol, adjusted_close, observed
         FROM prices
         WHERE {' AND '.join(clauses)}
         ORDER BY date ASC, symbol ASC
     """
-    with _connection_scope(database) as connection:
-        _ensure_schema(connection)
+    with _read_connection_scope(database) as connection:
+        _validate_schema(connection)
         result = connection.execute(query, parameters).fetchdf()
 
     if result.empty:
+        if normalised_symbols is not None and strict:
+            raise ValueError(
+                "Database contains none of the requested symbols for the query: "
+                f"{list(normalised_symbols)}."
+            )
         return _empty_prices(normalised_symbols)
+    if normalised_symbols is not None:
+        returned_symbols = set(result["symbol"].tolist())
+        missing_symbols = [
+            symbol for symbol in normalised_symbols if symbol not in returned_symbols
+        ]
+        if missing_symbols and strict:
+            raise ValueError(
+                f"Database query is missing requested symbols: {missing_symbols}."
+            )
     result["date"] = pd.to_datetime(result["date"]).astype("datetime64[ns]")
     wide = result.pivot(index="date", columns="symbol", values="adjusted_close")
-    wide = wide.sort_index().reindex(sorted(wide.columns), axis=1).astype(float)
+    observed = result.pivot(index="date", columns="symbol", values="observed")
+    output_columns = (
+        list(normalised_symbols)
+        if normalised_symbols is not None
+        else sorted(wide.columns)
+    )
+    wide = wide.sort_index().reindex(columns=output_columns).astype(float)
+    observed = (
+        observed.sort_index()
+        .reindex(index=wide.index, columns=output_columns)
+        .astype("boolean")
+        .fillna(False)
+        .astype(bool)
+    )
     wide.index = pd.DatetimeIndex(wide.index, name="date")
     wide.columns.name = None
+    observed.index = wide.index.copy()
+    observed.columns = wide.columns.copy()
+    observed.columns.name = None
+    wide.attrs[OBSERVED_PRICE_MASK_ATTR] = observed
+    wide.attrs["valuation_policy"] = (
+        "database_observed_provenance; execution_requires_observed"
+    )
     return wide
 
 
@@ -521,6 +726,30 @@ def _normalise_quality_report(
         )
         if not 0 <= coverage <= 1:
             raise ValueError(f"coverage for {symbol} must be in [0, 1].")
+        total = counts["total_observations"]
+        valid = counts["valid_observations"]
+        invalid = counts["missing_or_invalid"]
+        if total == 0:
+            raise ValueError(f"total_observations for {symbol} must be positive.")
+        if valid + invalid != total:
+            raise ValueError(
+                f"valid_observations plus missing_or_invalid for {symbol} "
+                "must equal total_observations."
+            )
+        if counts["non_positive"] > invalid:
+            raise ValueError(
+                f"non_positive for {symbol} must not exceed missing_or_invalid."
+            )
+        if counts["forward_filled"] > invalid:
+            raise ValueError(
+                f"forward_filled for {symbol} must not exceed missing_or_invalid."
+            )
+        expected_coverage = valid / total
+        if not np.isclose(coverage, expected_coverage, rtol=0.0, atol=1e-12):
+            raise ValueError(
+                f"coverage for {symbol} must equal valid_observations / "
+                "total_observations."
+            )
 
         stale_value = report.iloc[row_position]["stale_fraction"]
         if _is_missing_scalar(stale_value):
@@ -645,8 +874,8 @@ def load_data_quality_report(
         WHERE run_id = ?
         ORDER BY symbol ASC
     """
-    with _connection_scope(database) as connection:
-        _ensure_schema(connection)
+    with _read_connection_scope(database) as connection:
+        _validate_schema(connection)
         result = connection.execute(query, [normalised_run_id]).fetchdf()
 
     if result.empty:
@@ -704,17 +933,54 @@ def _strict_positive_integer(value: Any, field: str) -> int:
     return integer
 
 
-def _validate_critical_values(result: PairScreeningResult) -> None:
+def _normalise_critical_values(
+    result: PairScreeningResult,
+    *,
+    selected: bool,
+) -> str:
     critical_values = result.cointegration_critical_values
     if not isinstance(critical_values, Mapping):
         raise TypeError("cointegration_critical_values must be a mapping.")
+    normalised: dict[str, float] = {}
     for label, value in critical_values.items():
-        _normalise_non_empty_string(label, "cointegration critical-value label")
+        normalised_label = _normalise_non_empty_string(
+            label, "cointegration critical-value label"
+        )
         critical_value, _ = _optional_screening_real(
             value, f"cointegration critical value {label!r}"
         )
         if critical_value is None:
             raise TypeError("Cointegration critical values must not be nullable.")
+        normalised[normalised_label] = critical_value
+    if selected and set(normalised) != {"1%", "5%", "10%"}:
+        raise ValueError(
+            "Selected pairs require 1%, 5%, and 10% cointegration critical values."
+        )
+    return json.dumps(normalised, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _decode_critical_values(encoded: Any) -> dict[str, float]:
+    if not isinstance(encoded, str):
+        raise ValueError("Stored cointegration_critical_values must contain JSON text.")
+    try:
+        decoded = json.loads(encoded)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "Stored cointegration_critical_values contains invalid JSON."
+        ) from exc
+    if not isinstance(decoded, dict):
+        raise ValueError("Stored cointegration_critical_values must be a JSON object.")
+    result: dict[str, float] = {}
+    for label, value in decoded.items():
+        if not isinstance(label, str) or isinstance(value, bool) or not isinstance(
+            value, (int, float)
+        ):
+            raise ValueError("Stored cointegration critical values are malformed.")
+        number = float(value)
+        if not np.isfinite(number):
+            raise ValueError("Stored cointegration critical values must be finite.")
+        result[label] = number
+    return result
 
 
 def _encode_rejection_reasons(reasons: Any) -> str:
@@ -851,8 +1117,45 @@ def _normalise_pair_screening_results(
         )
         if half_life is not None and half_life <= 0:
             raise ValueError("Finite half_life must be positive.")
-        _validate_critical_values(result)
         encoded_reasons = _encode_rejection_reasons(result.rejection_reasons)
+        encoded_critical_values = _normalise_critical_values(
+            result,
+            selected=selected,
+        )
+        if selected:
+            required_selected = (
+                "alpha",
+                "beta",
+                "spread_standard_deviation",
+                "cointegration_statistic",
+                "cointegration_pvalue",
+                "corrected_pvalue",
+                "adf_statistic",
+                "adf_pvalue",
+                "hurst",
+            )
+            missing_selected = [
+                field for field in required_selected if numeric_values[field] is None
+            ]
+            if missing_selected:
+                raise ValueError(
+                    f"Selected pair {symbol_y}/{symbol_x} is missing required "
+                    f"diagnostics: {missing_selected}."
+                )
+            if observations <= 0:
+                raise ValueError("Selected pairs require positive observations.")
+            if numeric_values["beta"] <= 0:  # type: ignore[operator]
+                raise ValueError("Selected pairs require finite positive beta.")
+            if spread_standard_deviation is None or spread_standard_deviation <= 0:
+                raise ValueError(
+                    "Selected pairs require positive spread_standard_deviation."
+                )
+            if half_life is None or half_life_was_infinite:
+                raise ValueError("Selected pairs require finite positive half_life.")
+            if result.rejection_reasons:
+                raise ValueError("Selected pairs must not contain rejection reasons.")
+        elif not result.rejection_reasons:
+            raise ValueError("Rejected pairs must contain at least one rejection reason.")
 
         records.append(
             (
@@ -869,6 +1172,7 @@ def _normalise_pair_screening_results(
                 numeric_values["cointegration_statistic"],
                 numeric_values["cointegration_pvalue"],
                 numeric_values["corrected_pvalue"],
+                encoded_critical_values,
                 numeric_values["adf_statistic"],
                 numeric_values["adf_pvalue"],
                 half_life,
@@ -926,7 +1230,7 @@ def _validate_screening_upsert_consistency(
         for _, _, symbol_y, symbol_x, selected, rank in existing_rows
     }
     for record in records:
-        resulting_pairs[(record[3], record[4])] = (record[18], record[19])
+        resulting_pairs[(record[3], record[4])] = (record[19], record[20])
 
     selected_ranks: list[int] = []
     for pair, (selected, rank) in resulting_pairs.items():
@@ -974,11 +1278,12 @@ def store_pair_screening_results(
             run_id, formation_start, formation_end, symbol_y, symbol_x,
             group_name, observations, alpha, beta,
             spread_standard_deviation, cointegration_statistic,
-            cointegration_pvalue, corrected_pvalue, adf_statistic, adf_pvalue,
+            cointegration_pvalue, corrected_pvalue,
+            cointegration_critical_values, adf_statistic, adf_pvalue,
             half_life, half_life_was_infinite, hurst, selected, rank,
             rejection_reasons, loaded_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (run_id, symbol_y, symbol_x) DO UPDATE SET
             formation_start = EXCLUDED.formation_start,
             formation_end = EXCLUDED.formation_end,
@@ -990,6 +1295,7 @@ def store_pair_screening_results(
             cointegration_statistic = EXCLUDED.cointegration_statistic,
             cointegration_pvalue = EXCLUDED.cointegration_pvalue,
             corrected_pvalue = EXCLUDED.corrected_pvalue,
+            cointegration_critical_values = EXCLUDED.cointegration_critical_values,
             adf_statistic = EXCLUDED.adf_statistic,
             adf_pvalue = EXCLUDED.adf_pvalue,
             half_life = EXCLUDED.half_life,
@@ -1024,6 +1330,7 @@ def _empty_screening_results() -> pd.DataFrame:
             "cointegration_statistic": pd.Series(dtype="float64"),
             "cointegration_pvalue": pd.Series(dtype="float64"),
             "corrected_pvalue": pd.Series(dtype="float64"),
+            "cointegration_critical_values": pd.Series(dtype="object"),
             "adf_statistic": pd.Series(dtype="float64"),
             "adf_pvalue": pd.Series(dtype="float64"),
             "half_life": pd.Series(dtype="float64"),
@@ -1056,6 +1363,9 @@ def _coerce_screening_results(result: pd.DataFrame) -> pd.DataFrame:
     result["rejection_reasons"] = result["rejection_reasons"].map(
         _decode_rejection_reasons
     )
+    result["cointegration_critical_values"] = result[
+        "cointegration_critical_values"
+    ].map(_decode_critical_values)
     for column in ("formation_start", "formation_end", "loaded_at"):
         result[column] = pd.to_datetime(result[column]).astype("datetime64[ns]")
     result["observations"] = result["observations"].astype("int64")
@@ -1087,7 +1397,8 @@ def _load_screening_results(
             run_id, formation_start, formation_end, symbol_y, symbol_x,
             group_name, observations, alpha, beta,
             spread_standard_deviation, cointegration_statistic,
-            cointegration_pvalue, corrected_pvalue, adf_statistic, adf_pvalue,
+            cointegration_pvalue, corrected_pvalue,
+            cointegration_critical_values, adf_statistic, adf_pvalue,
             half_life, half_life_was_infinite, hurst, selected, rank,
             rejection_reasons, loaded_at
         FROM pair_screening_results
@@ -1102,8 +1413,8 @@ def _load_screening_results(
     if limit is not None:
         query += " LIMIT ?"
         parameters.append(limit)
-    with _connection_scope(database) as connection:
-        _ensure_schema(connection)
+    with _read_connection_scope(database) as connection:
+        _validate_schema(connection)
         result = connection.execute(query, parameters).fetchdf()
     return _coerce_screening_results(result)
 
@@ -1178,8 +1489,8 @@ def summarise_screening_runs(database: DatabaseTarget) -> pd.DataFrame:
             formation_start DESC,
             run_id ASC
     """
-    with _connection_scope(database) as connection:
-        _ensure_schema(connection)
+    with _read_connection_scope(database) as connection:
+        _validate_schema(connection)
         result = connection.execute(query).fetchdf()
     if result.empty:
         return _empty_screening_summary()

@@ -4,6 +4,7 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 import yaml
 
@@ -15,7 +16,11 @@ from pairs_trading.config import (
     StrategyConfig,
     WalkForwardConfig,
     load_config,
+    screening_kwargs_from_config,
 )
+from pairs_trading.data import make_synthetic_universe
+from pairs_trading.screening import screen_pairs
+from pairs_trading.stats import ADF_MIN_OBSERVATIONS
 
 
 def write_yaml(tmp_path: Path, values: Any) -> Path:
@@ -246,3 +251,236 @@ def test_to_dict_returns_serialisable_mutable_values(tmp_path: Path) -> None:
     assert isinstance(result["universe"], dict)
     assert result["universe"]["Technology"] == ["AAA", "BBB"]
     assert yaml.safe_load(yaml.safe_dump(result)) == result
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("start", False),
+        ("start", "2024/01/01"),
+        ("end", []),
+        ("end", "not-a-date"),
+        ("interval", 1),
+        ("interval", "   "),
+        ("cache_dir", False),
+        ("cache_dir", ""),
+    ),
+)
+def test_data_string_and_date_fields_are_validated(
+    tmp_path: Path,
+    field: str,
+    value: Any,
+) -> None:
+    with pytest.raises(ValueError, match=f"data.{field}"):
+        load_config(write_yaml(tmp_path, {"data": {field: value}}))
+
+
+def test_data_start_must_precede_explicit_end(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="start must be earlier"):
+        load_config(
+            write_yaml(
+                tmp_path,
+                {"data": {"start": "2024-01-02", "end": "2024-01-02"}},
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "universe",
+    (
+        {"Technology": ["AAA", " AAA"]},
+        {"Technology": ["AAA", "aaa"]},
+        {"Technology": ["AAA"], "Banks": ["aaa"]},
+        {" Technology": ["AAA"]},
+    ),
+)
+def test_universe_normalisation_collisions_fail_early(
+    tmp_path: Path,
+    universe: dict[str, list[str]],
+) -> None:
+    with pytest.raises(ValueError, match="universe|duplicate|belongs"):
+        load_config(write_yaml(tmp_path, {"universe": universe}))
+
+
+@pytest.mark.parametrize(
+    "obsolete_field",
+    (
+        "min_correlation",
+        "coint_pvalue",
+        "adf_pvalue",
+        "min_half_life",
+        "max_pairs_per_sector",
+    ),
+)
+def test_unsupported_legacy_screening_fields_are_rejected(
+    tmp_path: Path,
+    obsolete_field: str,
+) -> None:
+    with pytest.raises(ValueError, match="Unknown screening keys"):
+        load_config(
+            write_yaml(tmp_path, {"screening": {obsolete_field: 0.1}})
+        )
+
+
+def test_adapter_accepts_screening_from_valid_custom_strategy_config(
+    tmp_path: Path,
+) -> None:
+    config = load_config(
+        write_yaml(
+            tmp_path,
+            {
+                "screening": {
+                    "formation_days": 100,
+                    "min_observations": ADF_MIN_OBSERVATIONS,
+                },
+                "strategy": {
+                    "hedge_lookback": 60,
+                    "zscore_lookback": 40,
+                },
+            },
+        )
+    )
+
+    assert config.screening.formation_days <= StrategyConfig().hedge_lookback
+    assert screening_kwargs_from_config(config.screening)["min_observations"] == (
+        ADF_MIN_OBSERVATIONS
+    )
+
+
+def test_screening_min_observations_below_adf_floor_is_rejected(
+    tmp_path: Path,
+) -> None:
+    invalid_minimum = ADF_MIN_OBSERVATIONS - 1
+
+    with pytest.raises(ValueError, match=f"at least {ADF_MIN_OBSERVATIONS}"):
+        load_config(
+            write_yaml(
+                tmp_path,
+                {"screening": {"min_observations": invalid_minimum}},
+            )
+        )
+    with pytest.raises(ValueError, match=f"at least {ADF_MIN_OBSERVATIONS}"):
+        screening_kwargs_from_config(
+            ScreeningConfig(min_observations=invalid_minimum)
+        )
+
+
+def test_screening_min_observations_at_adf_floor_is_valid(
+    tmp_path: Path,
+) -> None:
+    config = load_config(
+        write_yaml(
+            tmp_path,
+            {"screening": {"min_observations": ADF_MIN_OBSERVATIONS}},
+        )
+    )
+
+    assert config.screening.min_observations == ADF_MIN_OBSERVATIONS
+    assert screening_kwargs_from_config(config.screening)["min_observations"] == (
+        ADF_MIN_OBSERVATIONS
+    )
+
+
+def test_formation_days_must_cover_screening_minimum_observations(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="formation_days must be at least screening.min_observations",
+    ):
+        load_config(
+            write_yaml(
+                tmp_path,
+                {
+                    "screening": {
+                        "formation_days": ADF_MIN_OBSERVATIONS - 1,
+                        "min_observations": ADF_MIN_OBSERVATIONS,
+                    },
+                    "strategy": {
+                        "hedge_lookback": 20,
+                        "zscore_lookback": 20,
+                    },
+                },
+            )
+        )
+
+
+def test_formation_days_equal_to_min_observations_is_valid(
+    tmp_path: Path,
+) -> None:
+    config = load_config(
+        write_yaml(
+            tmp_path,
+            {
+                "screening": {
+                    "formation_days": ADF_MIN_OBSERVATIONS,
+                    "min_observations": ADF_MIN_OBSERVATIONS,
+                },
+                "strategy": {
+                    "hedge_lookback": 20,
+                    "zscore_lookback": 20,
+                },
+            },
+        )
+    )
+
+    assert config.screening.formation_days == config.screening.min_observations
+
+
+def test_adapter_boundary_kwargs_are_accepted_by_screen_pairs() -> None:
+    prices, groups = make_synthetic_universe(n_days=300, seed=42)
+    kwargs = screening_kwargs_from_config(
+        ScreeningConfig(
+            formation_days=ADF_MIN_OBSERVATIONS,
+            min_observations=ADF_MIN_OBSERVATIONS,
+        )
+    )
+
+    results = screen_pairs(prices, groups, **kwargs)
+
+    assert results
+
+
+def test_screening_adapter_matches_active_production_parameters() -> None:
+    config = ScreeningConfig(
+        min_observations=150,
+        fdr_threshold=0.10,
+        max_half_life=45.0,
+        hurst_threshold=0.40,
+    )
+
+    assert screening_kwargs_from_config(config) == {
+        "min_observations": 150,
+        "fdr_threshold": 0.10,
+        "max_half_life": 45.0,
+        "hurst_threshold": 0.40,
+    }
+
+
+def test_screening_adapter_drives_the_scalar_screening_api() -> None:
+    prices, groups = make_synthetic_universe(n_days=500, seed=42)
+    baseline = screen_pairs(
+        prices,
+        groups,
+        **screening_kwargs_from_config(ScreeningConfig(min_observations=300)),
+    )
+    strict = screen_pairs(
+        prices,
+        groups,
+        **screening_kwargs_from_config(
+            ScreeningConfig(
+                min_observations=300,
+                fdr_threshold=0.0,
+                max_half_life=1.0,
+                hurst_threshold=-1.0,
+            )
+        ),
+    )
+
+    assert any(result.selected for result in baseline)
+    assert not any(result.selected for result in strict)
+    assert all(
+        result.corrected_pvalue is None
+        or np.isfinite(result.corrected_pvalue)
+        for result in strict
+    )

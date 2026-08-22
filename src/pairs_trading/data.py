@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 import hashlib
+import json
 import logging
 from pathlib import Path
 import re
@@ -15,6 +16,9 @@ import pandas as pd
 LOGGER = logging.getLogger(__name__)
 
 OBSERVED_PRICE_MASK_ATTR = "observed_price_mask"
+_CACHE_FORMAT_VERSION = 1
+_CACHE_SOURCE = "yahoo_finance"
+_CACHE_ADJUSTMENT_POLICY = "auto_adjust_true_close"
 
 
 class DataQualityError(ValueError):
@@ -61,10 +65,33 @@ class MarketDataLoader:
         response remains auditable.
         """
         symbols = self.normalize_tickers(tickers)
-        cache_path = self._cache_path(symbols, start, end, interval)
+        start_value = self._non_empty_request_string(start, "start")
+        if end is not None:
+            end_value = self._non_empty_request_string(end, "end")
+        else:
+            end_value = None
+        interval_value = self._non_empty_request_string(interval, "interval")
+        if not isinstance(refresh, (bool, np.bool_)):
+            raise TypeError("refresh must be Boolean.")
+
+        resolved_end = end_value or self._cache_as_of_date()
+        metadata = self._cache_metadata(
+            symbols,
+            start=start_value,
+            requested_end=end_value,
+            resolved_end=resolved_end,
+            interval=interval_value,
+        )
+        cache_path = self._cache_path(
+            symbols,
+            start_value,
+            end_value,
+            resolved_end,
+            interval_value,
+        )
 
         if cache_path.is_file() and not refresh:
-            return self._read_cache(cache_path, symbols)
+            return self._read_cache(cache_path, symbols, metadata)
 
         try:
             import yfinance as yf
@@ -77,9 +104,9 @@ class MarketDataLoader:
         try:
             raw = yf.download(
                 tickers=list(symbols),
-                start=start,
-                end=end,
-                interval=interval,
+                start=start_value,
+                end=end_value,
+                interval=interval_value,
                 auto_adjust=True,
                 actions=False,
                 progress=False,
@@ -90,19 +117,65 @@ class MarketDataLoader:
             raise ConnectionError(f"Yahoo Finance download failed: {exc}") from exc
 
         prices = self._extract_close_prices(raw, symbols)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        prices.to_csv(cache_path, index_label="Date")
+        self._write_cache(cache_path, prices, metadata)
         return prices
+
+    @staticmethod
+    def _non_empty_request_string(value: Any, field: str) -> str:
+        if not isinstance(value, str):
+            raise TypeError(f"{field} must be a string.")
+        normalised = value.strip()
+        if not normalised:
+            raise ValueError(f"{field} must not be empty.")
+        return normalised
+
+    @staticmethod
+    def _cache_as_of_date() -> str:
+        """Return the UTC calendar date defining an open request's horizon."""
+        return pd.Timestamp.now(tz="UTC").date().isoformat()
+
+    @staticmethod
+    def _cache_metadata(
+        symbols: tuple[str, ...],
+        *,
+        start: str,
+        requested_end: str | None,
+        resolved_end: str,
+        interval: str,
+    ) -> dict[str, Any]:
+        return {
+            "format_version": _CACHE_FORMAT_VERSION,
+            "source": _CACHE_SOURCE,
+            "symbols": list(symbols),
+            "start": start,
+            "requested_end": requested_end,
+            "resolved_end": resolved_end,
+            "interval": interval,
+            "adjustment_policy": _CACHE_ADJUSTMENT_POLICY,
+        }
 
     def _cache_path(
         self,
         symbols: tuple[str, ...],
         start: str,
-        end: str | None,
+        requested_end: str | None,
+        resolved_end: str,
         interval: str,
     ) -> Path:
         """Build a stable cache name from the complete request identity."""
-        identity = "\x1f".join([*symbols, str(start), str(end), str(interval)])
+        request_mode = "OPEN_ENDED" if requested_end is None else "EXPLICIT_END"
+        identity = "\x1f".join(
+            [
+                str(_CACHE_FORMAT_VERSION),
+                _CACHE_SOURCE,
+                _CACHE_ADJUSTMENT_POLICY,
+                request_mode,
+                *symbols,
+                str(start),
+                str(resolved_end),
+                str(interval),
+            ]
+        )
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
         safe_interval = re.sub(r"[^A-Za-z0-9_-]+", "-", str(interval)).strip("-")
         safe_interval = safe_interval or "interval"
@@ -113,7 +186,30 @@ class MarketDataLoader:
         cls,
         cache_path: Path,
         symbols: tuple[str, ...],
+        expected_metadata: dict[str, Any],
     ) -> pd.DataFrame:
+        metadata_path = cls._cache_metadata_path(cache_path)
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise DataQualityError(
+                f"Could not read cache metadata {metadata_path}: {exc}"
+            ) from exc
+        if not isinstance(metadata, dict):
+            raise DataQualityError("Cached request metadata must be a JSON object.")
+        retrieved_at = metadata.pop("retrieved_at_utc", None)
+        try:
+            retrieved_timestamp = pd.Timestamp(retrieved_at)
+        except (TypeError, ValueError) as exc:
+            raise DataQualityError(
+                "Cached retrieval timestamp is missing or invalid."
+            ) from exc
+        if retrieved_timestamp.tzinfo is None:
+            raise DataQualityError("Cached retrieval timestamp must be UTC-aware.")
+        if metadata != expected_metadata:
+            raise DataQualityError(
+                "Cached request metadata does not exactly match the current request."
+            )
         try:
             cached = pd.read_csv(cache_path, index_col=0, parse_dates=True)
         except (OSError, ValueError, pd.errors.ParserError) as exc:
@@ -135,6 +231,42 @@ class MarketDataLoader:
             unusable = cached.columns[cached.isna().all(axis=0)].tolist()
             raise DataQualityError(f"Cached tickers contain no prices: {unusable}")
         return cached
+
+    @staticmethod
+    def _cache_metadata_path(cache_path: Path) -> Path:
+        return cache_path.with_suffix(cache_path.suffix + ".json")
+
+    def _write_cache(
+        self,
+        cache_path: Path,
+        prices: pd.DataFrame,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Replace one cache and its exact request metadata deterministically."""
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        metadata_path = self._cache_metadata_path(cache_path)
+        csv_temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        metadata_temporary = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
+        try:
+            prices.to_csv(csv_temporary, index_label="Date")
+            stored_metadata = dict(metadata)
+            stored_metadata["retrieved_at_utc"] = pd.Timestamp.now(
+                tz="UTC"
+            ).isoformat()
+            metadata_temporary.write_text(
+                json.dumps(stored_metadata, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            csv_temporary.replace(cache_path)
+            metadata_temporary.replace(metadata_path)
+        except OSError as exc:
+            raise DataQualityError(f"Could not write cache {cache_path}: {exc}") from exc
+        finally:
+            for temporary in (csv_temporary, metadata_temporary):
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    LOGGER.warning("Could not remove cache temporary file %s", temporary)
 
     @classmethod
     def _extract_close_prices(
@@ -221,7 +353,12 @@ class MarketDataLoader:
         max_forward_fill: int = 3,
         min_observations: int = 100,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Return clean prices and a pre-fill, per-symbol quality report."""
+        """Return clean prices and a pre-fill, per-symbol quality report.
+
+        Coverage and complete-row filtering apply to the entire supplied frame.
+        Historical simulations must therefore perform universe eligibility on
+        formation-only data rather than using a future-inclusive cleaned frame.
+        """
         if not isinstance(prices, pd.DataFrame):
             raise TypeError("prices must be a pandas DataFrame.")
         if prices.empty or prices.shape[1] == 0:
@@ -250,8 +387,13 @@ class MarketDataLoader:
         frame = frame.loc[~frame.index.duplicated(keep="last")].sort_index()
 
         numeric = frame.apply(pd.to_numeric, errors="coerce")
-        non_positive = numeric.le(0) & numeric.notna()
-        valid = numeric.mask(non_positive)
+        finite = pd.DataFrame(
+            np.isfinite(numeric.to_numpy(dtype=float)),
+            index=numeric.index,
+            columns=numeric.columns,
+        )
+        non_positive = numeric.le(0) & numeric.notna() & finite
+        valid = numeric.where(finite).mask(non_positive)
         coverage = valid.notna().mean()
         retained = coverage.ge(min_coverage)
 

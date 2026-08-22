@@ -2,6 +2,7 @@ CREATE TABLE IF NOT EXISTS prices (
     date DATE NOT NULL,
     symbol VARCHAR NOT NULL,
     adjusted_close DOUBLE NOT NULL,
+    observed BOOLEAN NOT NULL,
     source VARCHAR NOT NULL,
     loaded_at TIMESTAMP NOT NULL,
     CONSTRAINT prices_date_symbol_source_unique UNIQUE (date, symbol, source)
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS pair_screening_results (
     cointegration_statistic DOUBLE,
     cointegration_pvalue DOUBLE,
     corrected_pvalue DOUBLE,
+    cointegration_critical_values VARCHAR NOT NULL,
     adf_statistic DOUBLE,
     adf_pvalue DOUBLE,
     half_life DOUBLE,

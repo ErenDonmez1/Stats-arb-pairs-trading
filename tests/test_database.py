@@ -15,6 +15,7 @@ import pandas as pd
 import pytest
 
 import pairs_trading.database as database_module
+from pairs_trading.backtest import build_position_schedule
 from pairs_trading.database import (
     QUALITY_COLUMNS,
     SCREENING_RESULT_COLUMNS,
@@ -30,8 +31,12 @@ from pairs_trading.database import (
     store_prices,
     summarise_screening_runs,
 )
-from pairs_trading.data import MarketDataLoader
-from pairs_trading.screening import PairScreeningResult
+from pairs_trading.data import (
+    OBSERVED_PRICE_MASK_ATTR,
+    MarketDataLoader,
+    make_synthetic_universe,
+)
+from pairs_trading.screening import PairScreeningResult, screen_pairs
 
 
 PRICE_COLUMNS = ["ZZZ", "AAA"]
@@ -86,6 +91,15 @@ def _expected_prices(prices: pd.DataFrame) -> pd.DataFrame:
     expected = expected.sort_index().reindex(sorted(expected.columns), axis=1)
     expected = expected.astype(float)
     expected.columns.name = None
+    expected.attrs[OBSERVED_PRICE_MASK_ATTR] = pd.DataFrame(
+        True,
+        index=expected.index.copy(),
+        columns=expected.columns.copy(),
+        dtype=bool,
+    )
+    expected.attrs["valuation_policy"] = (
+        "database_observed_provenance; execution_requires_observed"
+    )
     return expected
 
 
@@ -183,6 +197,7 @@ def _replace_screening_table_with_observation_limit(
             cointegration_statistic DOUBLE,
             cointegration_pvalue DOUBLE,
             corrected_pvalue DOUBLE,
+            cointegration_critical_values VARCHAR NOT NULL,
             adf_statistic DOUBLE,
             adf_pvalue DOUBLE,
             half_life DOUBLE,
@@ -205,7 +220,8 @@ def test_schema_creation_is_idempotent_and_preserves_existing_data() -> None:
         connection.execute(
             """
             INSERT INTO prices VALUES
-                (DATE '2024-01-01', 'AAA', 100.0, 'test', TIMESTAMP '2024-02-01')
+                (DATE '2024-01-01', 'AAA', 100.0, TRUE, 'test',
+                 TIMESTAMP '2024-02-01')
             """
         )
 
@@ -232,6 +248,7 @@ def test_schema_has_required_tables_columns_and_unique_keys() -> None:
             ("date", "DATE", True),
             ("symbol", "VARCHAR", True),
             ("adjusted_close", "DOUBLE", True),
+            ("observed", "BOOLEAN", True),
             ("source", "VARCHAR", True),
             ("loaded_at", "TIMESTAMP", True),
         ]
@@ -253,8 +270,10 @@ def test_schema_has_required_tables_columns_and_unique_keys() -> None:
 
         duplicate_price = """
             INSERT INTO prices VALUES
-            (DATE '2024-01-01', 'AAA', 1.0, 'test', TIMESTAMP '2024-01-01'),
-            (DATE '2024-01-01', 'AAA', 2.0, 'test', TIMESTAMP '2024-01-02')
+            (DATE '2024-01-01', 'AAA', 1.0, TRUE, 'test',
+             TIMESTAMP '2024-01-01'),
+            (DATE '2024-01-01', 'AAA', 2.0, FALSE, 'test',
+             TIMESTAMP '2024-01-02')
         """
         with pytest.raises(duckdb.ConstraintException):
             connection.execute(duplicate_price)
@@ -302,8 +321,14 @@ def test_caller_supplied_connection_remains_open_after_success_and_failure(
         store_prices(connection, _prices(), source="test")
         assert connection.execute("SELECT COUNT(*) FROM prices").fetchone() == (6,)
 
-        monkeypatch.setattr(database_module, "_load_schema", lambda: "INVALID SQL")
-        with pytest.raises(duckdb.ParserException):
+        monkeypatch.setattr(
+            database_module,
+            "_validate_schema",
+            lambda connection: (_ for _ in ()).throw(
+                RuntimeError("deliberate schema validation failure")
+            ),
+        )
+        with pytest.raises(RuntimeError, match="deliberate"):
             initialise_database(connection)
         assert connection.execute("SELECT 1").fetchone() == (1,)
     finally:
@@ -379,7 +404,7 @@ def test_prices_round_trip_and_are_stored_as_long_rows(tmp_path: Path) -> None:
     try:
         rows = connection.execute(
             """
-            SELECT date, symbol, adjusted_close, source, loaded_at
+            SELECT date, symbol, adjusted_close, observed, source, loaded_at
             FROM prices ORDER BY date, symbol
             """
         ).fetchall()
@@ -388,6 +413,7 @@ def test_prices_round_trip_and_are_stored_as_long_rows(tmp_path: Path) -> None:
             datetime(2024, 1, 1).date(),
             "AAA",
             51.0,
+            True,
             "synthetic",
             datetime(2024, 2, 1, 12),
         )
@@ -467,14 +493,21 @@ def test_repeated_price_write_updates_value_and_timestamp_without_duplicate(
     path = tmp_path / "upsert.duckdb"
     original = _prices().iloc[[0], [0]]
     replacement = original * 2
+    original.attrs[OBSERVED_PRICE_MASK_ATTR] = pd.DataFrame(
+        False, index=original.index, columns=original.columns
+    )
+    replacement.attrs[OBSERVED_PRICE_MASK_ATTR] = pd.DataFrame(
+        True, index=replacement.index, columns=replacement.columns
+    )
     store_prices(path, original, source="test", loaded_at="2024-02-01")
     store_prices(path, replacement, source="test", loaded_at="2024-02-02")
 
     connection = duckdb.connect(str(path), read_only=True)
     try:
         assert connection.execute(
-            "SELECT COUNT(*), MIN(adjusted_close), MIN(loaded_at) FROM prices"
-        ).fetchone() == (1, 206.0, datetime(2024, 2, 2))
+            "SELECT COUNT(*), MIN(adjusted_close), MIN(observed), "
+            "MIN(loaded_at) FROM prices"
+        ).fetchone() == (1, 206.0, True, datetime(2024, 2, 2))
     finally:
         connection.close()
 
@@ -503,6 +536,165 @@ def test_store_prices_does_not_mutate_input(tmp_path: Path) -> None:
     store_prices(tmp_path / "immutable.duckdb", prices, source="test")
 
     pd.testing.assert_frame_equal(prices, before)
+
+
+def test_cleaned_observation_provenance_survives_database_round_trip(
+    tmp_path: Path,
+) -> None:
+    raw = pd.DataFrame(
+        {
+            "AAA": [100.0, np.nan, 102.0, 103.0],
+            "BBB": [50.0, 51.0, 52.0, 53.0],
+        },
+        index=pd.date_range("2024-01-01", periods=4),
+    )
+    clean, _ = MarketDataLoader.clean(
+        raw,
+        min_coverage=0.75,
+        max_forward_fill=1,
+        min_observations=4,
+    )
+    path = tmp_path / "observed-roundtrip.duckdb"
+
+    store_prices(path, clean, source="cleaned")
+    loaded = load_prices(path, source="cleaned", symbols=["AAA", "BBB"])
+
+    pd.testing.assert_frame_equal(
+        loaded,
+        clean.rename_axis("date").astype(float),
+        check_freq=False,
+    )
+    pd.testing.assert_frame_equal(
+        loaded.attrs[OBSERVED_PRICE_MASK_ATTR],
+        clean.attrs[OBSERVED_PRICE_MASK_ATTR].rename_axis("date"),
+        check_freq=False,
+    )
+    assert bool(loaded.attrs[OBSERVED_PRICE_MASK_ATTR].loc["2024-01-02", "AAA"]) is False
+    assert bool(loaded.attrs[OBSERVED_PRICE_MASK_ATTR].loc["2024-01-03", "AAA"]) is True
+    assert "execution_requires_observed" in loaded.attrs["valuation_policy"]
+
+
+def test_persisted_imputed_price_cannot_authorize_backtest_execution(
+    tmp_path: Path,
+) -> None:
+    dates = pd.date_range("2024-01-01", periods=3)
+    raw = pd.DataFrame(
+        {
+            "AAA": [100.0, np.nan, 102.0],
+            "BBB": [50.0, 51.0, 52.0],
+        },
+        index=dates,
+    )
+    clean, _ = MarketDataLoader.clean(
+        raw,
+        min_coverage=2 / 3,
+        max_forward_fill=1,
+        min_observations=3,
+    )
+    path = tmp_path / "provenance-execution.duckdb"
+    store_prices(path, clean, source="cleaned")
+    loaded = load_prices(
+        path,
+        source="cleaned",
+        symbols=["AAA", "BBB"],
+    )
+    signals = pd.DataFrame(
+        {
+            "state": ["LONG_SPREAD", "LONG_SPREAD", "LONG_SPREAD"],
+            "event": ["ENTER_LONG", "NONE", "NONE"],
+        },
+        index=loaded.index,
+    )
+
+    schedule = build_position_schedule(
+        loaded["AAA"],
+        loaded["BBB"],
+        signals,
+        hedge_ratio=1.0,
+        target_gross_notional=2_000.0,
+    )
+
+    imputed_date = loaded.index[1]
+    next_observed_date = loaded.index[2]
+    assert np.isfinite(loaded.loc[imputed_date, "AAA"])
+    assert not bool(
+        loaded.attrs[OBSERVED_PRICE_MASK_ATTR].loc[imputed_date, "AAA"]
+    )
+    assert not bool(schedule.loc[imputed_date, "observed_y"])
+    assert schedule.loc[imputed_date, "executed_state"] == "FLAT"
+    assert schedule.loc[imputed_date, "execution_event"] == "NONE"
+    assert schedule.loc[next_observed_date, "execution_event"] == "ENTER_LONG"
+
+
+def test_price_provenance_slicing_preserves_exact_alignment(tmp_path: Path) -> None:
+    raw = pd.DataFrame(
+        {
+            "AAA": [100.0, np.nan, 102.0, 103.0],
+            "BBB": [50.0, 51.0, 52.0, 53.0],
+        },
+        index=pd.date_range("2024-01-01", periods=4),
+    )
+    clean, _ = MarketDataLoader.clean(
+        raw,
+        min_coverage=0.75,
+        max_forward_fill=1,
+        min_observations=4,
+    )
+    path = tmp_path / "observed-slicing.duckdb"
+    store_prices(path, clean, source="cleaned")
+
+    loaded = load_prices(
+        path,
+        source="cleaned",
+        symbols=["BBB", "AAA"],
+        start="2024-01-02",
+        end="2024-01-03",
+    )
+    mask = loaded.attrs[OBSERVED_PRICE_MASK_ATTR]
+
+    assert loaded.columns.tolist() == ["BBB", "AAA"]
+    assert mask.index.equals(loaded.index)
+    assert mask.columns.equals(loaded.columns)
+    assert mask.dtypes.eq(bool).all()
+    assert bool(mask.loc["2024-01-02", "AAA"]) is False
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["non-frame", "non-boolean", "missing", "index", "columns"],
+)
+def test_malformed_observed_price_masks_are_rejected(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    prices = _prices().iloc[:2].copy(deep=True)
+    mask: Any = pd.DataFrame(
+        True, index=prices.index.copy(), columns=prices.columns.copy()
+    )
+    if case == "non-frame":
+        mask = np.ones(prices.shape, dtype=bool)
+    elif case == "non-boolean":
+        mask = mask.astype(object)
+        mask.iloc[0, 0] = 1
+    elif case == "missing":
+        mask = mask.astype(object)
+        mask.iloc[0, 0] = pd.NA
+    elif case == "index":
+        mask.index = pd.date_range("2030-01-01", periods=len(mask))
+    elif case == "columns":
+        mask = mask.iloc[:, ::-1]
+    prices.attrs[OBSERVED_PRICE_MASK_ATTR] = mask
+
+    with pytest.raises((TypeError, ValueError), match="observed_price_mask"):
+        store_prices(tmp_path / "bad-mask.duckdb", prices, source="test")
+
+
+def test_cleaned_claim_without_provenance_mask_is_rejected(tmp_path: Path) -> None:
+    prices = _prices()
+    prices.attrs["valuation_policy"] = "cleaned valuation data"
+
+    with pytest.raises(ValueError, match="observed_price_mask"):
+        store_prices(tmp_path / "missing-mask.duckdb", prices, source="test")
 
 
 def test_timezone_aware_price_dates_are_converted_to_utc_naive_dates(
@@ -609,12 +801,143 @@ def test_legitimate_empty_price_query_returns_typed_empty_frame(
     path = tmp_path / "empty-query.duckdb"
     initialise_database(path)
 
-    result = load_prices(path, source="unknown", symbols=["BBB", "AAA"])
+    result = load_prices(
+        path,
+        source="unknown",
+        symbols=["BBB", "AAA"],
+        strict=False,
+    )
 
     assert result.empty
     assert isinstance(result.index, pd.DatetimeIndex)
     assert result.index.dtype == "datetime64[ns]"
-    assert result.columns.tolist() == ["AAA", "BBB"]
+    assert result.columns.tolist() == ["BBB", "AAA"]
+    assert result.attrs[OBSERVED_PRICE_MASK_ATTR].columns.tolist() == ["BBB", "AAA"]
+
+
+def test_explicit_price_load_is_strict_by_default_and_non_strict_is_complete(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "partial-universe.duckdb"
+    store_prices(path, _prices(), source="test")
+
+    with pytest.raises(ValueError, match="missing requested symbols.*CCC"):
+        load_prices(path, source="test", symbols=["ZZZ", "CCC", "AAA"])
+
+    loaded = load_prices(
+        path,
+        source="test",
+        symbols=["ZZZ", "CCC", "AAA"],
+        strict=False,
+    )
+    mask = loaded.attrs[OBSERVED_PRICE_MASK_ATTR]
+    assert loaded.columns.tolist() == ["ZZZ", "CCC", "AAA"]
+    assert loaded["CCC"].isna().all()
+    assert mask["CCC"].eq(False).all()
+    assert mask.columns.equals(loaded.columns)
+
+
+def test_date_filtered_symbol_absence_is_not_silently_dropped(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "date-filtered-universe.duckdb"
+    prices = pd.DataFrame(
+        {"AAA": [100.0, 101.0], "BBB": [np.nan, 50.0]},
+        index=pd.to_datetime(["2024-01-01", "2024-01-02"]),
+    )
+    store_prices(path, prices[["AAA"]], source="test")
+    store_prices(path, prices.loc[[prices.index[1]], ["BBB"]], source="test")
+
+    with pytest.raises(ValueError, match="missing requested symbols.*BBB"):
+        load_prices(
+            path,
+            source="test",
+            symbols=["AAA", "BBB"],
+            start="2024-01-01",
+            end="2024-01-01",
+        )
+
+    loaded = load_prices(
+        path,
+        source="test",
+        symbols=["AAA", "BBB"],
+        start="2024-01-01",
+        end="2024-01-01",
+        strict=False,
+    )
+    assert loaded.columns.tolist() == ["AAA", "BBB"]
+    assert pd.isna(loaded.loc["2024-01-01", "BBB"])
+
+
+def test_duplicate_requested_symbols_are_rejected_before_query(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "duplicates.duckdb"
+    initialise_database(path)
+
+    with pytest.raises(ValueError, match="duplicates after normalisation"):
+        load_prices(path, source="test", symbols=["AAA", " aaa "])
+
+
+def test_strict_empty_price_load_raises_for_complete_requested_universe(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "strict-empty.duckdb"
+    initialise_database(path)
+
+    with pytest.raises(ValueError, match="none of the requested symbols"):
+        load_prices(path, source="test", symbols=["AAA", "BBB"])
+
+
+def test_missing_database_reads_do_not_create_typo_files(tmp_path: Path) -> None:
+    paths = [tmp_path / f"missing-{position}.duckdb" for position in range(4)]
+
+    with pytest.raises(FileNotFoundError):
+        load_prices(paths[0], source="test")
+    with pytest.raises(FileNotFoundError):
+        load_data_quality_report(paths[1], run_id="run")
+    with pytest.raises(FileNotFoundError):
+        load_pair_screening_results(paths[2], run_id="run")
+    with pytest.raises(FileNotFoundError):
+        summarise_screening_runs(paths[3])
+
+    assert all(not path.exists() for path in paths)
+
+
+def test_legacy_price_schema_without_provenance_is_rejected() -> None:
+    connection = duckdb.connect(":memory:")
+    try:
+        initialise_database(connection)
+        connection.execute("DROP TABLE prices")
+        connection.execute(
+            """
+            CREATE TABLE prices (
+                date DATE NOT NULL,
+                symbol VARCHAR NOT NULL,
+                adjusted_close DOUBLE NOT NULL,
+                source VARCHAR NOT NULL,
+                loaded_at TIMESTAMP NOT NULL,
+                UNIQUE (date, symbol, source)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO prices VALUES (
+                DATE '2024-01-01', 'AAA', 100.0, 'legacy',
+                TIMESTAMP '2024-02-01'
+            )
+            """
+        )
+
+        with pytest.raises(RuntimeError, match="missing columns.*observed"):
+            load_prices(connection, source="legacy")
+
+        assert connection.execute(
+            "SELECT adjusted_close FROM prices"
+        ).fetchall() == [(100.0,)]
+    finally:
+        connection.close()
 
 
 def test_failed_price_batch_rolls_back_without_partial_updates() -> None:
@@ -628,6 +951,7 @@ def test_failed_price_batch_rolls_back_without_partial_updates() -> None:
                 date DATE NOT NULL,
                 symbol VARCHAR NOT NULL,
                 adjusted_close DOUBLE NOT NULL CHECK (adjusted_close < 150),
+                observed BOOLEAN NOT NULL,
                 source VARCHAR NOT NULL,
                 loaded_at TIMESTAMP NOT NULL,
                 UNIQUE (date, symbol, source)
@@ -636,6 +960,9 @@ def test_failed_price_batch_rolls_back_without_partial_updates() -> None:
         )
         baseline = pd.DataFrame(
             {"AAA": [100.0]}, index=pd.DatetimeIndex(["2024-01-01"])
+        )
+        baseline.attrs[OBSERVED_PRICE_MASK_ATTR] = pd.DataFrame(
+            False, index=baseline.index, columns=baseline.columns
         )
         store_prices(connection, baseline, source="test", loaded_at="2024-02-01")
         failing_batch = pd.DataFrame(
@@ -652,8 +979,8 @@ def test_failed_price_batch_rolls_back_without_partial_updates() -> None:
             )
 
         assert connection.execute(
-            "SELECT symbol, adjusted_close, loaded_at FROM prices"
-        ).fetchall() == [("AAA", 100.0, datetime(2024, 2, 1))]
+            "SELECT symbol, adjusted_close, observed, loaded_at FROM prices"
+        ).fetchall() == [("AAA", 100.0, False, datetime(2024, 2, 1))]
     finally:
         connection.close()
 
@@ -708,6 +1035,8 @@ def test_repeated_quality_write_updates_fields_and_timestamp_without_duplicate(
         path, report, run_id="run", loaded_at="2024-02-01"
     )
     replacement = report.copy(deep=True)
+    replacement.loc[:, "valid_observations"] = 2
+    replacement.loc[:, "missing_or_invalid"] = 2
     replacement.loc[:, "coverage"] = 0.5
     replacement.loc[:, "retained"] = False
     store_data_quality_report(
@@ -803,6 +1132,44 @@ def test_invalid_quality_report_values_are_rejected(
     with pytest.raises((TypeError, ValueError)):
         store_data_quality_report(
             tmp_path / "invalid-quality.duckdb", report, run_id="run"
+        )
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        (
+            {"valid_observations": 2, "missing_or_invalid": 1},
+            "must equal total_observations",
+        ),
+        ({"non_positive": 2}, "must not exceed missing_or_invalid"),
+        ({"forward_filled": 2}, "must not exceed missing_or_invalid"),
+        ({"coverage": 0.5}, "must equal valid_observations"),
+        (
+            {
+                "total_observations": 0,
+                "valid_observations": 0,
+                "missing_or_invalid": 0,
+                "coverage": 0.0,
+            },
+            "must be positive",
+        ),
+    ],
+)
+def test_quality_report_cross_field_identities_are_validated(
+    tmp_path: Path,
+    updates: dict[str, Any],
+    message: str,
+) -> None:
+    report = _quality_report().loc[["BBB"]].copy(deep=True)
+    for field, value in updates.items():
+        report.loc["BBB", field] = value
+
+    with pytest.raises(ValueError, match=message):
+        store_data_quality_report(
+            tmp_path / "invalid-quality-identity.duckdb",
+            report,
+            run_id="run",
         )
 
 
@@ -912,12 +1279,10 @@ def test_failed_quality_batch_rolls_back_without_partial_updates() -> None:
             """
         )
         baseline = _quality_report().loc[["BBB"]].copy(deep=True)
-        baseline.loc[:, "coverage"] = 0.5
         store_data_quality_report(
             connection, baseline, run_id="run", loaded_at="2024-02-01"
         )
         failing = _quality_report().loc[["BBB", "AAA"]].copy(deep=True)
-        failing.loc["BBB", "coverage"] = 0.7
         failing.loc["AAA", "coverage"] = 1.0
 
         with pytest.raises(duckdb.ConstraintException):
@@ -927,7 +1292,7 @@ def test_failed_quality_batch_rolls_back_without_partial_updates() -> None:
 
         assert connection.execute(
             "SELECT symbol, coverage, loaded_at FROM data_quality_reports"
-        ).fetchall() == [("BBB", 0.5, datetime(2024, 2, 1))]
+        ).fetchall() == [("BBB", 0.75, datetime(2024, 2, 1))]
     finally:
         connection.close()
 
@@ -1012,6 +1377,7 @@ def test_screening_schema_has_required_columns_and_unique_key() -> None:
             ("cointegration_statistic", "DOUBLE", False),
             ("cointegration_pvalue", "DOUBLE", False),
             ("corrected_pvalue", "DOUBLE", False),
+            ("cointegration_critical_values", "VARCHAR", True),
             ("adf_statistic", "DOUBLE", False),
             ("adf_pvalue", "DOUBLE", False),
             ("half_life", "DOUBLE", False),
@@ -1073,6 +1439,11 @@ def test_pair_screening_results_round_trip_with_selected_and_rejected_fields(
     assert selected["spread_standard_deviation"] == pytest.approx(0.03)
     assert selected["cointegration_statistic"] == pytest.approx(-4.2)
     assert selected["cointegration_pvalue"] == pytest.approx(0.004)
+    assert selected["cointegration_critical_values"] == {
+        "1%": -3.9,
+        "5%": -3.3,
+        "10%": -3.0,
+    }
     assert selected["adf_statistic"] == pytest.approx(-4.0)
     assert selected["adf_pvalue"] == pytest.approx(0.006)
     assert bool(selected["selected"]) is True
@@ -1222,6 +1593,113 @@ def test_invalid_cointegration_critical_values_are_rejected(
             "run",
             "2023-01-01",
             "2023-12-31",
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "alpha",
+        "beta",
+        "spread_standard_deviation",
+        "cointegration_statistic",
+        "cointegration_pvalue",
+        "corrected_pvalue",
+        "adf_statistic",
+        "adf_pvalue",
+        "half_life",
+        "hurst",
+    ],
+)
+def test_selected_screening_results_require_complete_diagnostics(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    result = replace(_screening_result(), **{field: None})
+
+    with pytest.raises(ValueError, match="Selected pair"):
+        store_pair_screening_results(
+            tmp_path / "missing-selected-diagnostic.duckdb",
+            [result],
+            "run",
+            "2023-01-01",
+            "2023-12-31",
+        )
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"observations": 0},
+        {"beta": 0.0},
+        {"beta": -1.0},
+        {"spread_standard_deviation": 0.0},
+        {"spread_standard_deviation": -0.01},
+        {"half_life": float("inf")},
+        {"rejection_reasons": ("impossible",)},
+        {"cointegration_critical_values": {}},
+        {"cointegration_critical_values": {"5%": -3.3}},
+    ],
+)
+def test_semantically_impossible_selected_screening_rows_are_rejected(
+    tmp_path: Path,
+    updates: dict[str, Any],
+) -> None:
+    result = replace(_screening_result(), **updates)
+
+    with pytest.raises((TypeError, ValueError)):
+        store_pair_screening_results(
+            tmp_path / "impossible-selected.duckdb",
+            [result],
+            "run",
+            "2023-01-01",
+            "2023-12-31",
+        )
+
+
+def test_rejected_screening_result_requires_rejection_reason(tmp_path: Path) -> None:
+    result = replace(_screening_result(), selected=False, rank=None)
+
+    with pytest.raises(ValueError, match="at least one rejection reason"):
+        store_pair_screening_results(
+            tmp_path / "reasonless-rejected.duckdb",
+            [result],
+            "run",
+            "2023-01-01",
+            "2023-12-31",
+        )
+
+
+def test_real_screening_output_round_trips_under_database_invariants(
+    tmp_path: Path,
+) -> None:
+    prices, groups = make_synthetic_universe(n_days=500, seed=42)
+    results = screen_pairs(prices, groups, min_observations=300)
+    path = tmp_path / "real-screening-output.duckdb"
+
+    stored = store_pair_screening_results(
+        path,
+        results,
+        "real-run",
+        prices.index[0],
+        prices.index[-1],
+    )
+    loaded = load_pair_screening_results(path, "real-run")
+
+    assert stored == len(results)
+    assert len(loaded) == len(results)
+    assert loaded["selected"].any()
+    assert loaded.loc[loaded["selected"], "beta"].gt(0).all()
+    assert loaded.loc[loaded["selected"], "rank"].tolist() == list(
+        range(1, int(loaded["selected"].sum()) + 1)
+    )
+    for result in results:
+        row = loaded.loc[
+            (loaded["symbol_y"] == result.symbol_y)
+            & (loaded["symbol_x"] == result.symbol_x)
+        ].iloc[0]
+        assert row["cointegration_critical_values"] == dict(
+            result.cointegration_critical_values
         )
 
 
@@ -1781,7 +2259,7 @@ def test_screening_run_summaries_use_all_counts_and_selected_diagnostics(
             "CCC",
             rank=2,
             corrected_pvalue=0.06,
-            half_life=float("inf"),
+            half_life=12.0,
             hurst=0.4,
         ),
         _screening_result(
@@ -1815,7 +2293,7 @@ def test_screening_run_summaries_use_all_counts_and_selected_diagnostics(
     assert newer_summary["selected_pairs"] == 2
     assert newer_summary["selection_rate"] == pytest.approx(2 / 3)
     assert newer_summary["mean_corrected_pvalue"] == pytest.approx(0.05)
-    assert newer_summary["median_half_life"] == pytest.approx(8.0)
+    assert newer_summary["median_half_life"] == pytest.approx(10.0)
     assert newer_summary["mean_hurst"] == pytest.approx(0.30)
     assert newer_summary["latest_loaded_at"] == pd.Timestamp("2024-01-02")
 

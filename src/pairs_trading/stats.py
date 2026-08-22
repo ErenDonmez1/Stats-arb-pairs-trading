@@ -20,6 +20,10 @@ DEFAULT_HURST_MAX_LAG = 20
 _NEAR_DEGENERATE_RELATIVE_RANGE = 1e-12
 
 
+class SpreadValidationError(ValueError):
+    """Expected candidate-level spread infeasibility."""
+
+
 @dataclass(frozen=True)
 class ADFTestResult:
     """Immutable Augmented Dickey-Fuller test output."""
@@ -92,6 +96,20 @@ def _align_and_validate_prices(y: pd.Series, x: pd.Series) -> pd.DataFrame:
     return aligned
 
 
+def _align_and_validate_ordered_prices(
+    y: pd.Series,
+    x: pd.Series,
+    diagnostic_name: str,
+) -> pd.DataFrame:
+    """Validate prices whose aligned row order represents causal time."""
+    aligned = _align_and_validate_prices(y, x)
+    if not aligned.index.is_monotonic_increasing:
+        raise ValueError(
+            f"{diagnostic_name} requires a monotonically increasing aligned index."
+        )
+    return aligned
+
+
 def ols_spread(
     y: pd.Series,
     x: pd.Series,
@@ -132,7 +150,7 @@ def rolling_ols_spread(
     if type(lookback) is not int or lookback < 2:
         raise ValueError("lookback must be an integer of at least 2.")
 
-    aligned = _align_and_validate_prices(y, x)
+    aligned = _align_and_validate_ordered_prices(y, x, "Rolling OLS")
     if len(aligned) <= lookback:
         raise ValueError(
             "Rolling OLS requires at least lookback + 1 aligned observations."
@@ -194,7 +212,7 @@ def kalman_ols_spread(
             raise ValueError(f"{name} must be strictly positive.")
         validated[name] = numeric_value
 
-    aligned = _align_and_validate_prices(y, x)
+    aligned = _align_and_validate_ordered_prices(y, x, "Kalman OLS")
     if len(aligned) < 2:
         raise ValueError("Kalman OLS requires at least two aligned observations.")
 
@@ -276,10 +294,16 @@ def _validate_spread(
     """Return complete float observations after strict spread validation."""
     if not isinstance(spread, pd.Series):
         raise TypeError("spread must be exactly a one-dimensional pandas Series.")
+    if not spread.index.is_unique:
+        raise SpreadValidationError("spread must have a unique index.")
+    if not spread.index.is_monotonic_increasing:
+        raise SpreadValidationError(
+            f"{diagnostic_name} requires a monotonically increasing index."
+        )
 
     values = spread.copy(deep=True).dropna()
     if len(values) < minimum_observations:
-        raise ValueError(
+        raise SpreadValidationError(
             f"{diagnostic_name} requires at least "
             f"{minimum_observations} complete observations."
         )
@@ -288,17 +312,19 @@ def _validate_spread(
         lambda value: isinstance(value, Real) and not isinstance(value, bool)
     )
     if not bool(numeric.all()):
-        raise ValueError("spread observations must be numeric.")
+        raise SpreadValidationError("spread observations must be numeric.")
 
     values = values.astype(float)
     array = values.to_numpy()
     if not np.isfinite(array).all():
-        raise ValueError("spread observations must be finite.")
+        raise SpreadValidationError("spread observations must be finite.")
 
     value_range = float(np.ptp(array))
     scale = max(float(np.max(np.abs(array))), 1.0)
     if value_range <= _NEAR_DEGENERATE_RELATIVE_RANGE * scale:
-        raise ValueError("spread must not be constant or near-degenerate.")
+        raise SpreadValidationError(
+            "spread must not be constant or near-degenerate."
+        )
     return values
 
 
@@ -333,8 +359,9 @@ def estimate_half_life(spread: pd.Series) -> float:
     """Estimate mean-reversion half-life from a lagged-level regression.
 
     Fits ``delta_t = intercept + lambda * spread_(t-1) + error_t`` using at
-    least 30 complete observations. ``lambda >= 0`` is classified as not
-    mean-reverting and returns positive infinity.
+    least 30 complete observations. A finite OU-style half-life is returned
+    only when the implied discrete root ``phi = 1 + lambda`` satisfies
+    ``abs(phi) < 1``.
     """
     values = _validate_spread(
         spread,
@@ -357,7 +384,12 @@ def estimate_half_life(spread: pd.Series) -> float:
     )
     fitted = sm.OLS(regression["delta_spread"], design, missing="raise").fit()
     mean_reversion_coefficient = float(fitted.params["lagged_spread"])
-    if mean_reversion_coefficient >= 0:
+    autoregressive_root = 1.0 + mean_reversion_coefficient
+    if (
+        not np.isfinite(autoregressive_root)
+        or abs(autoregressive_root) >= 1.0
+        or np.isclose(abs(autoregressive_root), 1.0, rtol=1e-12, atol=1e-12)
+    ):
         return float("inf")
     return float(-np.log(2.0) / mean_reversion_coefficient)
 
@@ -398,7 +430,9 @@ def estimate_hurst(
         dtype=float,
     )
     if not np.isfinite(dispersions).all() or np.any(dispersions <= 0):
-        raise ValueError("Hurst lagged-difference dispersions are degenerate.")
+        raise SpreadValidationError(
+            "Hurst lagged-difference dispersions are degenerate."
+        )
 
     design = pd.DataFrame(
         {
@@ -410,7 +444,9 @@ def estimate_hurst(
     fitted = sm.OLS(response, design, missing="raise").fit()
     hurst = float(fitted.params["log_lag"])
     if not np.isfinite(hurst):
-        raise ValueError("Hurst estimation produced a non-finite result.")
+        raise SpreadValidationError(
+            "Hurst estimation produced a non-finite result."
+        )
     return hurst
 
 

@@ -12,6 +12,7 @@ from statsmodels.tsa.stattools import adfuller
 from pairs_trading.stats import (
     ADFTestResult,
     SpreadDiagnostics,
+    SpreadValidationError,
     adf_test,
     diagnose_spread,
     estimate_half_life,
@@ -201,6 +202,39 @@ def test_future_price_changes_do_not_alter_earlier_rolling_estimates() -> None:
     )
 
 
+@pytest.mark.parametrize("order", ["descending", "shuffled"])
+def test_rolling_ols_rejects_nonchronological_inputs(order: str) -> None:
+    y, x = noisy_relationship(periods=40)
+    positions = (
+        np.arange(len(y) - 1, -1, -1)
+        if order == "descending"
+        else np.random.default_rng(801).permutation(len(y))
+    )
+
+    with pytest.raises(ValueError, match="monotonically increasing"):
+        rolling_ols_spread(y.iloc[positions], x.iloc[positions], lookback=10)
+
+
+def test_static_ols_is_unchanged_by_simultaneous_permutation() -> None:
+    y, x = noisy_relationship(periods=60)
+    positions = np.random.default_rng(802).permutation(len(y))
+
+    original_spread, original_alpha, original_beta = ols_spread(y, x)
+    permuted_spread, permuted_alpha, permuted_beta = ols_spread(
+        y.iloc[positions], x.iloc[positions]
+    )
+
+    assert permuted_alpha == pytest.approx(original_alpha, abs=1e-12)
+    assert permuted_beta == pytest.approx(original_beta, abs=1e-12)
+    pd.testing.assert_series_equal(
+        permuted_spread.sort_index(),
+        original_spread.sort_index(),
+        check_exact=False,
+        check_freq=False,
+        atol=1e-12,
+    )
+
+
 @pytest.mark.parametrize("lookback", [True, 1, 0, -2, 5.5, "5"])
 def test_invalid_lookbacks_are_rejected(lookback: object) -> None:
     y, x = noisy_relationship(periods=20)
@@ -228,6 +262,23 @@ def test_constant_explanatory_series_has_explicit_variance_policy() -> None:
 
     rolling = rolling_ols_spread(y, x, lookback=5)
     assert rolling.isna().all().all()
+
+
+@pytest.mark.parametrize(
+    "estimator",
+    [
+        lambda y, x: ols_spread(y, x),
+        lambda y, x: rolling_ols_spread(y, x, lookback=5),
+        lambda y, x: kalman_ols_spread(y, x),
+    ],
+)
+def test_price_estimators_reject_duplicate_indexes(estimator) -> None:
+    y, x = noisy_relationship(periods=20)
+    duplicate_y = pd.concat([y, y.iloc[[5]]])
+    duplicate_x = pd.concat([x, x.iloc[[5]]])
+
+    with pytest.raises(ValueError, match="unique"):
+        estimator(duplicate_y, duplicate_x)
 
 
 def test_kalman_output_has_expected_columns_and_aligned_index() -> None:
@@ -311,6 +362,19 @@ def test_kalman_future_data_does_not_change_estimates_through_cutoff() -> None:
         original.iloc[: cutoff + 1],
         changed.iloc[: cutoff + 1],
     )
+
+
+@pytest.mark.parametrize("order", ["descending", "shuffled"])
+def test_kalman_rejects_nonchronological_inputs(order: str) -> None:
+    y, x = noisy_relationship(periods=40)
+    positions = (
+        np.arange(len(y) - 1, -1, -1)
+        if order == "descending"
+        else np.random.default_rng(803).permutation(len(y))
+    )
+
+    with pytest.raises(ValueError, match="monotonically increasing"):
+        kalman_ols_spread(y.iloc[positions], x.iloc[positions])
 
 
 def test_kalman_recovers_slowly_varying_hedge_ratio() -> None:
@@ -468,6 +532,33 @@ def test_non_negative_half_life_coefficient_returns_infinity() -> None:
     assert result == float("inf")
 
 
+def _exact_autoregression(phi: float, periods: int = 120) -> pd.Series:
+    if phi == 1.0:
+        values = np.arange(periods, dtype=float)
+    else:
+        values = np.empty(periods, dtype=float)
+        values[0] = 1.0
+        for position in range(1, periods):
+            values[position] = phi * values[position - 1]
+    return pd.Series(values, name="spread")
+
+
+@pytest.mark.parametrize("phi", [0.9, 0.2, -0.5, -0.99])
+def test_stationary_ar_roots_return_existing_ou_half_life(phi: float) -> None:
+    expected = -np.log(2.0) / (phi - 1.0)
+
+    assert estimate_half_life(_exact_autoregression(phi)) == pytest.approx(
+        expected, rel=1e-9, abs=1e-9
+    )
+
+
+@pytest.mark.parametrize("phi", [-1.0, -1.1, 1.0, 1.1])
+def test_unit_or_explosive_ar_roots_do_not_receive_finite_half_life(
+    phi: float,
+) -> None:
+    assert estimate_half_life(_exact_autoregression(phi)) == float("inf")
+
+
 def test_hurst_is_lower_for_mean_reversion_than_persistence() -> None:
     mean_reverting = ar1_process(phi=-0.45, periods=2_000, seed=8)
     persistent_increments = ar1_process(phi=0.8, periods=2_000, seed=9)
@@ -532,6 +623,53 @@ def test_missing_spread_values_are_dropped_consistently() -> None:
     actual = diagnose_spread(expanded)
 
     assert actual == expected
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [adf_test, estimate_half_life, estimate_hurst, diagnose_spread],
+)
+@pytest.mark.parametrize("order", ["descending", "shuffled"])
+def test_ordered_diagnostics_reject_nonchronological_sequences(
+    diagnostic,
+    order: str,
+) -> None:
+    spread = ar1_process(phi=0.65, periods=500, seed=35)
+    spread.index = pd.bdate_range("2020-01-01", periods=len(spread))
+    positions = (
+        np.arange(len(spread) - 1, -1, -1)
+        if order == "descending"
+        else np.random.default_rng(804).permutation(len(spread))
+    )
+
+    with pytest.raises(SpreadValidationError, match="monotonically increasing"):
+        diagnostic(spread.iloc[positions])
+
+
+def test_ordered_estimators_preserve_valid_increasing_index() -> None:
+    y, x = noisy_relationship(periods=60)
+    rolling = rolling_ols_spread(y, x, lookback=15)
+    kalman = kalman_ols_spread(y, x)
+    diagnostics_input = ar1_process(phi=0.6, periods=300, seed=36)
+    diagnostics_input.index = pd.bdate_range(
+        "2020-01-01", periods=len(diagnostics_input)
+    )
+
+    assert rolling.index.equals(y.index)
+    assert kalman.index.equals(y.index)
+    assert diagnose_spread(diagnostics_input).adf_observations > 0
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [adf_test, estimate_half_life, estimate_hurst, diagnose_spread],
+)
+def test_ordered_diagnostics_reject_duplicate_indexes(diagnostic) -> None:
+    spread = ar1_process(phi=0.65, periods=500, seed=37)
+    duplicate = pd.concat([spread, spread.iloc[[10]]])
+
+    with pytest.raises(SpreadValidationError, match="unique"):
+        diagnostic(duplicate)
 
 
 @pytest.mark.parametrize(

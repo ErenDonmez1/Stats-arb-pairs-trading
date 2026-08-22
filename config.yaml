@@ -14,12 +14,10 @@ universe:
 
 screening:
   formation_days: 504
-  min_correlation: 0.60
-  coint_pvalue: 0.05
-  adf_pvalue: 0.05
-  min_half_life: 2
-  max_half_life: 90
-  max_pairs_per_sector: 3
+  min_observations: 100
+  fdr_threshold: 0.05
+  max_half_life: 60
+  hurst_threshold: 0.5
 
 strategy:
   hedge_lookback: 120

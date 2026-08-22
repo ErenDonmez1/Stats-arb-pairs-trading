@@ -14,7 +14,12 @@ import pandas as pd
 from statsmodels.tools.sm_exceptions import InfeasibleTestError, MissingDataError
 from statsmodels.tsa.stattools import coint
 
-from .stats import ADF_MIN_OBSERVATIONS, diagnose_spread, ols_spread
+from .stats import (
+    ADF_MIN_OBSERVATIONS,
+    SpreadValidationError,
+    diagnose_spread,
+    ols_spread,
+)
 
 
 @dataclass(frozen=True, order=True)
@@ -60,6 +65,15 @@ class PairScreeningResult:
 
 class _PairEvaluationError(ValueError):
     """Expected candidate-specific validation failure."""
+
+    def __init__(self, reason: str, observations: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.observations = observations
+
+
+class _PairHypothesisError(RuntimeError):
+    """Expected unavailable Engle-Granger result after family eligibility."""
 
     def __init__(self, reason: str, observations: int) -> None:
         super().__init__(reason)
@@ -249,6 +263,9 @@ def _validated_pair_prices(
         raise _PairEvaluationError("non_finite_prices", observations)
     if aligned.le(0).any().any():
         raise _PairEvaluationError("non_positive_prices", observations)
+    for symbol in (candidate.symbol_y, candidate.symbol_x):
+        if aligned[symbol].nunique(dropna=False) < 2:
+            raise _PairEvaluationError("degenerate_prices", observations)
     return aligned
 
 
@@ -288,17 +305,34 @@ def _evaluate_candidate(
     symbol_y, symbol_x = candidate.symbol_y, candidate.symbol_x
     log_y = np.log(pair[symbol_y])
     log_x = np.log(pair[symbol_x])
-    statistic, pvalue, critical_values = coint(
-        log_y,
-        log_x,
-        trend="c",
-        autolag="aic",
-    )
+    try:
+        statistic, pvalue, critical_values = coint(
+            log_y,
+            log_x,
+            trend="c",
+            autolag="aic",
+        )
+    except (
+        FloatingPointError,
+        InfeasibleTestError,
+        MissingDataError,
+        np.linalg.LinAlgError,
+    ) as exc:
+        raise _PairHypothesisError(
+            f"statistical_estimation_failed:{type(exc).__name__}:{exc}",
+            len(pair),
+        ) from exc
     if not np.isfinite(statistic) or not np.isfinite(pvalue):
-        raise ValueError("Engle-Granger returned non-finite test output.")
+        raise _PairHypothesisError(
+            "statistical_estimation_failed:non_finite_cointegration_output",
+            len(pair),
+        )
     critical_array = np.asarray(critical_values, dtype=float)
     if critical_array.shape != (3,) or not np.isfinite(critical_array).all():
-        raise ValueError("Engle-Granger returned invalid critical values.")
+        raise _PairHypothesisError(
+            "statistical_estimation_failed:invalid_cointegration_critical_values",
+            len(pair),
+        )
 
     critical_mapping = {
         "1%": float(critical_array[0]),
@@ -313,10 +347,10 @@ def _evaluate_candidate(
             not np.isfinite(spread_standard_deviation)
             or spread_standard_deviation <= 0
         ):
-            raise ValueError(
+            raise SpreadValidationError(
                 "Spread standard deviation is non-positive or non-finite."
             )
-    except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+    except (SpreadValidationError, FloatingPointError, np.linalg.LinAlgError) as exc:
         return PairScreeningResult(
             symbol_y=symbol_y,
             symbol_x=symbol_x,
@@ -375,10 +409,11 @@ def screen_pairs(
 ) -> tuple[PairScreeningResult, ...]:
     """Evaluate, FDR-correct, select, and deterministically rank pairs.
 
-    Invalid data or expected numerical failures reject only the affected pair.
-    Rejected failures use a corrected p-value of one so they sort after valid
-    statistical results. Top-level API, group, boundary, and threshold errors
-    raise immediately.
+    Deterministic price eligibility is fixed before Engle-Granger testing.
+    Every eligible candidate remains in the BH family: an unavailable expected
+    test result contributes a conservative p-value of one. Unexpected
+    programming or invariant errors propagate instead of becoming rejections.
+    Screening FDR is separate from later strategy-scenario multiplicity.
     """
     _validate_price_frame(prices)
     if type(min_observations) is not int or min_observations < ADF_MIN_OBSERVATIONS:
@@ -401,39 +436,54 @@ def screen_pairs(
         raise ValueError("No candidate pairs were generated.")
     formation = _formation_slice(prices, formation_start, formation_end)
 
-    results: list[PairScreeningResult] = []
-    successful_positions: list[int] = []
-    successful_pvalues: list[float] = []
+    # Determine family eligibility for every candidate before observing any
+    # cointegration outcome. This prevents an early test result or failure from
+    # influencing which later hypotheses enter the multiplicity correction.
+    staged_results: list[PairScreeningResult | None] = []
+    eligible_candidates: list[tuple[int, PairCandidate]] = []
     for candidate in candidates:
         try:
-            result = _evaluate_candidate(formation, candidate, min_observations)
+            _validated_pair_prices(formation, candidate, min_observations)
         except _PairEvaluationError as exc:
-            result = _failed_result(candidate, exc.observations, exc.reason)
-        except (
-            ValueError,
-            FloatingPointError,
-            InfeasibleTestError,
-            MissingDataError,
-            np.linalg.LinAlgError,
-        ) as exc:
-            aligned_count = len(
-                formation.loc[:, [candidate.symbol_y, candidate.symbol_x]].dropna()
+            staged_results.append(
+                _failed_result(candidate, exc.observations, exc.reason)
             )
-            reason = f"statistical_estimation_failed:{type(exc).__name__}:{exc}"
-            result = _failed_result(candidate, aligned_count, reason)
         else:
-            successful_positions.append(len(results))
-            if result.cointegration_pvalue is None:
-                raise RuntimeError("Successful cointegration result has no p-value.")
-            successful_pvalues.append(result.cointegration_pvalue)
-        results.append(result)
+            eligible_candidates.append((len(staged_results), candidate))
+            staged_results.append(None)
 
-    adjusted = benjamini_hochberg(successful_pvalues)
-    for position, corrected in zip(successful_positions, adjusted):
+    family_positions = [position for position, _ in eligible_candidates]
+    family_pvalues: list[float] = []
+    for position, candidate in eligible_candidates:
+        try:
+            result = _evaluate_candidate(formation, candidate, min_observations)
+        except _PairHypothesisError as exc:
+            result = _failed_result(candidate, exc.observations, exc.reason)
+            family_pvalues.append(1.0)
+        else:
+            if result.cointegration_pvalue is None:
+                raise RuntimeError(
+                    "An evaluated cointegration hypothesis has no p-value."
+                )
+            family_pvalues.append(result.cointegration_pvalue)
+        staged_results[position] = result
+
+    if any(result is None for result in staged_results):
+        raise RuntimeError("Screening left an eligible hypothesis unevaluated.")
+    results = [result for result in staged_results if result is not None]
+
+    adjusted = benjamini_hochberg(family_pvalues)
+    for position, corrected in zip(family_positions, adjusted):
         result = results[position]
         reasons = list(result.rejection_reasons)
         if corrected > fdr_limit:
             reasons.append("corrected_cointegration_pvalue_above_threshold")
+        if (
+            result.beta is None
+            or not np.isfinite(result.beta)
+            or result.beta <= 0
+        ):
+            reasons.append("beta_not_finite_positive")
         if (
             result.half_life is None
             or not np.isfinite(result.half_life)

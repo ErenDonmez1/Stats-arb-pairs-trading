@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 import pairs_trading.screening as screening_module
+from pairs_trading.backtest import calculate_pair_units
 from pairs_trading.data import make_synthetic_universe
 from pairs_trading.screening import (
     PairCandidate,
@@ -17,6 +18,7 @@ from pairs_trading.screening import (
     generate_candidate_pairs,
     screen_pairs,
 )
+from pairs_trading.stats import SpreadDiagnostics, SpreadValidationError
 
 
 def compact_synthetic(
@@ -125,10 +127,14 @@ def test_known_cointegrated_pairs_rank_ahead_of_unrelated_pairs() -> None:
 
     assert positions[("TECH_A", "TECH_B")] < positions[("TECH_A", "TECH_C")]
     assert positions[("BANK_A", "BANK_B")] < positions[("BANK_A", "BANK_C")]
-    assert next(
+    intended = next(
         result for result in results
         if (result.symbol_y, result.symbol_x) == ("TECH_A", "TECH_B")
-    ).corrected_pvalue < 0.05
+    )
+    assert intended.corrected_pvalue < 0.05
+    assert intended.selected is True
+    assert intended.rank is not None
+    assert any(not result.selected for result in results)
 
 
 def test_screening_result_contains_all_required_fields() -> None:
@@ -163,6 +169,7 @@ def test_selected_ranks_are_consecutive_and_deterministic() -> None:
     second = screen_pairs(prices, groups, min_observations=300)
     selected = [result for result in first if result.selected]
 
+    assert selected
     assert [result.rank for result in selected] == list(range(1, len(selected) + 1))
     assert all(result.rank is None for result in first if not result.selected)
     assert first == second
@@ -285,7 +292,7 @@ def test_valid_cointegration_pvalues_remain_in_fdr_after_diagnostic_failure(
         return -3.0, next(raw_pvalues), np.array([-4.0, -3.5, -3.0])
 
     def fail_diagnostics(*args, **kwargs):
-        raise ValueError("deliberate diagnostic failure")
+        raise SpreadValidationError("deliberate diagnostic failure")
 
     monkeypatch.setattr(screening_module, "coint", fake_coint)
     monkeypatch.setattr(screening_module, "diagnose_spread", fail_diagnostics)
@@ -302,6 +309,262 @@ def test_valid_cointegration_pvalues_remain_in_fdr_after_diagnostic_failure(
         any(reason.startswith("spread_diagnostics_failed") for reason in result.rejection_reasons)
         for result in results
     )
+
+
+def _fake_diagnostics() -> SpreadDiagnostics:
+    return SpreadDiagnostics(
+        adf_statistic=-4.0,
+        adf_pvalue=0.01,
+        adf_lags=1,
+        adf_observations=90,
+        adf_critical_values={"1%": -3.5, "5%": -2.9, "10%": -2.6},
+        half_life=10.0,
+        hurst=0.25,
+    )
+
+
+def _three_symbol_prices() -> pd.DataFrame:
+    index = pd.bdate_range("2021-01-01", periods=100)
+    trend = np.linspace(3.0, 4.0, len(index))
+    return pd.DataFrame(
+        {
+            "A": np.exp(trend),
+            "B": np.exp(0.2 + 1.1 * trend),
+            "C": np.exp(0.4 + 1.2 * trend),
+        },
+        index=index,
+    )
+
+
+def _install_successful_diagnostic_stubs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_ols(y: pd.Series, x: pd.Series):
+        spread = pd.Series(
+            np.sin(np.linspace(0.0, 8.0, len(y))),
+            index=y.index,
+            name="spread",
+        )
+        return spread, 0.2, 1.1
+
+    monkeypatch.setattr(screening_module, "ols_spread", fake_ols)
+    monkeypatch.setattr(
+        screening_module,
+        "diagnose_spread",
+        lambda spread: _fake_diagnostics(),
+    )
+
+
+def test_entered_hypothesis_failure_remains_in_fixed_fdr_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _three_symbol_prices()
+    call_count = 0
+
+    def fake_coint(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise np.linalg.LinAlgError("expected candidate-level infeasibility")
+        pvalue = 0.01 if call_count == 2 else 0.04
+        return -3.0, pvalue, np.array([-4.0, -3.5, -3.0])
+
+    monkeypatch.setattr(screening_module, "coint", fake_coint)
+    _install_successful_diagnostic_stubs(monkeypatch)
+
+    results = screen_pairs(prices, min_observations=50)
+    by_pair = {(result.symbol_y, result.symbol_x): result for result in results}
+
+    assert by_pair[("A", "B")].corrected_pvalue == pytest.approx(1.0)
+    assert by_pair[("A", "C")].corrected_pvalue == pytest.approx(0.03)
+    assert by_pair[("B", "C")].corrected_pvalue == pytest.approx(0.06)
+    assert by_pair[("A", "B")].rejection_reasons[0].startswith(
+        "statistical_estimation_failed"
+    )
+
+
+def test_fdr_eligibility_is_fixed_before_any_cointegration_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _three_symbol_prices()
+    original_validate = screening_module._validated_pair_prices
+    eligibility_calls: list[tuple[str, str]] = []
+
+    def tracking_validate(formation, candidate, min_observations):
+        eligibility_calls.append((candidate.symbol_y, candidate.symbol_x))
+        return original_validate(formation, candidate, min_observations)
+
+    def fake_coint(*args, **kwargs):
+        assert eligibility_calls[:3] == [("A", "B"), ("A", "C"), ("B", "C")]
+        return -3.0, 0.02, np.array([-4.0, -3.5, -3.0])
+
+    monkeypatch.setattr(
+        screening_module,
+        "_validated_pair_prices",
+        tracking_validate,
+    )
+    monkeypatch.setattr(screening_module, "coint", fake_coint)
+    _install_successful_diagnostic_stubs(monkeypatch)
+
+    results = screen_pairs(prices, min_observations=50)
+
+    assert len(results) == 3
+
+
+def test_deterministic_preeligibility_rejection_stays_outside_fdr_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _three_symbol_prices()
+    prices["A"] = 100.0
+    monkeypatch.setattr(
+        screening_module,
+        "coint",
+        lambda *args, **kwargs: (
+            -3.0,
+            0.02,
+            np.array([-4.0, -3.5, -3.0]),
+        ),
+    )
+    _install_successful_diagnostic_stubs(monkeypatch)
+
+    results = screen_pairs(prices, min_observations=50)
+    by_pair = {(result.symbol_y, result.symbol_x): result for result in results}
+
+    assert by_pair[("A", "B")].corrected_pvalue is None
+    assert by_pair[("A", "C")].corrected_pvalue is None
+    assert by_pair[("B", "C")].corrected_pvalue == pytest.approx(0.02)
+
+
+@pytest.mark.parametrize("exception_type", [ValueError, TypeError])
+def test_unexpected_screening_errors_propagate(
+    monkeypatch: pytest.MonkeyPatch,
+    exception_type: type[Exception],
+) -> None:
+    prices = _three_symbol_prices()
+
+    def fail_coint(*args, **kwargs):
+        raise exception_type("programming regression")
+
+    monkeypatch.setattr(screening_module, "coint", fail_coint)
+
+    with pytest.raises(exception_type, match="programming regression"):
+        screen_pairs(prices, min_observations=50)
+
+
+def test_only_positive_beta_candidates_are_tradeable_and_ranked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _three_symbol_prices()
+    beta_by_pair = {
+        ("A", "B"): -1.0,
+        ("A", "C"): 0.0,
+        ("B", "C"): 1.25,
+    }
+    pvalue_by_pair = {
+        ("A", "B"): 0.001,
+        ("A", "C"): 0.005,
+        ("B", "C"): 0.02,
+    }
+
+    def fake_evaluate(formation, candidate, min_observations):
+        pair = (candidate.symbol_y, candidate.symbol_x)
+        return PairScreeningResult(
+            symbol_y=pair[0],
+            symbol_x=pair[1],
+            group=candidate.group,
+            observations=len(formation),
+            alpha=0.2,
+            beta=beta_by_pair[pair],
+            spread_standard_deviation=0.03,
+            cointegration_statistic=-4.0,
+            cointegration_pvalue=pvalue_by_pair[pair],
+            corrected_pvalue=None,
+            cointegration_critical_values={
+                "1%": -3.9,
+                "5%": -3.3,
+                "10%": -3.0,
+            },
+            adf_statistic=-4.0,
+            adf_pvalue=0.01,
+            half_life=10.0,
+            hurst=0.25,
+            selected=False,
+            rank=None,
+            rejection_reasons=(),
+        )
+
+    monkeypatch.setattr(screening_module, "_evaluate_candidate", fake_evaluate)
+
+    results = screen_pairs(prices, min_observations=50)
+    by_pair = {(result.symbol_y, result.symbol_x): result for result in results}
+    selected = [result for result in results if result.selected]
+
+    assert "beta_not_finite_positive" in by_pair[("A", "B")].rejection_reasons
+    assert "beta_not_finite_positive" in by_pair[("A", "C")].rejection_reasons
+    assert selected == [by_pair[("B", "C")]]
+    assert selected[0].rank == 1
+    units = calculate_pair_units(
+        "LONG_SPREAD",
+        price_y=100.0,
+        price_x=80.0,
+        hedge_ratio=selected[0].beta,
+        target_gross_notional=10_000.0,
+    )
+    assert units.units_y > 0
+    assert units.units_x < 0
+
+
+def test_explosive_half_life_cannot_pass_pair_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prices = _three_symbol_prices().loc[:, ["A", "B"]]
+
+    def fake_evaluate(formation, candidate, min_observations):
+        return PairScreeningResult(
+            symbol_y=candidate.symbol_y,
+            symbol_x=candidate.symbol_x,
+            group=candidate.group,
+            observations=len(formation),
+            alpha=0.2,
+            beta=1.1,
+            spread_standard_deviation=0.03,
+            cointegration_statistic=-4.0,
+            cointegration_pvalue=0.001,
+            corrected_pvalue=None,
+            cointegration_critical_values={
+                "1%": -3.9,
+                "5%": -3.3,
+                "10%": -3.0,
+            },
+            adf_statistic=-4.0,
+            adf_pvalue=0.01,
+            half_life=float("inf"),
+            hurst=0.25,
+            selected=False,
+            rank=None,
+            rejection_reasons=(),
+        )
+
+    monkeypatch.setattr(screening_module, "_evaluate_candidate", fake_evaluate)
+
+    result = screen_pairs(prices, min_observations=50)[0]
+
+    assert result.selected is False
+    assert result.rank is None
+    assert "half_life_not_finite_positive" in result.rejection_reasons
+
+
+@pytest.mark.parametrize("order", ["descending", "shuffled"])
+def test_screening_rejects_nonchronological_price_frames(order: str) -> None:
+    prices, groups = compact_synthetic(n_days=300)
+    positions = (
+        np.arange(len(prices) - 1, -1, -1)
+        if order == "descending"
+        else np.random.default_rng(805).permutation(len(prices))
+    )
+
+    with pytest.raises(ValueError, match="monotonically increasing"):
+        screen_pairs(prices.iloc[positions], groups, min_observations=100)
 
 
 def test_screening_results_are_deeply_immutable() -> None:

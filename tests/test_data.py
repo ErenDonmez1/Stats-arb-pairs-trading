@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -142,6 +143,36 @@ def test_invalid_prices_are_reported_and_limited_forward_filled() -> None:
     assert dates[3] not in clean.index
 
 
+def test_nonfinite_prices_are_invalid_before_coverage_fill_and_provenance() -> None:
+    dates = pd.bdate_range("2024-01-01", periods=5)
+    prices = pd.DataFrame(
+        {
+            "AAA": [100.0, np.inf, -np.inf, 103.0, 104.0],
+            "BBB": [200.0, 201.0, 202.0, 203.0, 204.0],
+        },
+        index=dates,
+    )
+    before = prices.copy(deep=True)
+
+    clean, report = MarketDataLoader.clean(
+        prices,
+        min_coverage=0.6,
+        max_forward_fill=1,
+        min_observations=4,
+    )
+
+    assert report.loc["AAA", "valid_observations"] == 3
+    assert report.loc["AAA", "missing_or_invalid"] == 2
+    assert report.loc["AAA", "coverage"] == pytest.approx(0.6)
+    assert report.loc["AAA", "forward_filled"] == 1
+    assert clean.loc[dates[1], "AAA"] == 100.0
+    assert dates[2] not in clean.index
+    assert np.isfinite(clean.to_numpy()).all()
+    observed = clean.attrs[OBSERVED_PRICE_MASK_ATTR]
+    assert not bool(observed.loc[dates[1], "AAA"])
+    pd.testing.assert_frame_equal(prices, before)
+
+
 def test_clean_preserves_observed_mask_for_forward_filled_prices() -> None:
     dates = pd.bdate_range("2024-01-01", periods=5)
     prices = pd.DataFrame(
@@ -209,6 +240,32 @@ def test_low_coverage_symbol_is_removed_but_remains_in_report() -> None:
     assert list(clean.columns) == ["AAA", "BBB"]
     assert bool(report.loc["LOW", "retained"]) is False
     assert report.loc["LOW", "coverage"] == pytest.approx(0.2)
+
+
+def test_coverage_scope_is_the_complete_frame_supplied_by_the_caller() -> None:
+    dates = pd.bdate_range("2024-01-01", periods=6)
+    full = pd.DataFrame(
+        {
+            "AAA": [10.0, 11.0, 12.0, np.nan, np.nan, np.nan],
+            "BBB": [20.0, 21.0, 22.0, 23.0, 24.0, 25.0],
+            "CCC": [30.0, 31.0, 32.0, 33.0, 34.0, 35.0],
+        },
+        index=dates,
+    )
+
+    formation_clean, formation_report = MarketDataLoader.clean(
+        full.iloc[:3], min_coverage=1.0, max_forward_fill=0, min_observations=3
+    )
+    _, full_report = MarketDataLoader.clean(
+        full,
+        min_coverage=0.75,
+        max_forward_fill=0,
+        min_observations=6,
+    )
+
+    assert "AAA" in formation_clean.columns
+    assert bool(formation_report.loc["AAA", "retained"])
+    assert not bool(full_report.loc["AAA", "retained"])
 
 
 def test_observed_mask_aligns_after_symbol_and_complete_row_filtering() -> None:
@@ -370,6 +427,163 @@ def test_cache_is_separate_for_different_ticker_universes(
     assert list(first.columns) == ["AAPL", "MSFT"]
     assert list(second.columns) == ["AAPL", "GOOG"]
     assert len(list(loader.cache_dir.glob("*.csv"))) == 2
+
+
+def test_cache_is_separate_for_different_intervals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def download(**kwargs: Any) -> pd.DataFrame:
+        calls.append(kwargs["interval"])
+        return provider_frame(kwargs["tickers"], periods=3)
+
+    install_mock_yfinance(monkeypatch, download)
+    loader = MarketDataLoader(tmp_path / "cache")
+
+    loader.download(
+        ["AAPL", "MSFT"],
+        start="2024-01-01",
+        end="2024-02-01",
+        interval="1d",
+    )
+    loader.download(
+        ["AAPL", "MSFT"],
+        start="2024-01-01",
+        end="2024-02-01",
+        interval="1h",
+    )
+
+    assert calls == ["1d", "1h"]
+    assert len(list(loader.cache_dir.glob("*.csv"))) == 2
+
+
+def test_open_ended_cache_identity_advances_with_utc_as_of_date(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def download(**kwargs: Any) -> pd.DataFrame:
+        nonlocal calls
+        calls += 1
+        return provider_frame(kwargs["tickers"], periods=3)
+
+    install_mock_yfinance(monkeypatch, download)
+    loader = MarketDataLoader(tmp_path / "cache")
+    monkeypatch.setattr(loader, "_cache_as_of_date", lambda: "2024-02-01")
+    loader.download(["AAPL", "MSFT"], start="2024-01-01")
+    loader.download(["AAPL", "MSFT"], start="2024-01-01")
+    monkeypatch.setattr(loader, "_cache_as_of_date", lambda: "2024-02-02")
+    loader.download(["AAPL", "MSFT"], start="2024-01-01")
+
+    assert calls == 2
+    assert len(list(loader.cache_dir.glob("*.csv"))) == 2
+
+
+def test_open_and_explicit_same_date_cache_requests_have_distinct_stable_identities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_ends: list[str | None] = []
+
+    def download(**kwargs: Any) -> pd.DataFrame:
+        requested_ends.append(kwargs["end"])
+        return provider_frame(kwargs["tickers"], periods=3)
+
+    install_mock_yfinance(monkeypatch, download)
+    loader = MarketDataLoader(tmp_path / "cache")
+    monkeypatch.setattr(loader, "_cache_as_of_date", lambda: "2024-02-01")
+
+    loader.download(["AAPL", "MSFT"], start="2024-01-01")
+    loader.download(["MSFT", "AAPL"], start="2024-01-01")
+    loader.download(
+        ["AAPL", "MSFT"],
+        start="2024-01-01",
+        end="2024-02-01",
+    )
+    loader.download(
+        ["MSFT", "AAPL"],
+        start="2024-01-01",
+        end="2024-02-01",
+    )
+
+    assert requested_ends == [None, "2024-02-01"]
+    assert len(list(loader.cache_dir.glob("*.csv"))) == 2
+
+
+def test_cache_metadata_is_exact_and_malformed_metadata_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def download(**kwargs: Any) -> pd.DataFrame:
+        nonlocal calls
+        calls += 1
+        return provider_frame(kwargs["tickers"], periods=3)
+
+    install_mock_yfinance(monkeypatch, download)
+    loader = MarketDataLoader(tmp_path / "cache")
+    loader.download(
+        ["AAPL", "MSFT"],
+        start="2024-01-01",
+        end="2024-02-01",
+        interval="1h",
+    )
+    metadata_path = next(loader.cache_dir.glob("*.csv.json"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["symbols"] == ["AAPL", "MSFT"]
+    assert metadata["start"] == "2024-01-01"
+    assert metadata["resolved_end"] == "2024-02-01"
+    assert metadata["interval"] == "1h"
+    assert metadata["source"] == "yahoo_finance"
+    assert metadata["adjustment_policy"] == "auto_adjust_true_close"
+    assert metadata["format_version"] == 1
+    assert metadata["retrieved_at_utc"].endswith("+00:00")
+
+    metadata_path.write_text("not-json", encoding="utf-8")
+    with pytest.raises(DataQualityError, match="cache metadata"):
+        loader.download(
+            ["AAPL", "MSFT"],
+            start="2024-01-01",
+            end="2024-02-01",
+            interval="1h",
+        )
+    assert calls == 1
+
+
+@pytest.mark.parametrize("metadata_root", [[], False, 0, ""])
+def test_non_mapping_cache_metadata_is_rejected_as_data_quality_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_root: Any,
+) -> None:
+    calls = 0
+
+    def download(**kwargs: Any) -> pd.DataFrame:
+        nonlocal calls
+        calls += 1
+        return provider_frame(kwargs["tickers"], periods=3)
+
+    install_mock_yfinance(monkeypatch, download)
+    loader = MarketDataLoader(tmp_path / "cache")
+    loader.download(
+        ["AAPL", "MSFT"],
+        start="2024-01-01",
+        end="2024-02-01",
+    )
+    metadata_path = next(loader.cache_dir.glob("*.csv.json"))
+    metadata_path.write_text(json.dumps(metadata_root), encoding="utf-8")
+
+    with pytest.raises(DataQualityError, match="JSON object"):
+        loader.download(
+            ["AAPL", "MSFT"],
+            start="2024-01-01",
+            end="2024-02-01",
+        )
+    assert calls == 1
 
 
 def test_flattened_provider_columns_are_supported(

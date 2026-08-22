@@ -10,7 +10,7 @@ Performance metrics remain outside this milestone.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from enum import Enum
 from numbers import Integral, Real
 from typing import Any, NamedTuple
@@ -55,6 +55,8 @@ _OUTPUT_COLUMNS = (
     "executed_state",
     "decision_event",
     "execution_event",
+    "execution_decision_row",
+    "execution_due_row",
     "hedge_ratio",
     "price_y",
     "price_x",
@@ -183,6 +185,32 @@ _TRADE_LEDGER_COLUMNS = (
     "forced_exit",
 )
 
+_TRADE_LEDGER_FLOAT_COLUMNS = frozenset(
+    {
+        "entry_price_y",
+        "entry_price_x",
+        "exit_price_y",
+        "exit_price_x",
+        "entry_units_y",
+        "entry_units_x",
+        "exit_units_y",
+        "exit_units_x",
+        "entry_hedge_ratio",
+        "exit_hedge_ratio",
+        "entry_gross_notional",
+        "gross_pnl",
+        "commission_cost",
+        "slippage_cost",
+        "transaction_cost",
+        "borrow_cost",
+        "financing_cost",
+        "carry_cost",
+        "total_cost",
+        "net_pnl",
+        "return_on_entry_gross_notional",
+    }
+)
+
 
 class TradeExitReason(str, Enum):
     """Canonical reasons recorded when an executed trade closes."""
@@ -301,6 +329,18 @@ class PairUnits(NamedTuple):
     units_x: float
 
 
+@dataclass(frozen=True)
+class _PendingOrder:
+    """One matured state target with immutable decision and due provenance."""
+
+    target_state: str
+    event: str
+    decision_position: int
+    decision_label: Any
+    due_position: int
+    due_label: Any
+
+
 def _positive_integer(value: Any, name: str) -> int:
     """Return a positive, non-Boolean integer within the int64 range."""
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
@@ -343,6 +383,16 @@ def _finite_nonnegative_scalar(value: Any, name: str) -> float:
     return normalised
 
 
+def _require_causal_index(index: pd.Index, name: str) -> None:
+    """Reject duplicate or nonchronological dated rows without sorting."""
+    if not index.is_unique:
+        raise ValueError(f"{name} must have a unique index.")
+    if isinstance(index, pd.DatetimeIndex) and not index.is_monotonic_increasing:
+        raise ValueError(
+            f"{name} DatetimeIndex must be monotonically increasing."
+        )
+
+
 def _normalise_state(value: Any, *, name: str = "state") -> str:
     """Return a canonical :class:`PositionState` member name."""
     if isinstance(value, PositionState):
@@ -383,8 +433,7 @@ def _validated_signals(signals: pd.DataFrame) -> pd.DataFrame:
     """Copy and validate the state/event contract emitted by signal generation."""
     if not isinstance(signals, pd.DataFrame):
         raise TypeError("signals must be a pandas DataFrame.")
-    if not signals.index.is_unique:
-        raise ValueError("signals must have a unique index.")
+    _require_causal_index(signals.index, "signals")
 
     required = {"state", "event"}
     missing = required.difference(signals.columns)
@@ -438,8 +487,7 @@ def _validated_market_series(
     """Copy a numeric Series, allowing missing rows solely for deferral."""
     if not isinstance(series, pd.Series):
         raise TypeError(f"{name} must be a pandas Series.")
-    if not series.index.is_unique:
-        raise ValueError(f"{name} must have a unique index.")
+    _require_causal_index(series.index, name)
 
     copied = series.copy(deep=True)
     non_missing = copied.loc[copied.notna()]
@@ -645,6 +693,34 @@ def calculate_pair_units(
     units_x = notional_x / normalised_price_x
     if not np.isfinite([units_y, units_x]).all():
         raise ValueError("Calculated pair units must be finite.")
+    if direction > 0 and not (units_y > 0.0 and units_x < 0.0):
+        raise ValueError(
+            "Calculated long-spread units must contain two representable, "
+            "nonzero legs."
+        )
+    if direction < 0 and not (units_y < 0.0 and units_x > 0.0):
+        raise ValueError(
+            "Calculated short-spread units must contain two representable, "
+            "nonzero legs."
+        )
+    with np.errstate(over="ignore", invalid="ignore"):
+        represented_gross = (
+            abs(units_y * normalised_price_y)
+            + abs(units_x * normalised_price_x)
+        )
+    if (
+        not np.isfinite(represented_gross)
+        or represented_gross <= 0.0
+        or not np.isclose(
+            represented_gross,
+            gross_target,
+            rtol=1e-12,
+            atol=0.0,
+        )
+    ):
+        raise ValueError(
+            "Calculated pair units cannot represent the target gross notional."
+        )
     return PairUnits(float(units_y), float(units_x))
 
 
@@ -674,6 +750,35 @@ def _mark_exposure(
     return float(notional_y), float(notional_x), float(gross), float(net)
 
 
+def _queue_matured_order(
+    pending_orders: deque[_PendingOrder],
+    order: _PendingOrder,
+    executed_state: str,
+) -> deque[_PendingOrder]:
+    """Apply one matured target while removing transitions it invalidates."""
+    if order.target_state != PositionState.FLAT.name:
+        pending_orders.append(order)
+        return pending_orders
+
+    if executed_state == PositionState.FLAT.name:
+        # The matured FLAT target invalidates every unfilled entry.  Any queued
+        # FLAT target is redundant because the real position is already flat.
+        return deque()
+
+    # The real position still needs one close.  Preserve the earliest matured
+    # close and its event provenance, while cancelling later entries and the
+    # redundant closes that existed only for those cancelled entries.
+    required_close = next(
+        (
+            candidate
+            for candidate in pending_orders
+            if candidate.target_state == PositionState.FLAT.name
+        ),
+        order,
+    )
+    return deque([required_close])
+
+
 def build_position_schedule(
     price_y: pd.Series,
     price_x: pd.Series,
@@ -690,10 +795,12 @@ def build_position_schedule(
     """Build a causal schedule of executed states, units, and raw exposures.
 
     State-changing orders become eligible after ``execution_lag`` rows.  If
-    either execution-row price is imputed/missing or the execution-available
-    hedge ratio is missing, the order remains pending.  A pending entry is
-    cancelled if the desired state changes before it fills.  At most one
-    state-changing order executes on a valid row, preventing same-row reversal.
+    either execution-row price is imputed or missing, the order remains
+    pending.  Entries additionally require an execution-available hedge ratio;
+    closing known units does not.  A matured FLAT target cancels later unfilled
+    entries while preserving the earliest close still required by the actual
+    executed position.  At most one state-changing order executes on a valid
+    row, preventing same-row reversal.
 
     Every execution, including a close, requires genuine observations for both
     current prices.  Forward-filled prices remain valid valuation marks only.
@@ -742,7 +849,7 @@ def build_position_schedule(
         hedge_ratio_lag,
     )
 
-    pending_orders: deque[tuple[str, str]] = deque()
+    pending_orders: deque[_PendingOrder] = deque()
     executed_state = PositionState.FLAT.name
     units_y = 0.0
     units_x = 0.0
@@ -760,39 +867,54 @@ def build_position_schedule(
             due_state = lagged["due_state"].iat[row_number]
             if due_state is None:  # Defensive: validation/lagging make this unreachable.
                 raise RuntimeError("A due event has no associated target state.")
-            if (
-                due_state == PositionState.FLAT.name
-                and executed_state == PositionState.FLAT.name
-            ):
-                # Only a matured FLAT decision may invalidate a deferred entry.
-                # Current-row signal state is deliberately ignored because it
-                # has not yet served its own execution lag.
-                pending_orders = deque(
-                    order
-                    for order in pending_orders
-                    if order[0] == PositionState.FLAT.name
-                )
-            else:
-                pending_orders.append((due_state, due_event))
+            decision_position = row_number - lag
+            matured_order = _PendingOrder(
+                target_state=due_state,
+                event=due_event,
+                decision_position=decision_position,
+                decision_label=price_y.index[decision_position],
+                due_position=row_number,
+                due_label=price_y.index[row_number],
+            )
+            # Only this matured target may change the pending path.  The
+            # current-row decision remains causally immature until its own due
+            # position.
+            pending_orders = _queue_matured_order(
+                pending_orders,
+                matured_order,
+                executed_state,
+            )
 
         # Discard a redundant target without presenting it as an execution.
-        while pending_orders and pending_orders[0][0] == executed_state:
+        while pending_orders and pending_orders[0].target_state == executed_state:
             pending_orders.popleft()
 
         current_y = y_array[row_number]
         current_x = x_array[row_number]
         current_beta = beta_array[row_number]
         execution_event = TradeEvent.NONE.value
-        execution_inputs_available = bool(
+        executed_order: _PendingOrder | None = None
+        prices_available = bool(
             np.isfinite(current_y)
             and np.isfinite(current_x)
-            and np.isfinite(current_beta)
             and observed_y_array[row_number]
             and observed_x_array[row_number]
         )
 
-        if pending_orders and execution_inputs_available:
-            target_state, source_event = pending_orders[0]
+        if pending_orders:
+            candidate = pending_orders[0]
+            beta_required = candidate.target_state != PositionState.FLAT.name
+            execution_inputs_available = bool(
+                prices_available
+                and (not beta_required or np.isfinite(current_beta))
+            )
+        else:
+            candidate = None
+            execution_inputs_available = False
+
+        if candidate is not None and execution_inputs_available:
+            target_state = candidate.target_state
+            source_event = candidate.event
             terminal_entry_suppressed = bool(
                 suppress_terminal_entries
                 and row_number == len(price_y) - 1
@@ -804,7 +926,7 @@ def build_position_schedule(
                 target_state = executed_state
                 source_event = TradeEvent.NONE.value
             else:
-                pending_orders.popleft()
+                executed_order = pending_orders.popleft()
             if (
                 executed_state != PositionState.FLAT.name
                 and target_state != PositionState.FLAT.name
@@ -841,6 +963,16 @@ def build_position_schedule(
                 executed_state,
                 decisions["decision_event"].iat[row_number],
                 execution_event,
+                (
+                    np.nan
+                    if executed_order is None
+                    else float(executed_order.decision_position)
+                ),
+                (
+                    np.nan
+                    if executed_order is None
+                    else float(executed_order.due_position)
+                ),
                 current_beta,
                 current_y,
                 current_x,
@@ -858,6 +990,8 @@ def build_position_schedule(
     result = pd.DataFrame.from_records(rows, columns=list(_OUTPUT_COLUMNS))
     result.index = price_y.index
     for column in (
+        "execution_decision_row",
+        "execution_due_row",
         "hedge_ratio",
         "price_y",
         "price_x",
@@ -885,8 +1019,7 @@ def _validated_position_schedule(schedule: pd.DataFrame) -> pd.DataFrame:
     """Copy and validate the state and unit contract from Milestone 6A."""
     if not isinstance(schedule, pd.DataFrame):
         raise TypeError("position_schedule must be a pandas DataFrame.")
-    if not schedule.index.is_unique:
-        raise ValueError("position_schedule must have a unique index.")
+    _require_causal_index(schedule.index, "position_schedule")
 
     required = {"executed_state", "execution_event", "units_y", "units_x"}
     missing = required.difference(schedule.columns)
@@ -2443,10 +2576,12 @@ def force_liquidate_open_position(
     accounting functions.  Normal 6C transaction costs then arise from the
     final unit deltas; no penalty fee is introduced.
 
-    Final prices and beta are taken from explicit aligned inputs when supplied,
+    Final prices are taken from explicit aligned inputs when supplied,
     otherwise from matching columns in ``position_schedule``.  Both final
     prices must be genuine observations rather than forward-filled valuation
-    marks.  This function does not backfill them.
+    marks.  Known units can be set to zero without a new hedge ratio.  The
+    ``hedge_ratio`` argument is retained for API compatibility but never
+    overwrites the schedule's causal, execution-available beta metadata.
     """
     if type(force_liquidation) is not bool:
         raise TypeError("force_liquidation must be a bool.")
@@ -2497,6 +2632,9 @@ def force_liquidate_open_position(
                 result.iat[final_row, result.columns.get_loc(column)] = 0.0
         if "rebalance" in result.columns:
             result.iat[final_row, result.columns.get_loc("rebalance")] = False
+        for column in ("execution_decision_row", "execution_due_row"):
+            if column in result.columns:
+                result.iat[final_row, result.columns.get_loc(column)] = np.nan
         _validated_position_schedule(result)
         result.index = position_schedule.index
         return result
@@ -2530,39 +2668,11 @@ def force_liquidate_open_position(
             "an open position."
         )
 
-    if hedge_ratio is None:
-        if "hedge_ratio" not in result.columns:
-            raise ValueError(
-                "hedge_ratio is required to force-liquidate an open position."
-            )
-        beta_values = _validated_market_series(
-            result["hedge_ratio"],
-            "hedge_ratio",
-            strictly_positive=True,
-        )
-    elif isinstance(hedge_ratio, pd.Series):
-        beta_values = _validated_market_series(
-            hedge_ratio,
-            "hedge_ratio",
-            strictly_positive=True,
-        )
-        _require_matching_index(result.index, hedge_ratio.index, "hedge_ratio")
-    else:
-        beta = _finite_positive_scalar(hedge_ratio, "hedge_ratio")
-        beta_values = pd.Series(beta, index=result.index, dtype=float)
-    final_beta = beta_values.iat[final_row]
-    if not np.isfinite(final_beta):
-        raise ValueError(
-            "Final hedge ratio must be available to force-liquidate an open "
-            "position."
-        )
-
     # If the schedule stores market inputs, keep its final row consistent with
     # the explicit current observations used to authorize the close.
     for column, current_value in (
         ("price_y", float(final_y)),
         ("price_x", float(final_x)),
-        ("hedge_ratio", float(final_beta)),
     ):
         if column in result.columns:
             result.iat[final_row, result.columns.get_loc(column)] = current_value
@@ -2585,6 +2695,9 @@ def force_liquidate_open_position(
             result.iat[final_row, result.columns.get_loc(column)] = 0.0
     if "rebalance" in result.columns:
         result.iat[final_row, result.columns.get_loc("rebalance")] = False
+    for column in ("execution_decision_row", "execution_due_row"):
+        if column in result.columns:
+            result.iat[final_row, result.columns.get_loc(column)] = np.nan
     if "observed_y" in result.columns:
         result.iat[final_row, result.columns.get_loc("observed_y")] = True
     if "observed_x" in result.columns:
@@ -2817,6 +2930,13 @@ def _finite_trade_endpoint(value: Any, name: str) -> float:
     return _finite_positive_scalar(value, name)
 
 
+def _optional_trade_endpoint(value: Any, name: str) -> float:
+    """Return a positive endpoint value or NaN when causal metadata is absent."""
+    if pd.isna(value):
+        return np.nan
+    return _finite_trade_endpoint(value, name)
+
+
 def build_trade_ledger(
     accounting_schedule: pd.DataFrame,
     position_schedule: pd.DataFrame | None = None,
@@ -2861,7 +2981,7 @@ def build_trade_ledger(
             hedge.iat[entry_row],
             "entry_hedge_ratio",
         )
-        exit_beta = _finite_trade_endpoint(
+        exit_beta = _optional_trade_endpoint(
             hedge.iat[exit_row],
             "exit_hedge_ratio",
         )
@@ -2988,6 +3108,95 @@ def _validated_ledger(ledger: pd.DataFrame) -> pd.DataFrame:
             strictly_positive=False,
         )
     return result
+
+
+def _assert_canonical_ledger(
+    actual: pd.DataFrame,
+    expected: pd.DataFrame,
+    *,
+    rtol: float,
+    atol: float,
+) -> None:
+    """Require the supplied ledger to equal the authoritative rebuilt ledger."""
+    if not actual.index.equals(expected.index):
+        raise ValueError("Backtest invariant failed: ledger index is not canonical.")
+    if len(actual) != len(expected):
+        raise ValueError("Backtest invariant failed: ledger trade count is not canonical.")
+
+    for column in _TRADE_LEDGER_COLUMNS:
+        if column in _TRADE_LEDGER_FLOAT_COLUMNS:
+            try:
+                actual_values = actual[column].to_numpy(dtype=float)
+                expected_values = expected[column].to_numpy(dtype=float)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"Backtest invariant failed: ledger {column} is not numeric."
+                ) from exc
+            if not np.array_equal(
+                np.isnan(actual_values),
+                np.isnan(expected_values),
+            ):
+                raise ValueError(
+                    f"Backtest invariant failed: ledger {column} has inconsistent NaNs."
+                )
+            known = ~np.isnan(expected_values)
+            if (
+                not np.isfinite(actual_values[known]).all()
+                or not np.allclose(
+                    actual_values[known],
+                    expected_values[known],
+                    rtol=rtol,
+                    atol=atol,
+                )
+            ):
+                raise ValueError(
+                    f"Backtest invariant failed: ledger {column} is not canonical."
+                )
+        elif not actual[column].equals(expected[column]):
+            raise ValueError(
+                f"Backtest invariant failed: ledger {column} is not canonical."
+            )
+
+
+def _assert_reconciliation_matches(
+    stored: LedgerReconciliation,
+    recomputed: LedgerReconciliation,
+    *,
+    rtol: float,
+    atol: float,
+) -> None:
+    """Require a stored reconciliation to match current result components."""
+    if not isinstance(stored, LedgerReconciliation):
+        raise TypeError("reconciliation must be a LedgerReconciliation.")
+    for field_info in fields(LedgerReconciliation):
+        stored_value = getattr(stored, field_info.name)
+        recomputed_value = getattr(recomputed, field_info.name)
+        if isinstance(recomputed_value, Real) and not isinstance(
+            recomputed_value,
+            (bool, np.bool_),
+        ):
+            stored_number = float(stored_value)
+            recomputed_number = float(recomputed_value)
+            matches = bool(
+                (np.isnan(stored_number) and np.isnan(recomputed_number))
+                or (
+                    np.isfinite(stored_number)
+                    and np.isfinite(recomputed_number)
+                    and np.isclose(
+                        stored_number,
+                        recomputed_number,
+                        rtol=rtol,
+                        atol=atol,
+                    )
+                )
+            )
+        else:
+            matches = stored_value == recomputed_value
+        if not matches:
+            raise ValueError(
+                "Backtest invariant failed: stored reconciliation is stale "
+                f"for field {field_info.name}."
+            )
 
 
 def _rows_total(
@@ -3257,8 +3466,12 @@ def validate_backtest_invariants(
             raise TypeError(f"result.{name} must be a pandas DataFrame.")
         if not frame.index.is_unique:
             raise ValueError(f"result.{name} must have a unique index.")
+    _require_causal_index(signals.index, "result.signals")
+    _require_causal_index(positions.index, "result.positions")
+    _require_causal_index(accounting.index, "result.accounting")
     _require_matching_index(positions.index, signals.index, "signals")
     _require_matching_index(positions.index, accounting.index, "accounting")
+    _validated_signals(signals)
 
     required_accounting = {
         "pnl_y",
@@ -3292,6 +3505,7 @@ def validate_backtest_invariants(
         "rebalance_decision_row",
         "observed_y",
         "observed_x",
+        "hedge_ratio",
     }
     missing_positions = required_positions.difference(positions.columns)
     if missing_positions:
@@ -3395,7 +3609,29 @@ def validate_backtest_invariants(
                 "Backtest invariant failed: forced liquidation left open units."
             )
 
-    for row in ledger.itertuples(index=False):
+    checked_ledger = _validated_ledger(ledger)
+    canonical_ledger = build_trade_ledger(accounting, positions)
+    _assert_canonical_ledger(
+        checked_ledger,
+        canonical_ledger,
+        rtol=relative_tolerance,
+        atol=absolute_tolerance,
+    )
+    recomputed_reconciliation = reconcile_trade_ledger(
+        checked_ledger,
+        accounting,
+        positions,
+        rtol=relative_tolerance,
+        atol=absolute_tolerance,
+    )
+    _assert_reconciliation_matches(
+        result.reconciliation,
+        recomputed_reconciliation,
+        rtol=relative_tolerance,
+        atol=absolute_tolerance,
+    )
+
+    for row in checked_ledger.itertuples(index=False):
         known = np.isfinite(
             [row.gross_pnl, row.total_cost, row.net_pnl]
         ).all()

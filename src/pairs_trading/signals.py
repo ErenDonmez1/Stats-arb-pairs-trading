@@ -97,6 +97,16 @@ def _valid_ddof(value: Any, lookback: int) -> int:
     return normalised
 
 
+def _require_causal_index(index: pd.Index, name: str) -> None:
+    """Reject duplicate or nonchronological dated observations without sorting."""
+    if not index.is_unique:
+        raise ValueError(f"{name} must have a unique index.")
+    if isinstance(index, pd.DatetimeIndex) and not index.is_monotonic_increasing:
+        raise ValueError(
+            f"{name} DatetimeIndex must be monotonically increasing."
+        )
+
+
 def _validated_spread(
     spread: pd.Series,
     lookback: Any,
@@ -105,8 +115,7 @@ def _validated_spread(
     """Return an independent float spread after strict structural validation."""
     if not isinstance(spread, pd.Series):
         raise TypeError("spread must be a pandas Series.")
-    if not spread.index.is_unique:
-        raise ValueError("spread must have a unique index.")
+    _require_causal_index(spread.index, "spread")
 
     normalised_lookback = _positive_integer(lookback, "lookback")
     normalised_ddof = _valid_ddof(ddof, normalised_lookback)
@@ -254,8 +263,7 @@ def _validated_zscore(zscore: pd.Series) -> pd.Series:
     """Return an independent float z-score Series without changing row order."""
     if not isinstance(zscore, pd.Series):
         raise TypeError("zscore must be a pandas Series.")
-    if not zscore.index.is_unique:
-        raise ValueError("zscore must have a unique index.")
+    _require_causal_index(zscore.index, "zscore")
 
     copied = zscore.copy(deep=True)
     non_missing = copied.loc[copied.notna()]

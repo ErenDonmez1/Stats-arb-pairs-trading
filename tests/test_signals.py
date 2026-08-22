@@ -279,6 +279,22 @@ def test_unique_non_datetime_nonmonotonic_index_is_preserved() -> None:
     assert result.index.tolist() == [9, 2, 7, 1, 5, 3]
 
 
+@pytest.mark.parametrize(
+    "index",
+    [
+        pd.DatetimeIndex(["2025-01-03", "2025-01-01", "2025-01-02"]),
+        pd.date_range("2025-01-01", periods=6, tz="UTC")[::-1],
+    ],
+)
+def test_standardise_spread_rejects_nonchronological_datetime_index(
+    index: pd.DatetimeIndex,
+) -> None:
+    spread = pd.Series(np.arange(len(index), dtype=float), index=index)
+
+    with pytest.raises(ValueError, match="monotonically increasing"):
+        standardise_spread(spread, lookback=2)
+
+
 def test_timezone_aware_datetime_index_and_metadata_are_preserved() -> None:
     index = pd.date_range(
         "2024-03-28",
@@ -952,7 +968,7 @@ def test_nullable_float_trade_zscores_follow_hold_policy() -> None:
     assert pd.isna(result.loc[1, "zscore"])
 
 
-def test_nonmonotonic_trade_index_is_processed_in_original_row_order() -> None:
+def test_nonmonotonic_non_datetime_trade_index_is_processed_in_original_row_order() -> None:
     index = pd.Index([9, 2, 7], name="sequence")
     zscore = pd.Series([-2.0, 0.0, 2.0], index=index)
 
@@ -964,6 +980,34 @@ def test_nonmonotonic_trade_index_is_processed_in_original_row_order() -> None:
         "EXIT_MEAN_REVERSION",
         "ENTER_SHORT",
     ]
+
+
+@pytest.mark.parametrize(
+    "index",
+    [
+        pd.DatetimeIndex(["2025-01-03", "2025-01-01", "2025-01-02"]),
+        pd.date_range("2025-01-01", periods=3, tz="Europe/London")[::-1],
+    ],
+)
+def test_trade_signals_reject_nonchronological_datetime_index(
+    index: pd.DatetimeIndex,
+) -> None:
+    zscore = pd.Series([-2.0, 0.0, 2.0], index=index)
+
+    with pytest.raises(ValueError, match="monotonically increasing"):
+        _trade_signals(zscore)
+
+
+def test_increasing_datetime_trade_index_is_preserved_without_sorting() -> None:
+    index = pd.date_range(
+        "2025-01-01",
+        periods=4,
+        tz="Europe/London",
+        name="decision_time",
+    )
+    result = _trade_signals(pd.Series([-2.0, -1.0, 0.0, 2.0], index=index))
+
+    pd.testing.assert_index_equal(result.index, index, exact=True)
 
 
 def test_timezone_trade_index_metadata_is_preserved() -> None:

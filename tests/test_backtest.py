@@ -35,6 +35,7 @@ from pairs_trading.backtest import (
     validate_backtest_invariants,
 )
 from pairs_trading.data import MarketDataLoader, OBSERVED_PRICE_MASK_ATTR
+from pairs_trading.signals import generate_trade_signals
 
 
 def _signals_from_events(
@@ -3827,6 +3828,248 @@ def _integrated_case(
     return inputs, result
 
 
+def _execution_aware_case(
+    z_values: list[float],
+    *,
+    execution_lag: int = 1,
+    max_holding_period: int | None = None,
+    cooldown_period: int | None = None,
+    observed_y: list[bool] | None = None,
+) -> BacktestResult:
+    """Run a flat-price integrated case that isolates strategy clocks."""
+    index = pd.RangeIndex(len(z_values), name="execution_clock_row")
+    price_y = pd.Series(100.0, index=index, name="Y")
+    price_x = pd.Series(50.0, index=index, name="X")
+    zscore = pd.Series(z_values, index=index, name="zscore")
+    observed_y_series = (
+        None
+        if observed_y is None
+        else pd.Series(observed_y, index=index, name="observed_y")
+    )
+    return run_pair_backtest(
+        price_y,
+        price_x,
+        1.0,
+        2_000.0,
+        zscore=zscore,
+        initial_capital=20_000.0,
+        entry_z=2.0,
+        exit_z=0.5,
+        stop_z=3.5,
+        max_holding_period=max_holding_period,
+        cooldown_period=cooldown_period,
+        execution_lag=execution_lag,
+        commission_bps=5.0,
+        slippage_bps=2.0,
+        observed_y=observed_y_series,
+    )
+
+
+def test_price_deferred_entry_receives_full_post_fill_holding_period() -> None:
+    observed_y = [True, False, False, False, True, True, True, True, True, True]
+    result = _execution_aware_case(
+        [-2.5, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0],
+        max_holding_period=3,
+        observed_y=observed_y,
+    )
+    diagnostic = generate_trade_signals(
+        result.signals["zscore"],
+        2.0,
+        0.5,
+        3.5,
+        max_holding_period=3,
+    )
+
+    assert result.positions["execution_event"].iat[4] == "ENTER_LONG"
+    assert result.positions["execution_decision_row"].iat[4] == 0.0
+    assert result.positions["execution_due_row"].iat[4] == 1.0
+    assert result.signals["holding_period"].iloc[:5].tolist() == [0, 0, 0, 0, 0]
+    assert result.signals["holding_period"].iloc[5:9].tolist() == [1, 2, 3, 4]
+    assert result.signals["event"].iat[7] == "EXIT_TIME"
+    assert result.positions["execution_event"].iat[8] == "EXIT_TIME"
+    assert diagnostic["event"].iat[3] == "EXIT_TIME"
+    assert result.ledger.loc[0, "entry_row"] == 4
+    assert result.ledger.loc[0, "exit_row"] == 8
+    assert result.ledger.loc[0, "holding_period_rows"] == 4
+    assert result.reconciliation.status == "RECONCILED"
+
+
+@pytest.mark.parametrize(
+    ("execution_lag", "entry_fill", "time_decision", "exit_fill"),
+    [(1, 1, 4, 5), (2, 2, 5, 7)],
+)
+def test_normal_and_multirow_lags_use_entry_fill_for_time_boundary(
+    execution_lag: int,
+    entry_fill: int,
+    time_decision: int,
+    exit_fill: int,
+) -> None:
+    result = _execution_aware_case(
+        [-2.5] + [-1.0] * 8,
+        execution_lag=execution_lag,
+        max_holding_period=3,
+    )
+
+    assert result.positions["execution_event"].iat[entry_fill] == "ENTER_LONG"
+    assert result.signals["holding_period"].iat[entry_fill] == 0
+    assert result.signals["holding_period"].iat[time_decision] == 3
+    assert result.signals["event"].iat[time_decision] == "EXIT_TIME"
+    assert result.positions["execution_event"].iat[exit_fill] == "EXIT_TIME"
+    assert result.positions["execution_decision_row"].iat[exit_fill] == float(
+        time_decision
+    )
+    assert result.positions["execution_due_row"].iat[exit_fill] == float(exit_fill)
+
+
+@pytest.mark.parametrize(
+    ("trigger_z", "exit_event"),
+    [(0.0, "EXIT_MEAN_REVERSION"), (-3.5, "EXIT_STOP")],
+)
+def test_deferred_actual_exit_starts_full_cooldown_only_on_fill(
+    trigger_z: float,
+    exit_event: str,
+) -> None:
+    z_values = [-2.5, -1.0, trigger_z, 2.5, 2.5, 2.5, 2.5, 2.5, 2.5, 2.5, 2.5]
+    observed_y = [True, True, True, False, False, False, True, True, True, True, True]
+    result = _execution_aware_case(
+        z_values,
+        cooldown_period=2,
+        observed_y=observed_y,
+    )
+
+    assert result.signals["event"].iat[2] == exit_event
+    assert result.positions["execution_event"].iloc[3:6].eq("NONE").all()
+    assert result.signals["state"].iloc[3:6].eq("FLAT").all()
+    assert result.positions["executed_state"].iloc[3:6].eq("LONG_SPREAD").all()
+    assert result.signals["cooldown_remaining"].iloc[2:6].eq(0).all()
+    assert result.positions["execution_event"].iat[6] == exit_event
+    assert result.signals["cooldown_remaining"].iloc[6:10].tolist() == [2, 2, 1, 0]
+    assert result.signals["event"].iloc[6:9].eq("NONE").all()
+    assert result.signals["event"].iat[9] == "ENTER_SHORT"
+    assert result.positions["execution_event"].iat[10] == "ENTER_SHORT"
+
+
+def test_zero_cooldown_allows_next_row_decision_but_no_same_row_reentry() -> None:
+    result = _execution_aware_case(
+        [-2.5, -1.0, 0.0, 2.5, 2.5, 2.5, 2.5],
+        cooldown_period=0,
+    )
+
+    assert result.positions["execution_event"].iat[3] == "EXIT_MEAN_REVERSION"
+    assert result.signals["event"].iat[3] == "NONE"
+    assert result.signals["cooldown_remaining"].iat[3] == 0
+    assert result.signals["event"].iat[4] == "ENTER_SHORT"
+    assert result.positions["execution_event"].iat[5] == "ENTER_SHORT"
+    state_changes = result.positions["executed_state"].ne(
+        result.positions["executed_state"].shift(fill_value="FLAT")
+    )
+    assert state_changes.astype(int).le(1).all()
+
+
+def test_opposite_signal_waits_for_deferred_close_and_next_decision_row() -> None:
+    result = _execution_aware_case(
+        [-2.5, -1.0, 0.0, 2.5, 2.5, 2.5, 2.5, 2.5, 2.5],
+        cooldown_period=0,
+        observed_y=[True, True, True, False, False, False, True, True, True],
+    )
+
+    assert result.signals["event"].iloc[3:7].eq("NONE").all()
+    assert result.positions["executed_state"].iloc[3:6].eq("LONG_SPREAD").all()
+    assert result.positions["execution_event"].iat[6] == "EXIT_MEAN_REVERSION"
+    assert result.signals["event"].iat[7] == "ENTER_SHORT"
+    assert result.positions["execution_event"].iat[8] == "ENTER_SHORT"
+
+
+def test_mean_reversion_cancels_unfilled_entry_without_starting_cooldown() -> None:
+    result = _execution_aware_case(
+        [-2.5, 0.0, 2.5, 2.5, 2.5],
+        cooldown_period=2,
+        observed_y=[True, False, True, True, True],
+    )
+
+    assert result.signals["event"].iat[0] == "ENTER_LONG"
+    assert result.signals["event"].iat[1] == "EXIT_MEAN_REVERSION"
+    assert result.positions["execution_event"].iloc[:3].eq("NONE").all()
+    assert result.positions["executed_state"].iloc[:3].eq("FLAT").all()
+    assert result.signals["holding_period"].iloc[:3].eq(0).all()
+    assert result.signals["cooldown_remaining"].iloc[:3].eq(0).all()
+    assert result.signals["event"].iat[2] == "ENTER_SHORT"
+    assert result.positions["execution_event"].iat[3] == "ENTER_SHORT"
+    assert result.accounting["transaction_cost"].iloc[:3].eq(0.0).all()
+    assert result.ledger.empty
+
+
+def test_execution_aware_clocks_and_completed_ledger_are_future_invariant() -> None:
+    index = pd.RangeIndex(10, name="clock_causality_row")
+    price_y = pd.Series(100.0, index=index)
+    price_x = pd.Series(50.0, index=index)
+    zscore = pd.Series(
+        [-2.5, -1.0, 0.0, 2.5, 2.5, 2.5, 2.5, 2.5, 2.5, 2.5],
+        index=index,
+    )
+    observed_y = pd.Series(
+        [True, True, True, False, False, False, True, True, True, True],
+        index=index,
+    )
+    changed_y = price_y.copy(deep=True)
+    changed_x = price_x.copy(deep=True)
+    changed_zscore = zscore.copy(deep=True)
+    cutoff = 6
+    changed_y.iloc[cutoff + 1 :] *= 3.0
+    changed_x.iloc[cutoff + 1 :] *= 0.5
+    changed_zscore.iloc[cutoff + 1 :] = -3.5
+    common = {
+        "hedge_ratio": 1.0,
+        "target_gross_notional": 2_000.0,
+        "cooldown_period": 2,
+        "observed_y": observed_y,
+        "commission_bps": 5.0,
+        "slippage_bps": 2.0,
+    }
+
+    original = run_pair_backtest(price_y, price_x, zscore=zscore, **common)
+    changed = run_pair_backtest(
+        changed_y,
+        changed_x,
+        zscore=changed_zscore,
+        **common,
+    )
+
+    pd.testing.assert_frame_equal(
+        original.signals.iloc[: cutoff + 1],
+        changed.signals.iloc[: cutoff + 1],
+    )
+    pd.testing.assert_frame_equal(
+        original.positions.iloc[: cutoff + 1],
+        changed.positions.iloc[: cutoff + 1],
+    )
+    pd.testing.assert_frame_equal(
+        original.accounting.iloc[: cutoff + 1],
+        changed.accounting.iloc[: cutoff + 1],
+    )
+    pd.testing.assert_frame_equal(
+        original.ledger.loc[original.ledger["exit_row"] <= cutoff].reset_index(drop=True),
+        changed.ledger.loc[changed.ledger["exit_row"] <= cutoff].reset_index(drop=True),
+    )
+
+
+def test_execution_aware_integrated_runs_are_deterministic() -> None:
+    kwargs = {
+        "z_values": [-2.5, -1.0, 0.0, 2.5, 2.5, 2.5, 2.5, 2.5, 2.5],
+        "cooldown_period": 1,
+        "observed_y": [True, True, True, False, False, True, True, True, True],
+    }
+
+    first = _execution_aware_case(**kwargs)
+    second = _execution_aware_case(**kwargs)
+
+    pd.testing.assert_frame_equal(first.signals, second.signals)
+    pd.testing.assert_frame_equal(first.positions, second.positions)
+    pd.testing.assert_frame_equal(first.accounting, second.accounting)
+    pd.testing.assert_frame_equal(first.ledger, second.ledger)
+    assert first.reconciliation == second.reconciliation
+
+
 def test_integrated_long_trade_obeys_lag_pnl_and_cost_timing() -> None:
     _, result = _integrated_case()
 
@@ -3991,6 +4234,8 @@ def test_runner_exposes_research_mode_causality_and_sizing_warnings() -> None:
     assert metadata.upstream_inputs_assumed_causal
     assert not metadata.upstream_provenance_validated
     assert "does not validate" in metadata.warning
+    assert "clocks follow actual fills" in metadata.warning
+    assert "external decisions" in metadata.warning
     assert "genuine observed" in metadata.price_policy
     assert "after 1 row" in metadata.hedge_ratio_policy
     assert metadata.sizing_policy == "beta_weighted_gross_notional"

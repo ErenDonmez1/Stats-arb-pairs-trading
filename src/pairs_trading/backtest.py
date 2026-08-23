@@ -13,13 +13,24 @@ from collections import deque
 from dataclasses import asdict, dataclass, fields
 from enum import Enum
 from numbers import Integral, Real
-from typing import Any, NamedTuple
+from typing import Any, Callable, NamedTuple
 
 import numpy as np
 import pandas as pd
 
 from .data import OBSERVED_PRICE_MASK_ATTR
-from .signals import PositionState, TradeEvent, generate_trade_signals
+from .signals import (
+    ExitReason,
+    PositionState,
+    TradeEvent,
+    _TRADE_SIGNAL_COLUMNS,
+    _TradeSignalPolicy,
+    _coerce_trade_signal_dtypes,
+    _entry_decision,
+    _exit_decision,
+    _trade_signal_record,
+    _validated_trade_signal_inputs,
+)
 
 
 __all__ = [
@@ -341,6 +352,162 @@ class _PendingOrder:
     due_label: Any
 
 
+@dataclass(frozen=True)
+class _ExecutionDecision:
+    """One current-row target that will mature after the configured lag."""
+
+    target_state: str
+    event: str
+
+
+@dataclass(frozen=True)
+class _ExecutionFeedback:
+    """Actual state transition produced before the current decision is made."""
+
+    previous_state: str
+    executed_state: str
+    execution_event: str
+
+
+@dataclass(frozen=True)
+class _ExecutionMarketInputs:
+    """Defensively validated arrays shared by both scheduling pathways."""
+
+    price_y: pd.Series
+    price_x: pd.Series
+    observed_y: pd.Series
+    observed_x: pd.Series
+    hedge_ratio: pd.Series
+    target_gross_notional: float
+    execution_lag: int
+
+
+class _ExecutionAwareStrategy:
+    """Causal z-score policy whose clocks follow acknowledged executions."""
+
+    def __init__(self, zscore: pd.Series, policy: _TradeSignalPolicy) -> None:
+        self._values = zscore.to_numpy(dtype=float)
+        self._policy = policy
+        self._desired_state = PositionState.FLAT
+        self._holding_period = 0
+        self._cooldown_remaining = 0
+        self._rows: list[tuple[Any, ...]] = []
+
+    def decide(
+        self,
+        row_number: int,
+        feedback: _ExecutionFeedback,
+    ) -> _ExecutionDecision:
+        """Create the current decision after applying this row's actual fill."""
+        current_zscore = float(self._values[row_number])
+        previous_actual = PositionState[feedback.previous_state]
+        current_actual = PositionState[feedback.executed_state]
+        entered = feedback.execution_event in {
+            TradeEvent.ENTER_LONG.value,
+            TradeEvent.ENTER_SHORT.value,
+        }
+        exited = feedback.execution_event in _EXIT_EVENTS
+
+        row_holding_period = 0
+        if previous_actual is not PositionState.FLAT:
+            self._holding_period += 1
+            row_holding_period = self._holding_period
+        if entered:
+            self._holding_period = 0
+            row_holding_period = 0
+
+        if exited:
+            self._cooldown_remaining = self._policy.cooldown_period
+        row_cooldown_remaining = self._cooldown_remaining
+
+        event = TradeEvent.NONE
+        exit_reason = ExitReason.NONE
+        if exited:
+            if self._desired_state is not PositionState.FLAT:
+                raise RuntimeError(
+                    "An executed close requires an existing desired FLAT target."
+                )
+        elif current_actual is not PositionState.FLAT:
+            if self._desired_state is current_actual:
+                event, exit_reason = _exit_decision(
+                    current_actual,
+                    current_zscore,
+                    self._holding_period,
+                    self._policy,
+                )
+                if event is not TradeEvent.NONE:
+                    self._desired_state = PositionState.FLAT
+            elif self._desired_state is not PositionState.FLAT:
+                raise RuntimeError(
+                    "Desired and actual open states cannot point in opposite directions."
+                )
+        elif self._desired_state is not PositionState.FLAT:
+            # A pending entry is not exposure, so stop and time-exit rules do
+            # not apply.  Mean reversion can still invalidate the unfilled
+            # entry intent through a normally lagged FLAT target; it does not
+            # start cooldown because no actual exit has filled.
+            pending_entry_reverted = bool(
+                not np.isnan(current_zscore)
+                and (
+                    (
+                        self._desired_state is PositionState.LONG_SPREAD
+                        and current_zscore >= -self._policy.exit_z
+                    )
+                    or (
+                        self._desired_state is PositionState.SHORT_SPREAD
+                        and current_zscore <= self._policy.exit_z
+                    )
+                )
+            )
+            if pending_entry_reverted:
+                self._desired_state = PositionState.FLAT
+                event = TradeEvent.EXIT_MEAN_REVERSION
+                exit_reason = ExitReason.MEAN_REVERSION
+        elif self._desired_state is PositionState.FLAT:
+            # The exit-fill row itself never admits a new entry, including
+            # when cooldown is configured as zero.
+            if not exited and self._cooldown_remaining == 0:
+                self._desired_state, event = _entry_decision(
+                    current_zscore,
+                    self._policy,
+                )
+
+        self._rows.append(
+            _trade_signal_record(
+                current_zscore,
+                self._desired_state,
+                event,
+                exit_reason,
+                row_holding_period,
+                row_cooldown_remaining,
+            )
+        )
+
+        if exited:
+            self._holding_period = 0
+        elif (
+            current_actual is PositionState.FLAT
+            and self._desired_state is PositionState.FLAT
+            and self._cooldown_remaining > 0
+        ):
+            # Report the pre-decrement value that blocked this whole row.
+            self._cooldown_remaining -= 1
+
+        return _ExecutionDecision(
+            target_state=self._desired_state.name,
+            event=event.value,
+        )
+
+    def to_frame(self, index: pd.Index) -> pd.DataFrame:
+        """Return the execution-aware decisions with their actual clocks."""
+        result = pd.DataFrame.from_records(
+            self._rows,
+            columns=list(_TRADE_SIGNAL_COLUMNS),
+        )
+        result.index = index
+        return _coerce_trade_signal_dtypes(result)
+
+
 def _positive_integer(value: Any, name: str) -> int:
     """Return a positive, non-Boolean integer within the int64 range."""
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
@@ -614,6 +781,59 @@ def _available_hedge_ratios(
     return pd.Series(beta, index=index, name="hedge_ratio", dtype=float)
 
 
+def _validated_execution_market_inputs(
+    price_y: pd.Series,
+    price_x: pd.Series,
+    hedge_ratio: float | pd.Series,
+    target_gross_notional: float,
+    execution_lag: int,
+    observed_y: pd.Series | None,
+    observed_x: pd.Series | None,
+    hedge_ratio_lag: int,
+) -> _ExecutionMarketInputs:
+    """Validate and own every market input used by the execution scheduler."""
+    lag = _positive_integer(execution_lag, "execution_lag")
+    gross_target = _finite_positive_scalar(
+        target_gross_notional,
+        "target_gross_notional",
+    )
+    y_values = _validated_market_series(
+        price_y,
+        "price_y",
+        strictly_positive=True,
+    )
+    x_values = _validated_market_series(
+        price_x,
+        "price_x",
+        strictly_positive=True,
+    )
+    _require_matching_index(price_y.index, price_x.index, "price_x")
+    observed_y_values = _validated_observed_mask(
+        price_y,
+        observed_y,
+        "observed_y",
+    )
+    observed_x_values = _validated_observed_mask(
+        price_x,
+        observed_x,
+        "observed_x",
+    )
+    beta_values = _available_hedge_ratios(
+        hedge_ratio,
+        price_y.index,
+        hedge_ratio_lag,
+    )
+    return _ExecutionMarketInputs(
+        price_y=y_values,
+        price_x=x_values,
+        observed_y=observed_y_values,
+        observed_x=observed_x_values,
+        hedge_ratio=beta_values,
+        target_gross_notional=gross_target,
+        execution_lag=lag,
+    )
+
+
 def lag_trade_decisions(
     signals: pd.DataFrame,
     execution_lag: int = 1,
@@ -779,102 +999,54 @@ def _queue_matured_order(
     return deque([required_close])
 
 
-def build_position_schedule(
-    price_y: pd.Series,
-    price_x: pd.Series,
-    signals: pd.DataFrame,
-    hedge_ratio: float | pd.Series,
-    target_gross_notional: float,
-    execution_lag: int = 1,
+def _build_position_schedule_core(
+    index: pd.Index,
+    inputs: _ExecutionMarketInputs,
+    decision_provider: Callable[
+        [int, _ExecutionFeedback],
+        _ExecutionDecision,
+    ],
     *,
-    observed_y: pd.Series | None = None,
-    observed_x: pd.Series | None = None,
-    hedge_ratio_lag: int = 1,
-    suppress_terminal_entries: bool = False,
+    suppress_terminal_entries: bool,
 ) -> pd.DataFrame:
-    """Build a causal schedule of executed states, units, and raw exposures.
-
-    State-changing orders become eligible after ``execution_lag`` rows.  If
-    either execution-row price is imputed or missing, the order remains
-    pending.  Entries additionally require an execution-available hedge ratio;
-    closing known units does not.  A matured FLAT target cancels later unfilled
-    entries while preserving the earliest close still required by the actual
-    executed position.  At most one state-changing order executes on a valid
-    row, preventing same-row reversal.
-
-    Every execution, including a close, requires genuine observations for both
-    current prices.  Forward-filled prices remain valid valuation marks only.
-    A dynamic beta Series is treated as a close-derived posterior and shifted
-    by ``hedge_ratio_lag``; scalars are treated as pre-frozen parameters.
-    Reported notionals may still use imputed valuation marks.  When terminal
-    entry suppression is enabled, no new flat-to-open execution occurs on the
-    final row.
-    """
-    lag = _positive_integer(execution_lag, "execution_lag")
-    gross_target = _finite_positive_scalar(
-        target_gross_notional,
-        "target_gross_notional",
-    )
-    y_values = _validated_market_series(
-        price_y,
-        "price_y",
-        strictly_positive=True,
-    )
-    x_values = _validated_market_series(
-        price_x,
-        "price_x",
-        strictly_positive=True,
-    )
-    _require_matching_index(price_y.index, price_x.index, "price_x")
-    observed_y_values = _validated_observed_mask(
-        price_y,
-        observed_y,
-        "observed_y",
-    )
-    observed_x_values = _validated_observed_mask(
-        price_x,
-        observed_x,
-        "observed_x",
-    )
-    if type(suppress_terminal_entries) is not bool:
-        raise TypeError("suppress_terminal_entries must be a bool.")
-
-    decisions = _validated_signals(signals)
-    _require_matching_index(price_y.index, signals.index, "signals")
-    lagged = lag_trade_decisions(signals, execution_lag=lag)
-
-    beta_values = _available_hedge_ratios(
-        hedge_ratio,
-        price_y.index,
-        hedge_ratio_lag,
-    )
-
+    """Execute one causal decision provider through the hardened order queue."""
     pending_orders: deque[_PendingOrder] = deque()
+    decision_history: list[_ExecutionDecision] = []
     executed_state = PositionState.FLAT.name
     units_y = 0.0
     units_x = 0.0
     rows: list[tuple[Any, ...]] = []
 
-    y_array = y_values.to_numpy(dtype=float)
-    x_array = x_values.to_numpy(dtype=float)
-    beta_array = beta_values.to_numpy(dtype=float)
-    observed_y_array = observed_y_values.to_numpy(dtype=bool)
-    observed_x_array = observed_x_values.to_numpy(dtype=bool)
+    y_array = inputs.price_y.to_numpy(dtype=float)
+    x_array = inputs.price_x.to_numpy(dtype=float)
+    beta_array = inputs.hedge_ratio.to_numpy(dtype=float)
+    observed_y_array = inputs.observed_y.to_numpy(dtype=bool)
+    observed_x_array = inputs.observed_x.to_numpy(dtype=bool)
+    lag = inputs.execution_lag
 
-    for row_number in range(len(price_y)):
-        due_event = lagged["due_event"].iat[row_number]
+    for row_number in range(len(index)):
+        previous_executed_state = executed_state
+        due_decision = (
+            decision_history[row_number - lag]
+            if row_number >= lag
+            else None
+        )
+        due_event = (
+            TradeEvent.NONE.value
+            if due_decision is None
+            else due_decision.event
+        )
         if due_event != TradeEvent.NONE.value:
-            due_state = lagged["due_state"].iat[row_number]
-            if due_state is None:  # Defensive: validation/lagging make this unreachable.
-                raise RuntimeError("A due event has no associated target state.")
+            if due_decision is None:  # Defensive: branch condition excludes this.
+                raise RuntimeError("A due event has no associated decision.")
             decision_position = row_number - lag
             matured_order = _PendingOrder(
-                target_state=due_state,
+                target_state=due_decision.target_state,
                 event=due_event,
                 decision_position=decision_position,
-                decision_label=price_y.index[decision_position],
+                decision_label=index[decision_position],
                 due_position=row_number,
-                due_label=price_y.index[row_number],
+                due_label=index[row_number],
             )
             # Only this matured target may change the pending path.  The
             # current-row decision remains causally immature until its own due
@@ -917,7 +1089,7 @@ def build_position_schedule(
             source_event = candidate.event
             terminal_entry_suppressed = bool(
                 suppress_terminal_entries
-                and row_number == len(price_y) - 1
+                and row_number == len(index) - 1
                 and executed_state == PositionState.FLAT.name
                 and target_state != PositionState.FLAT.name
             )
@@ -944,11 +1116,31 @@ def build_position_schedule(
                     current_y,
                     current_x,
                     current_beta,
-                    gross_target,
+                    inputs.target_gross_notional,
                 )
                 units_y, units_x = sizing
             executed_state = target_state
             execution_event = source_event
+
+        current_decision = decision_provider(
+            row_number,
+            _ExecutionFeedback(
+                previous_state=previous_executed_state,
+                executed_state=executed_state,
+                execution_event=execution_event,
+            ),
+        )
+        decision_state = _normalise_state(
+            current_decision.target_state,
+            name="decision_provider state",
+        )
+        decision_event = _normalise_event(current_decision.event)
+        decision_history.append(
+            _ExecutionDecision(
+                target_state=decision_state,
+                event=decision_event,
+            )
+        )
 
         notional_y, notional_x, gross_exposure, net_exposure = _mark_exposure(
             executed_state,
@@ -959,9 +1151,9 @@ def build_position_schedule(
         )
         rows.append(
             (
-                decisions["decision_state"].iat[row_number],
+                decision_state,
                 executed_state,
-                decisions["decision_event"].iat[row_number],
+                decision_event,
                 execution_event,
                 (
                     np.nan
@@ -988,7 +1180,7 @@ def build_position_schedule(
         )
 
     result = pd.DataFrame.from_records(rows, columns=list(_OUTPUT_COLUMNS))
-    result.index = price_y.index
+    result.index = index
     for column in (
         "execution_decision_row",
         "execution_due_row",
@@ -1013,6 +1205,128 @@ def build_position_schedule(
     ):
         result[column] = result[column].astype(object)
     return result.loc[:, list(_OUTPUT_COLUMNS)]
+
+
+def build_position_schedule(
+    price_y: pd.Series,
+    price_x: pd.Series,
+    signals: pd.DataFrame,
+    hedge_ratio: float | pd.Series,
+    target_gross_notional: float,
+    execution_lag: int = 1,
+    *,
+    observed_y: pd.Series | None = None,
+    observed_x: pd.Series | None = None,
+    hedge_ratio_lag: int = 1,
+    suppress_terminal_entries: bool = False,
+) -> pd.DataFrame:
+    """Build a causal schedule of executed states, units, and raw exposures.
+
+    State-changing orders become eligible after ``execution_lag`` rows.  If
+    either execution-row price is imputed or missing, the order remains
+    pending.  Entries additionally require an execution-available hedge ratio;
+    closing known units does not.  A matured FLAT target cancels later unfilled
+    entries while preserving the earliest close still required by the actual
+    executed position.  At most one state-changing order executes on a valid
+    row, preventing same-row reversal.
+
+    Every execution, including a close, requires genuine observations for both
+    current prices.  Forward-filled prices remain valid valuation marks only.
+    A dynamic beta Series is treated as a close-derived posterior and shifted
+    by ``hedge_ratio_lag``; scalars are treated as pre-frozen parameters.
+    Reported notionals may still use imputed valuation marks.  When terminal
+    entry suppression is enabled, no new flat-to-open execution occurs on the
+    final row.
+
+    This standalone scheduler executes caller-supplied decisions literally; it
+    does not reinterpret their holding or cooldown clocks.  Z-score-driven
+    integrated backtests use a separate execution-aware decision provider over
+    the same core scheduler.
+    """
+    if type(suppress_terminal_entries) is not bool:
+        raise TypeError("suppress_terminal_entries must be a bool.")
+    inputs = _validated_execution_market_inputs(
+        price_y,
+        price_x,
+        hedge_ratio,
+        target_gross_notional,
+        execution_lag,
+        observed_y,
+        observed_x,
+        hedge_ratio_lag,
+    )
+    decisions = _validated_signals(signals)
+    _require_matching_index(price_y.index, signals.index, "signals")
+
+    def supplied_decision(
+        row_number: int,
+        _: _ExecutionFeedback,
+    ) -> _ExecutionDecision:
+        return _ExecutionDecision(
+            target_state=decisions["decision_state"].iat[row_number],
+            event=decisions["decision_event"].iat[row_number],
+        )
+
+    return _build_position_schedule_core(
+        price_y.index,
+        inputs,
+        supplied_decision,
+        suppress_terminal_entries=suppress_terminal_entries,
+    )
+
+
+def _build_execution_aware_position_schedule(
+    price_y: pd.Series,
+    price_x: pd.Series,
+    zscore: pd.Series,
+    hedge_ratio: float | pd.Series,
+    target_gross_notional: float,
+    *,
+    entry_z: float,
+    exit_z: float,
+    stop_z: float,
+    max_holding_period: int | None,
+    cooldown_period: int | None,
+    missing_policy: str,
+    execution_lag: int,
+    observed_y: pd.Series | None,
+    observed_x: pd.Series | None,
+    hedge_ratio_lag: int,
+    suppress_terminal_entries: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Interleave z-score decisions with actual fills and execution clocks."""
+    if type(suppress_terminal_entries) is not bool:
+        raise TypeError("suppress_terminal_entries must be a bool.")
+    values, policy = _validated_trade_signal_inputs(
+        zscore,
+        entry_z,
+        exit_z,
+        stop_z,
+        max_holding_period=max_holding_period,
+        cooldown_period=cooldown_period,
+        missing_policy=missing_policy,
+    )
+    _require_matching_index(price_y.index, zscore.index, "zscore")
+    inputs = _validated_execution_market_inputs(
+        price_y,
+        price_x,
+        hedge_ratio,
+        target_gross_notional,
+        execution_lag,
+        observed_y,
+        observed_x,
+        hedge_ratio_lag,
+    )
+    strategy = _ExecutionAwareStrategy(values, policy)
+    positions = _build_position_schedule_core(
+        price_y.index,
+        inputs,
+        strategy.decide,
+        suppress_terminal_entries=suppress_terminal_entries,
+    )
+    signals = strategy.to_frame(zscore.index)
+    _validated_signals(signals)
+    return signals, positions
 
 
 def _validated_position_schedule(schedule: pd.DataFrame) -> pd.DataFrame:
@@ -3736,49 +4050,59 @@ def run_pair_backtest(
 ) -> BacktestResult:
     """Run the complete causal one-pair workflow through ledger reconciliation.
 
-    Exactly one of ``zscore`` and ``signals`` is required.  Supplied z-scores,
-    signals, and hedge ratios are assumed causal; this accounting runner cannot
-    prove how upstream arrays were estimated.  A dynamic hedge-ratio Series is
-    treated as close-derived and becomes execution-available only after
-    ``hedge_ratio_lag`` rows.  Beta-weighted gross-notional sizing is retained
-    and is not dollar-neutral unless beta equals one.
+    Exactly one of ``zscore`` and ``signals`` is required.  Z-score-driven runs
+    interleave actual fills and current decisions: holding starts at the entry
+    fill, cooldown starts at the exit fill, and the current decision is made
+    only after processing an older order due on the current row.  Caller-
+    supplied signal frames remain explicit external decisions and are executed
+    literally; their upstream clock semantics cannot be reconstructed here.
 
-    The implementation delegates every stage to the existing signal,
-    execution, P&L, cost, liquidation, and ledger helpers.  Forward-filled
-    prices may mark holdings but cannot execute when their observed masks are
-    supplied or attached by market-data cleaning.
+    Supplied z-scores, signals, and hedge ratios are assumed causal; this
+    accounting runner cannot prove how upstream arrays were estimated.  A
+    dynamic hedge-ratio Series is treated as close-derived and becomes
+    execution-available only after ``hedge_ratio_lag`` rows.  Beta-weighted
+    gross-notional sizing is retained and is not dollar-neutral unless beta
+    equals one.  Forward-filled prices may mark holdings but cannot execute
+    when their observed masks are supplied or attached by market-data cleaning.
     """
     if (zscore is None) == (signals is None):
         raise ValueError("Exactly one of zscore or signals must be supplied.")
     lag = _positive_integer(execution_lag, "execution_lag")
     if zscore is not None:
-        generated_signals = generate_trade_signals(
+        signal_frame, base_positions = _build_execution_aware_position_schedule(
+            price_y,
+            price_x,
             zscore,
-            entry_z,
-            exit_z,
-            stop_z,
+            hedge_ratio,
+            target_gross_notional,
+            entry_z=entry_z,
+            exit_z=exit_z,
+            stop_z=stop_z,
             max_holding_period=max_holding_period,
             cooldown_period=cooldown_period,
             missing_policy=missing_policy,
+            execution_lag=lag,
+            observed_y=observed_y,
+            observed_x=observed_x,
+            hedge_ratio_lag=hedge_ratio_lag,
+            suppress_terminal_entries=force_liquidation,
         )
-        signal_frame = generated_signals.copy(deep=True)
     else:
         if not isinstance(signals, pd.DataFrame):
             raise TypeError("signals must be a pandas DataFrame.")
         signal_frame = signals.copy(deep=True)
-
-    base_positions = build_position_schedule(
-        price_y,
-        price_x,
-        signal_frame,
-        hedge_ratio,
-        target_gross_notional,
-        execution_lag=lag,
-        observed_y=observed_y,
-        observed_x=observed_x,
-        hedge_ratio_lag=hedge_ratio_lag,
-        suppress_terminal_entries=force_liquidation,
-    )
+        base_positions = build_position_schedule(
+            price_y,
+            price_x,
+            signal_frame,
+            hedge_ratio,
+            target_gross_notional,
+            execution_lag=lag,
+            observed_y=observed_y,
+            observed_x=observed_x,
+            hedge_ratio_lag=hedge_ratio_lag,
+            suppress_terminal_entries=force_liquidation,
+        )
 
     accounting_kwargs = {
         "initial_capital": initial_capital,
@@ -3912,7 +4236,9 @@ def run_pair_backtest(
             warning=(
                 "Supplied z-scores, signals, and hedge ratios are assumed causal; "
                 "run_pair_backtest does not validate their upstream estimation "
-                "or selection provenance."
+                "or selection provenance. Z-score-driven holding and cooldown "
+                "clocks follow actual fills; caller-supplied signal frames remain "
+                "external decisions whose clock semantics are not reinterpreted."
             ),
             price_policy=(
                 "Forward-filled prices may value holdings but genuine observed "

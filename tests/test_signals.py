@@ -871,7 +871,7 @@ def test_zero_exit_threshold_is_accepted() -> None:
 @pytest.mark.parametrize("field", ["max_holding_period", "cooldown_period"])
 @pytest.mark.parametrize(
     "invalid",
-    [True, False, np.bool_(True), np.bool_(False), 0, -1, 1.0, 1.5, "2", np.nan],
+    [True, False, np.bool_(True), np.bool_(False), -1, 1.0, 1.5, "2", np.nan],
 )
 def test_optional_trade_periods_reject_invalid_values(
     field: str,
@@ -879,6 +879,25 @@ def test_optional_trade_periods_reject_invalid_values(
 ) -> None:
     with pytest.raises((TypeError, ValueError), match=field):
         _trade_signals([0.0], **{field: invalid})
+
+
+def test_zero_maximum_holding_period_is_rejected() -> None:
+    with pytest.raises(ValueError, match="max_holding_period"):
+        _trade_signals([0.0], max_holding_period=0)
+
+
+def test_zero_cooldown_period_is_supported_as_no_blocked_rows() -> None:
+    result = _trade_signals(
+        [-2.0, 0.0, 2.0],
+        cooldown_period=0,
+    )
+
+    assert result["event"].tolist() == [
+        "ENTER_LONG",
+        "EXIT_MEAN_REVERSION",
+        "ENTER_SHORT",
+    ]
+    assert result["cooldown_remaining"].eq(0).all()
 
 
 def test_numpy_integer_optional_trade_periods_are_accepted() -> None:

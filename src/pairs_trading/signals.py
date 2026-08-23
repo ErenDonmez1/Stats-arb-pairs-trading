@@ -7,6 +7,7 @@ is present.  Values are never filled, interpolated, dropped, or reordered.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum, IntEnum, unique
 from numbers import Integral, Real
 from typing import Any
@@ -75,6 +76,17 @@ _TRADE_SIGNAL_COLUMNS = (
     "holding_period",
     "cooldown_remaining",
 )
+
+
+@dataclass(frozen=True)
+class _TradeSignalPolicy:
+    """Validated thresholds and row-count limits shared by signal engines."""
+
+    entry_z: float
+    exit_z: float
+    stop_z: float
+    max_holding_period: int | None
+    cooldown_period: int
 
 
 def _positive_integer(value: Any, name: str) -> int:
@@ -259,6 +271,20 @@ def _optional_positive_integer(value: Any, name: str) -> int | None:
     return normalised
 
 
+def _optional_nonnegative_integer(value: Any, name: str) -> int:
+    """Return zero for ``None`` or a non-negative non-Boolean integer."""
+    if value is None:
+        return 0
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
+        raise TypeError(f"{name} must be a non-Boolean integer.")
+    normalised = int(value)
+    if normalised < 0:
+        raise ValueError(f"{name} must be a non-negative integer.")
+    if normalised > np.iinfo(np.int64).max:
+        raise ValueError(f"{name} exceeds the supported int64 range.")
+    return normalised
+
+
 def _validated_zscore(zscore: pd.Series) -> pd.Series:
     """Return an independent float z-score Series without changing row order."""
     if not isinstance(zscore, pd.Series):
@@ -299,6 +325,121 @@ def _coerce_trade_signal_dtypes(result: pd.DataFrame) -> pd.DataFrame:
     return result.loc[:, list(_TRADE_SIGNAL_COLUMNS)]
 
 
+def _validated_trade_signal_inputs(
+    zscore: pd.Series,
+    entry_z: float,
+    exit_z: float,
+    stop_z: float,
+    *,
+    max_holding_period: int | None,
+    cooldown_period: int | None,
+    missing_policy: str,
+) -> tuple[pd.Series, _TradeSignalPolicy]:
+    """Validate common strategy inputs for diagnostic and integrated engines."""
+    values = _validated_zscore(zscore)
+    normalised_entry = _finite_real_parameter(entry_z, "entry_z")
+    normalised_exit = _finite_real_parameter(exit_z, "exit_z")
+    normalised_stop = _finite_real_parameter(stop_z, "stop_z")
+    if normalised_exit < 0:
+        raise ValueError("exit_z must be non-negative.")
+    if normalised_entry <= normalised_exit:
+        raise ValueError("entry_z must be greater than exit_z.")
+    if normalised_stop <= normalised_entry:
+        raise ValueError("stop_z must be greater than entry_z.")
+    maximum_holding = _optional_positive_integer(
+        max_holding_period,
+        "max_holding_period",
+    )
+    configured_cooldown = _optional_nonnegative_integer(
+        cooldown_period,
+        "cooldown_period",
+    )
+    if not isinstance(missing_policy, str) or missing_policy != "hold":
+        raise ValueError("missing_policy must be 'hold'.")
+    return values, _TradeSignalPolicy(
+        entry_z=normalised_entry,
+        exit_z=normalised_exit,
+        stop_z=normalised_stop,
+        max_holding_period=maximum_holding,
+        cooldown_period=configured_cooldown,
+    )
+
+
+def _entry_decision(
+    current_zscore: float,
+    policy: _TradeSignalPolicy,
+) -> tuple[PositionState, TradeEvent]:
+    """Return the inclusive entry decision for one eligible flat row."""
+    if np.isnan(current_zscore):
+        return PositionState.FLAT, TradeEvent.NONE
+    if current_zscore <= -policy.entry_z:
+        return PositionState.LONG_SPREAD, TradeEvent.ENTER_LONG
+    if current_zscore >= policy.entry_z:
+        return PositionState.SHORT_SPREAD, TradeEvent.ENTER_SHORT
+    return PositionState.FLAT, TradeEvent.NONE
+
+
+def _exit_decision(
+    state: PositionState,
+    current_zscore: float,
+    holding_period: int,
+    policy: _TradeSignalPolicy,
+) -> tuple[TradeEvent, ExitReason]:
+    """Return an actual/open-state exit decision using canonical precedence."""
+    stop_triggered = False
+    mean_reversion_triggered = False
+    if not np.isnan(current_zscore):
+        if state is PositionState.LONG_SPREAD:
+            stop_triggered = current_zscore <= -policy.stop_z
+            mean_reversion_triggered = current_zscore >= -policy.exit_z
+        elif state is PositionState.SHORT_SPREAD:
+            stop_triggered = current_zscore >= policy.stop_z
+            mean_reversion_triggered = current_zscore <= policy.exit_z
+        else:
+            raise ValueError("Exit decisions require an open position state.")
+    time_triggered = bool(
+        policy.max_holding_period is not None
+        and holding_period >= policy.max_holding_period
+    )
+    if stop_triggered:
+        return TradeEvent.EXIT_STOP, ExitReason.STOP
+    if time_triggered:
+        return TradeEvent.EXIT_TIME, ExitReason.TIME
+    if mean_reversion_triggered:
+        return TradeEvent.EXIT_MEAN_REVERSION, ExitReason.MEAN_REVERSION
+    return TradeEvent.NONE, ExitReason.NONE
+
+
+def _trade_signal_record(
+    current_zscore: float,
+    state: PositionState,
+    event: TradeEvent,
+    exit_reason: ExitReason,
+    holding_period: int,
+    cooldown_remaining: int,
+) -> tuple[Any, ...]:
+    """Build one canonical primitive signal row from a strategy decision."""
+    is_exit = event in {
+        TradeEvent.EXIT_MEAN_REVERSION,
+        TradeEvent.EXIT_STOP,
+        TradeEvent.EXIT_TIME,
+    }
+    return (
+        current_zscore,
+        state.name,
+        int(state),
+        event is TradeEvent.ENTER_LONG,
+        event is TradeEvent.ENTER_SHORT,
+        is_exit,
+        event is TradeEvent.EXIT_STOP,
+        event is TradeEvent.EXIT_TIME,
+        event.value,
+        exit_reason.value,
+        holding_period,
+        cooldown_remaining,
+    )
+
+
 def generate_trade_signals(
     zscore: pd.Series,
     entry_z: float,
@@ -315,12 +456,17 @@ def generate_trade_signals(
     holdings.  A decision at row ``t`` may use ``zscore_t``; a later backtester
     is responsible for applying execution lag and fills.
 
-    The entry row has ``holding_period=0`` because its order has not yet been
-    executed.  Every later row while open advances the counter, including a
-    missing-z-score row.  Reaching ``max_holding_period`` exits on that row.
-    Exit rows report the completed holding period even though their state is
-    flat; only the internal counter used by subsequent rows resets to zero.
-    Exit precedence is stop, time limit, then mean reversion.
+    This standalone function has no execution feedback.  Its holding and
+    cooldown columns therefore describe the desired-state diagnostic path,
+    not actual filled exposure.  :func:`pairs_trading.backtest.run_pair_backtest`
+    uses an interleaved execution-aware pathway for z-score-driven runs.
+
+    The entry-decision row has ``holding_period=0``.  Every later desired-open
+    row advances the counter, including a missing-z-score row.  Reaching
+    ``max_holding_period`` exits on that row.  Exit rows report the completed
+    desired-state holding period even though their state is flat; only the
+    internal counter used by subsequent rows resets to zero.  Exit precedence
+    is stop, time limit, then mean reversion.
 
     The exit row does not consume cooldown.  An exit reports the configured
     cooldown, and each of the next ``cooldown_period`` rows is entry-ineligible
@@ -335,27 +481,15 @@ def generate_trade_signals(
     Empty Series are accepted and return an empty, fully typed frame.  State,
     event, and exit-reason values are emitted as stable primitive strings.
     """
-    values = _validated_zscore(zscore)
-    normalised_entry = _finite_real_parameter(entry_z, "entry_z")
-    normalised_exit = _finite_real_parameter(exit_z, "exit_z")
-    normalised_stop = _finite_real_parameter(stop_z, "stop_z")
-    if normalised_exit < 0:
-        raise ValueError("exit_z must be non-negative.")
-    if normalised_entry <= normalised_exit:
-        raise ValueError("entry_z must be greater than exit_z.")
-    if normalised_stop <= normalised_entry:
-        raise ValueError("stop_z must be greater than entry_z.")
-
-    maximum_holding = _optional_positive_integer(
-        max_holding_period,
-        "max_holding_period",
+    values, policy = _validated_trade_signal_inputs(
+        zscore,
+        entry_z,
+        exit_z,
+        stop_z,
+        max_holding_period=max_holding_period,
+        cooldown_period=cooldown_period,
+        missing_policy=missing_policy,
     )
-    configured_cooldown = _optional_positive_integer(
-        cooldown_period,
-        "cooldown_period",
-    )
-    if not isinstance(missing_policy, str) or missing_policy != "hold":
-        raise ValueError("missing_policy must be 'hold'.")
 
     state = PositionState.FLAT
     holding_period = 0
@@ -363,11 +497,6 @@ def generate_trade_signals(
     rows: list[tuple[Any, ...]] = []
 
     for current_zscore in values.to_numpy(dtype=float):
-        entry_long = False
-        entry_short = False
-        exited = False
-        stopped = False
-        timed_out = False
         event = TradeEvent.NONE
         exit_reason = ExitReason.NONE
         is_missing = bool(np.isnan(current_zscore))
@@ -380,64 +509,28 @@ def generate_trade_signals(
                 # Consume this whole row before another entry becomes eligible.
                 cooldown_remaining -= 1
             elif not is_missing:
-                if current_zscore <= -normalised_entry:
-                    state = PositionState.LONG_SPREAD
-                    entry_long = True
-                    event = TradeEvent.ENTER_LONG
-                elif current_zscore >= normalised_entry:
-                    state = PositionState.SHORT_SPREAD
-                    entry_short = True
-                    event = TradeEvent.ENTER_SHORT
+                state, event = _entry_decision(current_zscore, policy)
         else:
             holding_period += 1
             row_holding_period = holding_period
-            stop_triggered = False
-            mean_reversion_triggered = False
-            if not is_missing:
-                if state is PositionState.LONG_SPREAD:
-                    stop_triggered = current_zscore <= -normalised_stop
-                    mean_reversion_triggered = current_zscore >= -normalised_exit
-                else:
-                    stop_triggered = current_zscore >= normalised_stop
-                    mean_reversion_triggered = current_zscore <= normalised_exit
-            time_triggered = (
-                maximum_holding is not None
-                and holding_period >= maximum_holding
+            event, exit_reason = _exit_decision(
+                state,
+                current_zscore,
+                holding_period,
+                policy,
             )
-
-            if stop_triggered:
-                exited = True
-                stopped = True
-                event = TradeEvent.EXIT_STOP
-                exit_reason = ExitReason.STOP
-            elif time_triggered:
-                exited = True
-                timed_out = True
-                event = TradeEvent.EXIT_TIME
-                exit_reason = ExitReason.TIME
-            elif mean_reversion_triggered:
-                exited = True
-                event = TradeEvent.EXIT_MEAN_REVERSION
-                exit_reason = ExitReason.MEAN_REVERSION
-
-            if exited:
+            if event is not TradeEvent.NONE:
                 state = PositionState.FLAT
                 holding_period = 0
-                cooldown_remaining = configured_cooldown or 0
+                cooldown_remaining = policy.cooldown_period
                 row_cooldown_remaining = cooldown_remaining
 
         rows.append(
-            (
+            _trade_signal_record(
                 current_zscore,
-                state.name,
-                int(state),
-                entry_long,
-                entry_short,
-                exited,
-                stopped,
-                timed_out,
-                event.value,
-                exit_reason.value,
+                state,
+                event,
+                exit_reason,
                 row_holding_period,
                 row_cooldown_remaining,
             )

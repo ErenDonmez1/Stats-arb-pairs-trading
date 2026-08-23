@@ -462,6 +462,57 @@ def test_new_equity_highs_produce_zero_drawdown_and_no_episode() -> None:
     assert drawdown_episodes(returns) == ()
 
 
+def test_first_observation_loss_uses_initial_equity_baseline() -> None:
+    index = pd.Index(["loss", "recovery"], name="event")
+    returns = pd.Series([-0.20, 0.25], index=index)
+
+    equity = equity_curve_from_returns(returns)
+    drawdowns = drawdown_series(returns)
+
+    pd.testing.assert_index_equal(equity.index, index, exact=True)
+    pd.testing.assert_series_equal(
+        equity,
+        pd.Series([0.80, 1.00], index=index, name="equity_curve"),
+    )
+    pd.testing.assert_series_equal(
+        drawdowns,
+        pd.Series([-0.20, 0.00], index=index, name="drawdown"),
+    )
+    assert maximum_drawdown(returns) == pytest.approx(-0.20)
+
+
+def test_first_observation_loss_creates_pre_sample_peak_episode() -> None:
+    index = pd.Index(["loss", "recovery"], name="event")
+    returns = pd.Series([-0.20, 0.25], index=index)
+
+    episodes = drawdown_episodes(returns)
+    metrics = calculate_drawdown_metrics(returns, periods_per_year=12)
+
+    assert len(episodes) == 1
+    episode = episodes[0]
+    assert episode.peak_index is None
+    assert episode.start_index == "loss"
+    assert episode.trough_index == "loss"
+    assert episode.recovery_index == "recovery"
+    assert episode.maximum_drawdown == pytest.approx(-0.20)
+    assert episode.duration == 2
+    assert episode.recovered
+    assert metrics.maximum_drawdown_start is None
+    assert metrics.maximum_drawdown_trough == "loss"
+    assert metrics.maximum_drawdown_recovery == "recovery"
+    assert metrics.maximum_drawdown_duration == 2
+    assert metrics.longest_drawdown_duration == 2
+    assert metrics.underwater_observations == 1
+
+
+def test_positive_first_return_is_an_immediate_new_high() -> None:
+    returns = pd.Series([0.10], index=pd.Index(["new_high"], name="event"))
+
+    assert drawdown_series(returns).iat[0] == 0.0
+    assert maximum_drawdown(returns) == 0.0
+    assert drawdown_episodes(returns) == ()
+
+
 def test_underwater_equity_produces_negative_drawdown() -> None:
     returns = _recovered_drawdown_returns()
     result = drawdown_series(returns)
@@ -474,7 +525,11 @@ def test_underwater_equity_produces_negative_drawdown() -> None:
 def test_drawdown_series_matches_manual_running_peak_calculation() -> None:
     returns = _recovered_drawdown_returns()
     equity = equity_curve_from_returns(returns)
-    expected = (equity / equity.cummax() - 1.0).rename("drawdown")
+    running_peak = pd.Series(
+        np.maximum.accumulate(np.concatenate(([1.0], equity.to_numpy())))[1:],
+        index=equity.index,
+    )
+    expected = (equity / running_peak - 1.0).rename("drawdown")
 
     pd.testing.assert_series_equal(drawdown_series(returns), expected)
 
@@ -1497,6 +1552,18 @@ def test_rolling_drawdown_matches_existing_causal_drawdown_series() -> None:
     expected = drawdown_series(returns).rename("rolling_drawdown")
 
     pd.testing.assert_series_equal(result, expected)
+
+
+def test_rolling_drawdown_includes_initial_equity_baseline() -> None:
+    index = pd.Index(["loss", "recovery"], name="event")
+    returns = pd.Series([-0.20, 0.25], index=index)
+
+    result = rolling_drawdown(returns)
+
+    pd.testing.assert_series_equal(
+        result,
+        pd.Series([-0.20, 0.00], index=index, name="rolling_drawdown"),
+    )
 
 
 def test_rolling_drawdown_retains_missing_rows_without_filling() -> None:

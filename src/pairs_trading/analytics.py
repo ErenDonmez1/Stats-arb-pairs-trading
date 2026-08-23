@@ -79,13 +79,16 @@ class CorePerformanceMetrics:
 class DrawdownEpisode:
     """One immutable observation-count drawdown episode.
 
-    ``peak_index`` is the most recent peak before the first underwater row,
-    while ``start_index`` is that first underwater row.  ``duration`` is the
-    recovery row position minus the peak row position, or the final row
-    position minus the peak row position when unrecovered.
+    ``peak_index`` is the most recent indexed peak before the first underwater
+    row.  It is ``None`` when the peak is the pre-sample initial equity.  The
+    ``start_index`` is the first underwater row.  ``duration`` is the recovery
+    row position minus the peak row position, or the final row position minus
+    the peak row position when unrecovered.  A pre-sample peak has the internal
+    position ``-1``, so its duration counts every indexed observation through
+    recovery or the final row.
     """
 
-    peak_index: Any
+    peak_index: Any | None
     start_index: Any
     trough_index: Any
     recovery_index: Any | None
@@ -526,16 +529,19 @@ def drawdown_series(
 ) -> pd.Series:
     """Return negative-or-zero equity drawdowns on the retained return index.
 
-    Drawdown is ``equity_t / running_peak_t - 1``.  New highs are zero and
-    underwater observations are negative.  Missing returns follow the 7A drop
-    policy, which compresses observation time without fabricating values.
+    Drawdown is ``equity_t / running_peak_t - 1``.  The running peak includes
+    the supplied initial equity before the first indexed return, without
+    prepending a synthetic public row.  New highs are zero and underwater
+    observations are negative.  Missing returns follow the 7A drop policy,
+    which compresses observation time without fabricating values.
     """
+    capital = _validated_initial_equity(initial_equity)
     equity = equity_curve_from_returns(
         returns,
-        initial_equity,
+        capital,
         missing_policy=missing_policy,
     )
-    running_peak = equity.cummax()
+    running_peak = equity.cummax().clip(lower=capital)
     result = (equity / running_peak - 1.0).rename("drawdown")
     if bool(result.gt(NEAR_ZERO_TOLERANCE).any()):
         raise RuntimeError("Drawdown cannot be positive relative to its running peak.")
@@ -553,15 +559,18 @@ def drawdown_episodes(
     """Return deterministic drawdown episodes in retained observation order.
 
     An episode begins on the first row below the most recent peak and recovers
-    on the first later row whose equity reaches or exceeds that peak.  The first
-    row attaining an episode's most negative drawdown is its trough.  Equal
-    peak observations before an episode update the associated peak to the most
-    recent one.  Duration is measured from peak row position to recovery row
-    position, or to the final row for an unrecovered episode.
+    on the first later row whose equity reaches or exceeds that peak.  The
+    initial equity is a virtual pre-sample peak at position ``-1`` and is
+    represented by ``peak_index=None``.  The first row attaining an episode's
+    most negative drawdown is its trough.  Equal indexed peak observations
+    before an episode update the associated peak to the most recent one.
+    Duration is measured from peak row position to recovery row position, or to
+    the final row for an unrecovered episode.
     """
+    capital = _validated_initial_equity(initial_equity)
     equity = equity_curve_from_returns(
         returns,
-        initial_equity,
+        capital,
         missing_policy=missing_policy,
     )
     drawdowns = drawdown_series(
@@ -573,15 +582,15 @@ def drawdown_episodes(
     drawdown_values = drawdowns.to_numpy(dtype=float)
     index = equity.index
 
-    peak_position = 0
-    peak_equity = float(equity_values[0])
+    peak_position = -1
+    peak_equity = capital
     underwater = False
     start_position = 0
     trough_position = 0
     trough_drawdown = 0.0
     episodes: list[DrawdownEpisode] = []
 
-    for position in range(1, len(equity_values)):
+    for position in range(len(equity_values)):
         current_equity = float(equity_values[position])
         current_drawdown = float(drawdown_values[position])
         if not underwater:
@@ -598,7 +607,9 @@ def drawdown_episodes(
         if current_equity >= peak_equity:
             episodes.append(
                 DrawdownEpisode(
-                    peak_index=index[peak_position],
+                    peak_index=(
+                        None if peak_position < 0 else index[peak_position]
+                    ),
                     start_index=index[start_position],
                     trough_index=index[trough_position],
                     recovery_index=index[position],
@@ -620,7 +631,7 @@ def drawdown_episodes(
         final_position = len(equity_values) - 1
         episodes.append(
             DrawdownEpisode(
-                peak_index=index[peak_position],
+                peak_index=(None if peak_position < 0 else index[peak_position]),
                 start_index=index[start_position],
                 trough_index=index[trough_position],
                 recovery_index=None,

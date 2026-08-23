@@ -449,6 +449,27 @@ def test_calendar_returns_are_primary_and_no_selection_cash_is_retained(
     assert result.selection_coverage == pytest.approx(0.25)
 
 
+def test_native_and_common_horizon_drawdown_include_first_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_walk_forward(
+        monkeypatch,
+        lambda *args: _walk_forward_result([-0.20, 0.25]),
+    )
+
+    result = run_sensitivity_analysis(
+        _prices(),
+        (_baseline(),),
+        "baseline",
+    )
+    baseline = result.baseline_result
+
+    assert baseline.calendar_metrics is not None
+    assert baseline.common_horizon_metrics is not None
+    assert baseline.calendar_metrics.maximum_drawdown == pytest.approx(-0.20)
+    assert baseline.common_horizon_metrics.maximum_drawdown == pytest.approx(-0.20)
+
+
 def test_insufficient_data_rows_remain_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

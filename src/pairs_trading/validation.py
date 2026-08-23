@@ -218,7 +218,14 @@ class FoldPerformance:
 
 @dataclass(frozen=True)
 class FoldConsistencyMetrics:
-    """Temporal fold dispersion and positive-contribution concentration."""
+    """Temporal fold dispersion and positive-contribution concentration.
+
+    ``pre_execution_insufficient_fold_count`` counts walk-forward folds that
+    never produced usable return evidence.  ``risk_analytics_insufficient_fold_count``
+    counts folds with a finite total return but insufficient fold-level risk
+    analytics.  The legacy ``insufficient_data_fold_count`` retains its prior
+    exact meaning and aliases the latter count.
+    """
 
     status: ValidationAvailability
     folds: tuple[FoldPerformance, ...]
@@ -230,6 +237,8 @@ class FoldConsistencyMetrics:
     unavailable_fold_count: int
     analytically_available_fold_count: int
     insufficient_data_fold_count: int
+    pre_execution_insufficient_fold_count: int
+    risk_analytics_insufficient_fold_count: int
     catastrophic_fold_count: int
     catastrophic_fold_ids: tuple[int, ...]
     invalid_return_fold_count: int
@@ -341,7 +350,15 @@ class MultipleTestingDiagnostics:
 
 @dataclass(frozen=True)
 class StatisticalValidationResult:
-    """Composed statistical evidence-quality report with no decision output."""
+    """Composed statistical evidence-quality report with no decision output.
+
+    ``primary_inference_availability`` composes bootstrap, probabilistic Sharpe,
+    and minimum-track-record evidence.  ``overall_availability`` additionally
+    includes fold consistency and caller-requested regime consistency.  The
+    legacy ``availability`` field is retained as a backward-compatible alias of
+    ``primary_inference_availability`` and must not be interpreted as a status
+    for every requested diagnostic.
+    """
 
     bootstrap: BootstrapPerformanceResult
     probabilistic_sharpe: ProbabilisticSharpeResult
@@ -351,12 +368,18 @@ class StatisticalValidationResult:
     regime_consistency: RegimeConsistencyMetrics | None
     primary_oos_returns: pd.Series
     observations: int
+    primary_inference_availability: ValidationAvailability
+    overall_availability: ValidationAvailability
     availability: ValidationAvailability
     validation_warnings: tuple[str, ...]
     provenance_warnings: tuple[str, ...]
     purpose: str = PURPOSE
 
     def __post_init__(self) -> None:
+        if self.availability is not self.primary_inference_availability:
+            raise ValueError(
+                "Legacy availability must equal primary_inference_availability."
+            )
         object.__setattr__(self, "primary_oos_returns", self.primary_oos_returns.copy(deep=True))
         object.__setattr__(self, "validation_warnings", tuple(self.validation_warnings))
         object.__setattr__(self, "provenance_warnings", tuple(self.provenance_warnings))
@@ -1137,7 +1160,12 @@ def analyze_fold_consistency(
     totals = np.asarray([record.total_return for record in observable], dtype=float)
     positive = totals[totals > 0.0]
     positive_sum = float(positive.sum())
-    summaries_complete = not catastrophic_records and not invalid_records
+    summaries_complete = (
+        bool(records)
+        and len(observable) == len(records)
+        and not catastrophic_records
+        and not invalid_records
+    )
     if len(positive) and summaries_complete:
         top_count = int(ceil(0.20 * len(positive)))
         ordered_positive = np.sort(positive)[::-1]
@@ -1160,6 +1188,10 @@ def analyze_fold_consistency(
         record.availability is ValidationAvailability.INSUFFICIENT_DATA
         for record in records
     )
+    pre_execution_insufficient_count = sum(
+        record.selection_status == WalkForwardStatus.INSUFFICIENT_DATA.value
+        for record in records
+    )
     if any(
         record.availability is ValidationAvailability.UNAVAILABLE
         for record in records
@@ -1180,6 +1212,8 @@ def analyze_fold_consistency(
         unavailable_fold_count=unavailable_count,
         analytically_available_fold_count=len(analytically_available),
         insufficient_data_fold_count=insufficient_count,
+        pre_execution_insufficient_fold_count=pre_execution_insufficient_count,
+        risk_analytics_insufficient_fold_count=insufficient_count,
         catastrophic_fold_count=len(catastrophic_records),
         catastrophic_fold_ids=tuple(record.fold_id for record in catastrophic_records),
         invalid_return_fold_count=len(invalid_records),
@@ -1206,7 +1240,9 @@ def analyze_fold_consistency(
         warning=(
             "Fold contributions describe independently reset folds and are not "
             "additive self-financing portfolio P&L. Aggregate return summaries "
-            "are incomplete when catastrophic or invalid-return folds exist."
+            "are incomplete when any scheduled fold lacks finite return evidence "
+            "or contains a catastrophic or invalid return. Conditional observable-"
+            "fold diagnostics retain their explicitly labelled denominator."
         ),
     )
 
@@ -1526,6 +1562,8 @@ def _empty_fold_consistency() -> FoldConsistencyMetrics:
         zero_return_no_selection_fold_count=0, unavailable_fold_count=0,
         analytically_available_fold_count=0,
         insufficient_data_fold_count=0,
+        pre_execution_insufficient_fold_count=0,
+        risk_analytics_insufficient_fold_count=0,
         catastrophic_fold_count=0,
         catastrophic_fold_ids=(),
         invalid_return_fold_count=0,
@@ -1598,13 +1636,25 @@ def build_statistical_validation_report(
         if regime_labels is not None
         else None
     )
-    availability = (
+    primary_inference_availability = (
         ValidationAvailability.AVAILABLE
         if bootstrap.status is ValidationAvailability.AVAILABLE
         and psr.status is ValidationAvailability.AVAILABLE
         and track_record.status is ValidationAvailability.AVAILABLE
         else ValidationAvailability.UNAVAILABLE
     )
+    requested_availability = [
+        primary_inference_availability,
+        fold_consistency.status,
+    ]
+    if regime is not None:
+        requested_availability.append(regime.status)
+    if ValidationAvailability.UNAVAILABLE in requested_availability:
+        overall_availability = ValidationAvailability.UNAVAILABLE
+    elif ValidationAvailability.INSUFFICIENT_DATA in requested_availability:
+        overall_availability = ValidationAvailability.INSUFFICIENT_DATA
+    else:
+        overall_availability = ValidationAvailability.AVAILABLE
     provenance = tuple(
         dict.fromkeys(
             (*robustness_result.provenance_warnings,
@@ -1620,7 +1670,9 @@ def build_statistical_validation_report(
         regime_consistency=regime,
         primary_oos_returns=primary,
         observations=len(primary),
-        availability=availability,
+        primary_inference_availability=primary_inference_availability,
+        overall_availability=overall_availability,
+        availability=primary_inference_availability,
         validation_warnings=VALIDATION_WARNINGS,
         provenance_warnings=provenance,
     )

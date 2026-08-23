@@ -329,6 +329,14 @@ def test_bootstrap_point_estimates_match_direct_analytics() -> None:
     assert result.maximum_drawdown.point_estimate == pytest.approx(maximum_drawdown(source))
 
 
+def test_bootstrap_maximum_drawdown_measures_first_loss_from_initial_equity() -> None:
+    source = _returns([-0.20, 0.25])
+
+    result = bootstrap_performance_metrics(source, 1, 40, random_seed=4)
+
+    assert result.maximum_drawdown.point_estimate == pytest.approx(-0.20)
+
+
 def test_full_length_block_is_not_primary_interval_evidence() -> None:
     source = _returns()
     result = bootstrap_performance_metrics(source, len(source), 10, random_seed=5)
@@ -690,23 +698,62 @@ def _mixed_folds() -> tuple[WalkForwardFoldResult, ...]:
     )
 
 
-def test_fold_consistency_counts_and_quantiles_retain_all_folds() -> None:
+def test_unavailable_scheduled_fold_suppresses_unqualified_summaries() -> None:
     folds = _mixed_folds()
     result = analyze_fold_consistency(_walk_forward_result(_returns().tolist(), folds=folds))
-    expected_totals = np.array([0.10, -0.10, 0.0, 0.20])
     assert result.fold_count == 5
     assert result.observable_fold_count == 4
     assert result.positive_return_fold_count == 2
     assert result.negative_return_fold_count == 1
     assert result.zero_return_no_selection_fold_count == 1
     assert result.unavailable_fold_count == 1
+    assert result.pre_execution_insufficient_fold_count == 1
+    assert result.risk_analytics_insufficient_fold_count == 0
+    assert result.insufficient_data_fold_count == 0
     assert result.fraction_observable_folds_positive == 0.5
-    assert result.median_fold_total_return == pytest.approx(np.quantile(expected_totals, 0.50))
-    assert result.lower_quartile_fold_total_return == pytest.approx(np.quantile(expected_totals, 0.25))
-    assert result.upper_quartile_fold_total_return == pytest.approx(np.quantile(expected_totals, 0.75))
-    assert result.worst_fold_return == pytest.approx(-0.10)
-    assert result.strongest_fold_return == pytest.approx(0.20)
+    assert not result.summaries_complete
+    assert np.isnan(result.median_fold_total_return)
+    assert np.isnan(result.lower_quartile_fold_total_return)
+    assert np.isnan(result.upper_quartile_fold_total_return)
+    assert np.isnan(result.worst_fold_return)
+    assert np.isnan(result.strongest_fold_return)
+    assert np.isnan(result.strongest_single_positive_fold_concentration)
+    assert np.isnan(result.strongest_twenty_percent_positive_folds_concentration)
+    assert result.strongest_twenty_percent_positive_fold_count == 0
     assert any(item.total_return < 0.0 for item in result.folds)
+
+
+def test_complete_fold_summaries_include_no_selection_and_singleton_returns() -> None:
+    folds = (
+        _fold_result(1, WalkForwardStatus.COMPLETED, [0.10, 0.0, 0.0, 0.0]),
+        _fold_result(2, WalkForwardStatus.NO_SELECTION, None),
+        _fold_result(3, WalkForwardStatus.COMPLETED, [0.05]),
+    )
+
+    result = analyze_fold_consistency(
+        _walk_forward_result(_returns().tolist(), folds=folds)
+    )
+    expected_totals = np.array([0.10, 0.0, 0.05])
+
+    assert result.summaries_complete
+    assert result.observable_fold_count == 3
+    assert result.zero_return_no_selection_fold_count == 1
+    assert result.pre_execution_insufficient_fold_count == 0
+    assert result.risk_analytics_insufficient_fold_count == 1
+    assert result.insufficient_data_fold_count == 1
+    assert result.unavailable_fold_count == 1
+    assert result.fraction_observable_folds_positive == pytest.approx(2.0 / 3.0)
+    assert result.median_fold_total_return == pytest.approx(
+        np.quantile(expected_totals, 0.50)
+    )
+    assert result.lower_quartile_fold_total_return == pytest.approx(
+        np.quantile(expected_totals, 0.25)
+    )
+    assert result.upper_quartile_fold_total_return == pytest.approx(
+        np.quantile(expected_totals, 0.75)
+    )
+    assert result.worst_fold_return == 0.0
+    assert result.strongest_fold_return == pytest.approx(0.10)
 
 
 def test_fold_positive_concentration_and_ceiling_rule_are_exact() -> None:
@@ -745,6 +792,9 @@ def test_singleton_fold_retains_return_but_has_insufficient_risk_analytics() -> 
     assert result.status is ValidationAvailability.INSUFFICIENT_DATA
     assert result.analytically_available_fold_count == 0
     assert result.insufficient_data_fold_count == 1
+    assert result.pre_execution_insufficient_fold_count == 0
+    assert result.risk_analytics_insufficient_fold_count == 1
+    assert result.summaries_complete
 
 
 def test_catastrophic_fold_remains_explicit_and_cannot_improve_summaries() -> None:
@@ -816,6 +866,16 @@ def test_regime_metrics_names_provenance_and_concentration_are_correct() -> None
     assert "caller-supplied" in result.provenance_warning
     assert not hasattr(result, "selected_regime")
     assert all(isinstance(item, RegimePerformance) for item in result.regimes)
+
+
+def test_regime_maximum_drawdown_measures_first_loss_from_initial_equity() -> None:
+    source = _returns([-0.20, 0.25, 0.01, -0.005])
+    labels = pd.Series(["initial", "initial", "later", "later"], index=source.index)
+
+    result = analyze_regime_consistency(source, labels)
+    by_name = {item.regime_label: item for item in result.regimes}
+
+    assert by_name["initial"].maximum_drawdown == pytest.approx(-0.20)
 
 
 def test_missing_regime_returns_are_unavailable_not_compressed() -> None:
@@ -1099,6 +1159,128 @@ def test_multiple_testing_uses_stable_survival_tail(
     assert row.raw_pvalue > 0.0
     assert row.bonferroni_adjusted_pvalue == precise_tail
     assert row.benjamini_hochberg_adjusted_pvalue == precise_tail
+
+
+def test_overall_availability_reflects_insufficient_fold_analytics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    folds = (_fold_result(1, WalkForwardStatus.COMPLETED, [0.05]),)
+    robustness = _robustness_result(monkeypatch, folds=folds)
+
+    report = build_statistical_validation_report(
+        robustness,
+        block_length=2,
+        n_bootstrap=40,
+        random_seed=5,
+    )
+
+    assert report.primary_inference_availability is ValidationAvailability.AVAILABLE
+    assert report.fold_consistency.status is ValidationAvailability.INSUFFICIENT_DATA
+    assert report.overall_availability is ValidationAvailability.INSUFFICIENT_DATA
+    assert report.availability is report.primary_inference_availability
+
+
+def test_requested_unavailable_regime_makes_overall_report_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    folds = (
+        _fold_result(
+            1,
+            WalkForwardStatus.COMPLETED,
+            [0.01, -0.005, 0.01, 0.0],
+        ),
+    )
+    robustness = _robustness_result(monkeypatch, folds=folds)
+    unavailable_source = _returns([0.01, np.nan, 0.02, 0.0])
+    unavailable_labels = pd.Series(
+        ["a", "a", "b", "b"],
+        index=unavailable_source.index,
+    )
+    unavailable_regime = analyze_regime_consistency(
+        unavailable_source,
+        unavailable_labels,
+    )
+    assert unavailable_regime.status is ValidationAvailability.UNAVAILABLE
+    monkeypatch.setattr(
+        validation_module,
+        "analyze_regime_consistency",
+        lambda *args, **kwargs: unavailable_regime,
+    )
+    requested_labels = pd.Series(
+        "requested",
+        index=robustness.baseline_result.common_horizon_returns.index,
+    )
+
+    report = build_statistical_validation_report(
+        robustness,
+        block_length=2,
+        n_bootstrap=40,
+        random_seed=5,
+        regime_labels=requested_labels,
+    )
+
+    assert report.primary_inference_availability is ValidationAvailability.AVAILABLE
+    assert report.regime_consistency is not None
+    assert report.regime_consistency.status is ValidationAvailability.UNAVAILABLE
+    assert report.overall_availability is ValidationAvailability.UNAVAILABLE
+    assert report.availability is report.primary_inference_availability
+
+
+def test_all_requested_validation_components_can_be_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    folds = (
+        _fold_result(
+            1,
+            WalkForwardStatus.COMPLETED,
+            [0.01, -0.005, 0.01, 0.0],
+        ),
+    )
+    robustness = _robustness_result(monkeypatch, folds=folds)
+    labels = pd.Series(
+        "all",
+        index=robustness.baseline_result.common_horizon_returns.index,
+    )
+
+    report = build_statistical_validation_report(
+        robustness,
+        block_length=2,
+        n_bootstrap=40,
+        random_seed=5,
+        regime_labels=labels,
+    )
+
+    assert report.primary_inference_availability is ValidationAvailability.AVAILABLE
+    assert report.fold_consistency.status is ValidationAvailability.AVAILABLE
+    assert report.regime_consistency is not None
+    assert report.regime_consistency.status is ValidationAvailability.AVAILABLE
+    assert report.overall_availability is ValidationAvailability.AVAILABLE
+    assert report.availability is report.primary_inference_availability
+
+
+def test_omitted_regime_does_not_reduce_overall_availability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    folds = (
+        _fold_result(
+            1,
+            WalkForwardStatus.COMPLETED,
+            [0.01, -0.005, 0.01, 0.0],
+        ),
+    )
+    robustness = _robustness_result(monkeypatch, folds=folds)
+
+    report = build_statistical_validation_report(
+        robustness,
+        block_length=2,
+        n_bootstrap=40,
+        random_seed=5,
+    )
+
+    assert report.regime_consistency is None
+    assert report.primary_inference_availability is ValidationAvailability.AVAILABLE
+    assert report.overall_availability is ValidationAvailability.AVAILABLE
+    assert report.availability is report.primary_inference_availability
 
 
 def test_report_is_immutable_defensive_and_composes_standalone_results(

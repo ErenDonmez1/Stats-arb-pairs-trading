@@ -15,7 +15,7 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 import pandas as pd
 
-from .backtest import BacktestResult
+from .backtest import BacktestResult, validate_backtest_invariants
 from .walkforward import WalkForwardResult
 
 
@@ -31,7 +31,10 @@ __all__ = [
     "PortfolioPosition",
     "PortfolioMetrics",
     "PortfolioResult",
+    "RISK_LIMIT_TOLERANCE",
     "validate_pair_results",
+    "validate_pair_allocations",
+    "validate_portfolio_result_invariants",
     "normalize_pair_weights",
     "allocate_pair_capital",
     "calculate_portfolio_returns",
@@ -42,6 +45,7 @@ __all__ = [
 
 
 PairIdentifier = str | tuple[str, str]
+RISK_LIMIT_TOLERANCE = 1e-12
 _WEIGHT_TOLERANCE = 1e-12
 _ACCOUNTING_TOLERANCE = 1e-9
 _EXPOSURE_COLUMNS = (
@@ -132,6 +136,11 @@ class PairPortfolioInput:
             )
         if not isinstance(self.execution_rows, pd.Series):
             raise TypeError("execution_rows must be a pandas Series.")
+        validated_active = _validate_boolean_series(
+            self.active_state,
+            f"{self.pair_id} active_state",
+            allow_missing=True,
+        )
         _validate_boolean_series(
             self.execution_rows,
             f"{self.pair_id} execution_rows",
@@ -161,7 +170,7 @@ class PairPortfolioInput:
             "calendar_returns",
             self.calendar_returns.copy(deep=True),
         )
-        object.__setattr__(self, "active_state", self.active_state.copy(deep=True))
+        object.__setattr__(self, "active_state", validated_active)
         object.__setattr__(
             self,
             "execution_rows",
@@ -424,6 +433,42 @@ def _validate_boolean_series(
     return series.astype(dtype).copy(deep=True)
 
 
+def _require_numeric_close(
+    actual: pd.Series | pd.DataFrame,
+    expected: pd.Series | pd.DataFrame,
+    name: str,
+) -> None:
+    """Require identical axes/NaN masks and numerically close finite values."""
+    if type(actual) is not type(expected):
+        raise TypeError(f"{name} must use the expected pandas container type.")
+    if not actual.index.equals(expected.index):
+        raise ValueError(f"{name} index is inconsistent.")
+    if isinstance(actual, pd.DataFrame) and not actual.columns.equals(expected.columns):
+        raise ValueError(f"{name} columns are inconsistent.")
+    for value, label in ((actual, "actual"), (expected, "expected")):
+        raw_values = value.to_numpy(dtype=object).ravel()
+        nonmissing = [item for item in raw_values if not pd.isna(item)]
+        if any(
+            isinstance(item, (bool, np.bool_)) or not isinstance(item, Real)
+            for item in nonmissing
+        ):
+            raise TypeError(f"{name} {label} values must be non-Boolean real numbers.")
+    actual_values = actual.to_numpy(dtype=float)
+    expected_values = expected.to_numpy(dtype=float)
+    if np.isinf(actual_values).any() or np.isinf(expected_values).any():
+        raise ValueError(f"{name} must not contain infinity.")
+    if not np.array_equal(np.isnan(actual_values), np.isnan(expected_values)):
+        raise ValueError(f"{name} has an inconsistent missing-value mask.")
+    known = np.isfinite(actual_values) & np.isfinite(expected_values)
+    if not np.allclose(
+        actual_values[known],
+        expected_values[known],
+        rtol=_ACCOUNTING_TOLERANCE,
+        atol=_ACCOUNTING_TOLERANCE,
+    ):
+        raise ValueError(f"{name} is inconsistent.")
+
+
 def _validate_exposure_frame(
     frame: pd.DataFrame,
     pair_id: str,
@@ -584,6 +629,11 @@ def _normalise_pair_identifier(value: PairIdentifier) -> tuple[str, str, str]:
     return f"{symbol_y}|{symbol_x}", symbol_y, symbol_x
 
 
+def _underlying_pair_key(symbol_y: str, symbol_x: str) -> tuple[str, str]:
+    """Return an unordered key used only for portfolio duplicate detection."""
+    return tuple(sorted((symbol_y, symbol_x)))
+
+
 def _validate_index(index: pd.Index, name: str) -> pd.Index:
     if not isinstance(index, pd.Index):
         raise TypeError(f"{name} must be a pandas Index.")
@@ -674,6 +724,7 @@ def _source_from_backtest(
     result: BacktestResult,
     capital_basis: float | None,
 ) -> PairPortfolioInput:
+    validate_backtest_invariants(result)
     accounting = result.accounting.copy(deep=True)
     if _RETURN_COLUMN not in accounting.columns:
         raise ValueError(
@@ -826,11 +877,19 @@ def validate_pair_results(
     capital_bases = _normalise_capital_bases(source_capital_bases)
     normalized: list[PairPortfolioInput] = []
     seen_ids: set[str] = set()
+    seen_underlying_pairs: set[tuple[str, str]] = set()
     for identifier, result in items:
         pair_id, symbol_y, symbol_x = _normalise_pair_identifier(identifier)
         if pair_id in seen_ids:
             raise ValueError(f"Duplicate normalized pair identifier {pair_id!r}.")
         seen_ids.add(pair_id)
+        underlying_key = _underlying_pair_key(symbol_y, symbol_x)
+        if underlying_key in seen_underlying_pairs:
+            raise ValueError(
+                "Duplicate underlying unordered pair is not permitted in one "
+                f"portfolio: {underlying_key[0]}|{underlying_key[1]}."
+            )
+        seen_underlying_pairs.add(underlying_key)
         capital_basis = capital_bases.get(pair_id)
         if isinstance(result, BacktestResult):
             source = _source_from_backtest(
@@ -880,8 +939,11 @@ def validate_pair_results(
                 result.calendar_returns,
                 pair_id,
             )
-            if not isinstance(result.active_state, pd.Series):
-                raise TypeError(f"{pair_id} active_state must be a pandas Series.")
+            validated_active = _validate_boolean_series(
+                result.active_state,
+                f"{pair_id} active_state",
+                allow_missing=True,
+            )
             validated_execution = _validate_boolean_series(
                 result.execution_rows,
                 f"{pair_id} execution_rows",
@@ -893,15 +955,27 @@ def validate_pair_results(
                 if effective_basis is not None
                 else SourceCapitalProvenance.UNAVAILABLE.value
             )
+            direct_warning = (
+                "Direct PairPortfolioInput provenance is caller supplied and "
+                "unverified; caller claims of continuous capital or point-in-time "
+                "universe validation are not authoritative."
+            )
             source = PairPortfolioInput(
                 **{
                     **result.__dict__,
                     "calendar_returns": validated_returns,
-                    "active_state": result.active_state.astype("boolean"),
+                    "active_state": validated_active,
                     "execution_rows": validated_execution,
                     "source_exposure": exposure,
                     "source_capital_basis": effective_basis,
                     "source_capital_provenance": capital_provenance,
+                    "source_return_path_policy": (
+                        SourceReturnPathPolicy.CALLER_SUPPLIED.value
+                    ),
+                    "point_in_time_universe_validated": False,
+                    "provenance_warnings": tuple(
+                        dict.fromkeys((*result.provenance_warnings, direct_warning))
+                    ),
                 }
             )
         else:
@@ -1000,6 +1074,135 @@ def normalize_pair_weights(
     return tuple((pair_id, normalized_values[pair_id]) for pair_id in normalized_ids)
 
 
+def validate_pair_allocations(
+    pair_inputs: Iterable[PairPortfolioInput],
+    allocations: Iterable[PairAllocation],
+    portfolio_initial_capital: Any,
+) -> tuple[PairAllocation, ...]:
+    """Validate static allocation, capital, and source-scaling identities."""
+    sources = tuple(sorted(tuple(pair_inputs), key=lambda item: item.pair_id))
+    if not sources or any(not isinstance(item, PairPortfolioInput) for item in sources):
+        raise TypeError("pair_inputs must contain PairPortfolioInput values.")
+    source_by_id = {item.pair_id: item for item in sources}
+    if len(source_by_id) != len(sources):
+        raise ValueError("pair_inputs must have unique pair IDs.")
+    underlying_keys = {
+        _underlying_pair_key(item.symbol_y, item.symbol_x) for item in sources
+    }
+    if len(underlying_keys) != len(sources):
+        raise ValueError("pair_inputs contain duplicate underlying unordered pairs.")
+
+    capital = _finite_positive(portfolio_initial_capital, "portfolio_initial_capital")
+    supplied = tuple(allocations)
+    if any(not isinstance(item, PairAllocation) for item in supplied):
+        raise TypeError("allocations must contain PairAllocation values.")
+    allocation_by_id = {item.pair_id: item for item in supplied}
+    if len(allocation_by_id) != len(supplied):
+        raise ValueError("allocations must have unique pair IDs.")
+    if set(allocation_by_id) != set(source_by_id):
+        raise ValueError("allocations must match pair_inputs exactly.")
+
+    validated: list[PairAllocation] = []
+    weight_total = 0.0
+    for pair_id in sorted(source_by_id):
+        source = source_by_id[pair_id]
+        allocation = allocation_by_id[pair_id]
+        normalized_id, symbol_y, symbol_x = _normalise_pair_identifier(
+            allocation.pair_id
+        )
+        if normalized_id != pair_id or allocation.pair_id != pair_id:
+            raise ValueError("Allocation pair ID must be canonical and match its source.")
+        if (allocation.symbol_y, allocation.symbol_x) != (
+            source.symbol_y,
+            source.symbol_x,
+        ) or (symbol_y, symbol_x) != (source.symbol_y, source.symbol_x):
+            raise ValueError(f"{pair_id} allocation symbols must match its source.")
+
+        weight = _finite_nonnegative(allocation.weight, f"{pair_id} weight")
+        allocated = _finite_nonnegative(
+            allocation.allocated_capital,
+            f"{pair_id} allocated_capital",
+        )
+        expected_allocated = capital * weight
+        if not np.isclose(
+            allocated,
+            expected_allocated,
+            rtol=_ACCOUNTING_TOLERANCE,
+            atol=_ACCOUNTING_TOLERANCE * max(1.0, abs(expected_allocated)),
+        ):
+            raise ValueError(
+                f"{pair_id} allocated_capital must equal portfolio initial "
+                "capital multiplied by weight."
+            )
+        weight_total += weight
+
+        if type(allocation.exposure_available) is not bool:
+            raise TypeError(f"{pair_id} exposure_available must be a bool.")
+        source_basis = source.source_capital_basis
+        allocation_basis = allocation.source_capital_basis
+        if source_basis is None:
+            if allocation_basis is not None:
+                raise ValueError(f"{pair_id} allocation source capital is inconsistent.")
+            if allocation.exposure_scaling_factor is not None:
+                raise ValueError(
+                    f"{pair_id} exposure scaling requires a source capital basis."
+                )
+            scale = None
+        else:
+            source_basis = _finite_positive(
+                source_basis,
+                f"{pair_id} source capital basis",
+            )
+            if allocation_basis is None:
+                raise ValueError(f"{pair_id} allocation source capital is missing.")
+            allocation_basis = _finite_positive(
+                allocation_basis,
+                f"{pair_id} allocation source capital basis",
+            )
+            if not _capital_bases_agree(source_basis, allocation_basis):
+                raise ValueError(f"{pair_id} allocation source capital is inconsistent.")
+            if allocation.exposure_scaling_factor is None:
+                raise ValueError(f"{pair_id} exposure scaling factor is missing.")
+            scale = _finite_nonnegative(
+                allocation.exposure_scaling_factor,
+                f"{pair_id} exposure_scaling_factor",
+            )
+            expected_scale = allocated / source_basis
+            if not np.isclose(
+                scale,
+                expected_scale,
+                rtol=_ACCOUNTING_TOLERANCE,
+                atol=_ACCOUNTING_TOLERANCE * max(1.0, abs(expected_scale)),
+            ):
+                raise ValueError(
+                    f"{pair_id} exposure_scaling_factor must equal allocated "
+                    "capital divided by source capital basis."
+                )
+
+        _, complete_exposure = _validate_exposure_frame(
+            source.source_exposure,
+            pair_id,
+        )
+        expected_exposure_available = bool(
+            weight == 0.0
+            or (scale is not None and not source.source_exposure.empty and complete_exposure.any())
+        )
+        if allocation.exposure_available != expected_exposure_available:
+            raise ValueError(
+                f"{pair_id} exposure_available is inconsistent with its source "
+                "and allocation."
+            )
+        if allocation.source_capital_provenance != source.source_capital_provenance:
+            raise ValueError(f"{pair_id} source capital provenance is inconsistent.")
+        if allocation.source_return_path_policy != source.source_return_path_policy:
+            raise ValueError(f"{pair_id} source return-path policy is inconsistent.")
+        validated.append(allocation)
+
+    if weight_total > 1.0 + _WEIGHT_TOLERANCE:
+        raise ValueError("allocations exceed portfolio initial capital.")
+    return tuple(validated)
+
+
 def allocate_pair_capital(
     pair_inputs: Iterable[PairPortfolioInput],
     portfolio_initial_capital: Any,
@@ -1079,7 +1282,7 @@ def allocate_pair_capital(
                 source_return_path_policy=source.source_return_path_policy,
             )
         )
-    return tuple(allocations)
+    return validate_pair_allocations(sources, allocations, capital)
 
 
 @dataclass(frozen=True)
@@ -1136,12 +1339,8 @@ def _calculate_static_sleeve_accounting(
     index = sources[0].calendar_returns.index.copy()
     if any(not source.calendar_returns.index.equals(index) for source in sources):
         raise ValueError("pair_inputs must share the exact same return index.")
-    allocation_tuple = tuple(allocations)
+    allocation_tuple = validate_pair_allocations(sources, allocations, capital)
     allocation_by_id = {item.pair_id: item for item in allocation_tuple}
-    if len(allocation_by_id) != len(allocation_tuple):
-        raise ValueError("allocations must have unique pair IDs.")
-    if set(allocation_by_id) != {item.pair_id for item in sources}:
-        raise ValueError("allocations must match pair_inputs exactly.")
     sleeve_returns = pd.DataFrame(
         {
             source.pair_id: source.calendar_returns.to_numpy(dtype=float)
@@ -1196,7 +1395,13 @@ def _calculate_static_sleeve_accounting(
             if not np.isfinite(pnl) or not np.isfinite(closing):
                 continuous = False
                 continue
-            if pair_return == -1.0:
+            if pair_return == -1.0 or (
+                running_equity > 0.0 and closing == 0.0
+            ):
+                # Exact zero from a valid update is the floating-point
+                # representability boundary for the sleeve.  Latch it under the
+                # existing zero-equity insolvency policy without introducing an
+                # arbitrary near-zero threshold.
                 closing = 0.0
                 insolvent = True
             sleeve_pnl.at[index[row_number], pair_id] = pnl
@@ -1397,11 +1602,36 @@ def calculate_portfolio_exposure_metrics(
     if any(not source.calendar_returns.index.equals(index) for source in sources):
         raise ValueError("pair inputs and portfolio_equity must align exactly.")
     allocation_tuple = tuple(allocations)
+    if any(not isinstance(item, PairAllocation) for item in allocation_tuple):
+        raise TypeError("allocations must contain PairAllocation values.")
+    if any(
+        not isinstance(item.weight, (bool, np.bool_)) and isinstance(item.weight, Real)
+        and np.isfinite(float(item.weight)) and float(item.weight) > 0.0
+        for item in allocation_tuple
+    ):
+        capital = _derived_initial_capital(allocation_tuple)
+    else:
+        finite_equity = portfolio_equity.dropna()
+        if finite_equity.empty:
+            raise ValueError(
+                "portfolio initial capital cannot be inferred from unavailable equity."
+            )
+        capital = _finite_positive(
+            finite_equity.iloc[0],
+            "inferred portfolio initial capital",
+        )
+    allocation_tuple = validate_pair_allocations(sources, allocation_tuple, capital)
+    expected_accounting = _calculate_static_sleeve_accounting(
+        sources,
+        allocation_tuple,
+        capital,
+    )
+    _require_numeric_close(
+        portfolio_equity,
+        expected_accounting.portfolio_equity,
+        "portfolio_equity supplied to exposure calculation",
+    )
     allocation_by_id = {item.pair_id: item for item in allocation_tuple}
-    if len(allocation_by_id) != len(allocation_tuple):
-        raise ValueError("allocations must have unique pair IDs.")
-    if set(allocation_by_id) != {source.pair_id for source in sources}:
-        raise ValueError("allocations must match pair_inputs exactly.")
     pair_columns = pd.MultiIndex.from_product(
         (
             [item.pair_id for item in sources],
@@ -1504,20 +1734,12 @@ def calculate_portfolio_exposure_metrics(
     for symbol in symbols:
         signed_legs: list[pd.Series] = []
         for source in sources:
-            allocation = allocation_by_id[source.pair_id]
-            scale = (
-                0.0
-                if allocation.weight == 0.0
-                else allocation.exposure_scaling_factor
-            )
-            if scale is None:
-                continue
             available = available_by_pair[source.pair_id]
             if source.symbol_y == symbol:
-                leg = source.source_exposure["market_value_y"].astype(float) * scale
+                leg = pair_exposures[(source.pair_id, "market_value_y")].astype(float)
                 signed_legs.append(leg.where(available))
             if source.symbol_x == symbol:
-                leg = source.source_exposure["market_value_x"].astype(float) * scale
+                leg = pair_exposures[(source.pair_id, "market_value_x")].astype(float)
                 signed_legs.append(leg.where(available))
         if not signed_legs:
             continue
@@ -1580,11 +1802,26 @@ def build_portfolio_schedule(
     """Compose row-level portfolio state and enforce execution-time limits."""
     sources = tuple(sorted(tuple(pair_inputs), key=lambda item: item.pair_id))
     allocation_tuple = tuple(allocations)
+    if any(not isinstance(item, PairAllocation) for item in allocation_tuple):
+        raise TypeError("allocations must contain PairAllocation values.")
+    if any(
+        not isinstance(item.weight, (bool, np.bool_)) and isinstance(item.weight, Real)
+        and np.isfinite(float(item.weight)) and float(item.weight) > 0.0
+        for item in allocation_tuple
+    ):
+        capital = _derived_initial_capital(allocation_tuple)
+    else:
+        finite_equity = portfolio_equity.dropna()
+        if finite_equity.empty:
+            raise ValueError(
+                "portfolio initial capital cannot be inferred from unavailable equity."
+            )
+        capital = _finite_positive(
+            finite_equity.iloc[0],
+            "inferred portfolio initial capital",
+        )
+    allocation_tuple = validate_pair_allocations(sources, allocation_tuple, capital)
     allocation_by_id = {item.pair_id: item for item in allocation_tuple}
-    if len(allocation_by_id) != len(allocation_tuple):
-        raise ValueError("allocations must have unique pair IDs.")
-    if set(allocation_by_id) != {source.pair_id for source in sources}:
-        raise ValueError("allocations must match pair_inputs exactly.")
     index = portfolio_returns.index.copy()
     for name, pandas_object in (
         ("portfolio_equity", portfolio_equity),
@@ -1596,12 +1833,36 @@ def build_portfolio_schedule(
             raise ValueError(f"{name} must align exactly with portfolio_returns.")
     if any(not source.calendar_returns.index.equals(index) for source in sources):
         raise ValueError("pair inputs and portfolio returns must align exactly.")
+    expected_accounting = _calculate_static_sleeve_accounting(
+        sources,
+        allocation_tuple,
+        capital,
+    )
+    _require_numeric_close(
+        portfolio_returns,
+        expected_accounting.portfolio_returns,
+        "portfolio_returns supplied to schedule construction",
+    )
+    _require_numeric_close(
+        portfolio_equity,
+        expected_accounting.portfolio_equity,
+        "portfolio_equity supplied to schedule construction",
+    )
+    _require_numeric_close(
+        cash_contribution,
+        expected_accounting.cash_return_contribution,
+        "cash_contribution supplied to schedule construction",
+    )
     active_count = np.zeros(len(index), dtype=int)
     active_available = np.ones(len(index), dtype=bool)
     for source in sources:
         if allocation_by_id[source.pair_id].weight <= 0.0:
             continue
-        states = source.active_state.astype("boolean")
+        states = _validate_boolean_series(
+            source.active_state,
+            f"{source.pair_id} active_state",
+            allow_missing=True,
+        )
         active_count += states.fillna(False).to_numpy(dtype=bool).astype(int)
         active_available &= states.notna().to_numpy(dtype=bool)
     if execution_rows is None:
@@ -1617,6 +1878,12 @@ def build_portfolio_schedule(
         portfolio_pnl = pd.Series(np.nan, index=index, name="portfolio_pnl")
     if not portfolio_pnl.index.equals(index):
         raise ValueError("portfolio_pnl must align exactly with portfolio returns.")
+    if not portfolio_pnl.isna().all():
+        _require_numeric_close(
+            portfolio_pnl,
+            expected_accounting.portfolio_pnl,
+            "portfolio_pnl supplied to schedule construction",
+        )
     if portfolio_catastrophic_state is None:
         portfolio_catastrophic_state = portfolio_returns.le(-1.0).cummax()
     if not portfolio_catastrophic_state.index.equals(index):
@@ -1628,6 +1895,10 @@ def build_portfolio_schedule(
         "portfolio_catastrophic_state",
         allow_missing=False,
     )
+    if not portfolio_catastrophic_state.equals(
+        expected_accounting.portfolio_catastrophic_state
+    ):
+        raise ValueError("portfolio catastrophic state is inconsistent with accounting.")
     gross_ratio = aggregate_exposures["gross_exposure_ratio"].astype(float)
     if max_total_gross_exposure_ratio is None:
         limit = None
@@ -1649,8 +1920,8 @@ def build_portfolio_schedule(
             aggregate_exposures["exposure_available"].fillna(False).astype(bool)
             & gross_ratio.notna()
         )
-        within = evaluable & gross_ratio.le(limit + _WEIGHT_TOLERANCE)
-        breached = evaluable & gross_ratio.gt(limit + _WEIGHT_TOLERANCE)
+        within = evaluable & gross_ratio.le(limit + RISK_LIMIT_TOLERANCE)
+        breached = evaluable & gross_ratio.gt(limit + RISK_LIMIT_TOLERANCE)
         statuses[within.to_numpy(dtype=bool)] = LeverageStatus.WITHIN_LIMIT
         statuses[breached.to_numpy(dtype=bool)] = LeverageStatus.BREACH
         leverage_status = pd.Series(
@@ -1704,6 +1975,445 @@ def build_portfolio_schedule(
     schedule["catastrophic_portfolio_return"] = portfolio_returns.le(-1.0).fillna(False)
     schedule["portfolio_catastrophic"] = portfolio_catastrophic_state
     return schedule
+
+
+def _require_boolean_frame_equal(
+    actual: pd.DataFrame,
+    expected: pd.DataFrame,
+    name: str,
+) -> None:
+    if not isinstance(actual, pd.DataFrame):
+        raise TypeError(f"{name} must be a pandas DataFrame.")
+    if not actual.index.equals(expected.index) or not actual.columns.equals(
+        expected.columns
+    ):
+        raise ValueError(f"{name} axes are inconsistent.")
+    validated = pd.DataFrame(index=actual.index, columns=actual.columns, dtype=bool)
+    for column in actual:
+        validated[column] = _validate_boolean_series(
+            actual[column],
+            f"{name}[{column!r}]",
+            allow_missing=False,
+        )
+    if not validated.equals(expected.astype(bool)):
+        raise ValueError(f"{name} is inconsistent with canonical accounting.")
+
+
+def _reconstruct_portfolio_sources(
+    result: PortfolioResult,
+    allocations: tuple[PairAllocation, ...],
+) -> tuple[PairPortfolioInput, ...]:
+    """Build minimal owned sources used only to replay sleeve accounting."""
+    allocation_by_id = {item.pair_id: item for item in allocations}
+    sources: list[PairPortfolioInput] = []
+    for pair_id in result.pair_ids:
+        allocation = allocation_by_id[pair_id]
+        exposure_value = 0.0 if allocation.exposure_available else np.nan
+        exposure = pd.DataFrame(
+            exposure_value,
+            index=result.portfolio_returns.index,
+            columns=_EXPOSURE_COLUMNS,
+        )
+        sources.append(
+            PairPortfolioInput(
+                pair_id=pair_id,
+                symbol_y=allocation.symbol_y,
+                symbol_x=allocation.symbol_x,
+                calendar_returns=result.pair_sleeve_returns[pair_id],
+                active_state=pd.Series(
+                    False,
+                    index=result.portfolio_returns.index,
+                    dtype=bool,
+                ),
+                execution_rows=pd.Series(
+                    False,
+                    index=result.portfolio_returns.index,
+                    dtype=bool,
+                ),
+                source_exposure=exposure,
+                source_capital_basis=allocation.source_capital_basis,
+                source_type="PortfolioResult invariant replay",
+                capital_policy="static_unrebalanced_replay",
+                point_in_time_universe_validated=False,
+                universe_provenance="invariant_replay_only",
+                cleaning_provenance="invariant_replay_only",
+                provenance_warnings=(),
+                source_capital_provenance=allocation.source_capital_provenance,
+                source_return_path_policy=allocation.source_return_path_policy,
+            )
+        )
+    return tuple(sources)
+
+
+def validate_portfolio_result_invariants(result: PortfolioResult) -> None:
+    """Validate canonical portfolio accounting and all risk-facing derivations.
+
+    ``PortfolioResult`` owns its pandas objects at construction, but those objects
+    intentionally remain caller-mutable.  Every downstream trust boundary must
+    therefore invoke this validator rather than relying on the frozen wrapper.
+    """
+    if not isinstance(result, PortfolioResult):
+        raise TypeError("result must be a PortfolioResult.")
+    index = _validate_index(result.portfolio_returns.index, "portfolio result index")
+    capital = _finite_positive(result.initial_capital, "PortfolioResult initial_capital")
+    pair_ids = tuple(result.pair_ids)
+    if not pair_ids or pair_ids != tuple(sorted(pair_ids)):
+        raise ValueError("PortfolioResult pair_ids must be non-empty and sorted.")
+    if len(pair_ids) != len(set(pair_ids)):
+        raise ValueError("PortfolioResult pair_ids must be unique.")
+    parsed = tuple(_normalise_pair_identifier(pair_id) for pair_id in pair_ids)
+    if any(item[0] != pair_id for item, pair_id in zip(parsed, pair_ids)):
+        raise ValueError("PortfolioResult pair_ids must use canonical formatting.")
+    if len({_underlying_pair_key(y, x) for _, y, x in parsed}) != len(pair_ids):
+        raise ValueError("PortfolioResult contains duplicate underlying unordered pairs.")
+
+    aligned_objects = (
+        result.portfolio_equity,
+        result.portfolio_pnl,
+        result.portfolio_schedule,
+        result.pair_sleeve_returns,
+        result.pair_prior_sleeve_equity,
+        result.pair_sleeve_equity,
+        result.pair_pnl_contributions,
+        result.pair_return_contributions,
+        result.pair_current_equity_weights,
+        result.pair_insolvency_state,
+        result.catastrophic_pair_rows,
+        result.pair_exposures,
+        result.aggregate_exposures,
+        result.symbol_exposures,
+        result.leverage_status,
+        result.unavailable_rows,
+    )
+    if any(not value.index.equals(index) for value in aligned_objects):
+        raise ValueError("PortfolioResult pandas objects must share the exact index.")
+    sleeve_frames = (
+        result.pair_sleeve_returns,
+        result.pair_prior_sleeve_equity,
+        result.pair_sleeve_equity,
+        result.pair_pnl_contributions,
+        result.pair_return_contributions,
+        result.pair_current_equity_weights,
+        result.pair_insolvency_state,
+        result.catastrophic_pair_rows,
+    )
+    if any(tuple(frame.columns) != pair_ids for frame in sleeve_frames):
+        raise ValueError("PortfolioResult sleeve columns must match pair_ids exactly.")
+
+    allocations = tuple(result.pair_allocations)
+    if len(allocations) != len(pair_ids):
+        raise ValueError("PortfolioResult must contain one allocation per pair.")
+    sources = _reconstruct_portfolio_sources(result, allocations)
+    allocations = validate_pair_allocations(sources, allocations, capital)
+    allocation_weights = tuple((item.pair_id, item.weight) for item in allocations)
+    if result.allocation_policy.pair_weights != allocation_weights:
+        raise ValueError("Portfolio allocation policy weights are inconsistent.")
+    expected_cash_weight = 1.0 - float(sum(item.weight for item in allocations))
+    if abs(expected_cash_weight) <= _WEIGHT_TOLERANCE:
+        expected_cash_weight = 0.0
+    for value, name in (
+        (result.cash_weight, "PortfolioResult cash_weight"),
+        (result.allocation_policy.cash_weight, "allocation policy cash_weight"),
+    ):
+        checked = _finite_nonnegative(value, name)
+        if not np.isclose(
+            checked,
+            expected_cash_weight,
+            rtol=_ACCOUNTING_TOLERANCE,
+            atol=_ACCOUNTING_TOLERANCE,
+        ):
+            raise ValueError(f"{name} is inconsistent with allocations.")
+    expected_cash_capital = capital * expected_cash_weight
+    if not np.isclose(
+        _finite_nonnegative(result.cash_capital, "PortfolioResult cash_capital"),
+        expected_cash_capital,
+        rtol=_ACCOUNTING_TOLERANCE,
+        atol=_ACCOUNTING_TOLERANCE * max(1.0, abs(expected_cash_capital)),
+    ):
+        raise ValueError("PortfolioResult cash capital is inconsistent.")
+
+    expected = _calculate_static_sleeve_accounting(sources, allocations, capital)
+    for actual, canonical, name in (
+        (result.pair_sleeve_returns, expected.sleeve_returns, "pair sleeve returns"),
+        (
+            result.pair_prior_sleeve_equity,
+            expected.prior_sleeve_equity,
+            "pair prior sleeve equity",
+        ),
+        (result.pair_sleeve_equity, expected.sleeve_equity, "pair sleeve equity"),
+        (result.pair_pnl_contributions, expected.sleeve_pnl, "pair sleeve P&L"),
+        (
+            result.pair_return_contributions,
+            expected.return_contributions,
+            "pair return contributions",
+        ),
+        (
+            result.pair_current_equity_weights,
+            expected.current_equity_weights,
+            "pair current equity weights",
+        ),
+        (result.portfolio_pnl, expected.portfolio_pnl, "portfolio P&L"),
+        (result.portfolio_returns, expected.portfolio_returns, "portfolio returns"),
+        (result.portfolio_equity, expected.portfolio_equity, "portfolio equity"),
+    ):
+        _require_numeric_close(actual, canonical, name)
+    _require_boolean_frame_equal(
+        result.pair_insolvency_state,
+        expected.insolvency_state,
+        "pair insolvency state",
+    )
+    _require_boolean_frame_equal(
+        result.catastrophic_pair_rows,
+        expected.catastrophic_pair_rows,
+        "catastrophic pair rows",
+    )
+
+    required_schedule = {
+        "portfolio_return",
+        "portfolio_pnl",
+        "portfolio_equity",
+        "portfolio_catastrophic",
+        "active_pair_count",
+        "active_pair_count_available",
+        "total_gross_exposure",
+        "total_long_exposure",
+        "total_short_exposure",
+        "total_net_exposure",
+        "gross_exposure_ratio",
+    }
+    if not required_schedule.issubset(result.portfolio_schedule.columns):
+        raise ValueError("PortfolioResult schedule is missing canonical columns.")
+    for schedule_column, canonical, name in (
+        ("portfolio_return", result.portfolio_returns, "schedule portfolio return"),
+        ("portfolio_pnl", result.portfolio_pnl, "schedule portfolio P&L"),
+        ("portfolio_equity", result.portfolio_equity, "schedule portfolio equity"),
+    ):
+        _require_numeric_close(
+            result.portfolio_schedule[schedule_column],
+            canonical,
+            name,
+        )
+    terminal = _validate_boolean_series(
+        result.portfolio_schedule["portfolio_catastrophic"],
+        "portfolio catastrophic state",
+        allow_missing=False,
+    )
+    if not terminal.equals(expected.portfolio_catastrophic_state):
+        raise ValueError("Portfolio terminal state is inconsistent with wealth.")
+    active_available = _validate_boolean_series(
+        result.portfolio_schedule["active_pair_count_available"],
+        "active pair count availability",
+        allow_missing=False,
+    )
+    active_count = result.portfolio_schedule["active_pair_count"]
+    if any(
+        isinstance(value, (bool, np.bool_)) or not isinstance(value, Real)
+        for value in active_count.loc[active_count.notna()].tolist()
+    ):
+        raise TypeError("active_pair_count must contain non-Boolean real values.")
+    active_values = active_count.astype(float)
+    positive_pair_count = sum(item.weight > 0.0 for item in allocations)
+    known_active = active_values.loc[active_available]
+    if (
+        np.isinf(active_values.to_numpy(dtype=float)).any()
+        or bool((known_active < 0.0).any())
+        or bool((known_active % 1.0 != 0.0).any())
+        or bool((known_active > positive_pair_count).any())
+    ):
+        raise ValueError("active_pair_count is outside its canonical range.")
+
+    expected_pair_columns = pd.MultiIndex.from_product(
+        (pair_ids, (*_EXPOSURE_COLUMNS, "gross_exposure_fraction", "exposure_available")),
+        names=("pair_id", "metric"),
+    )
+    if not isinstance(result.pair_exposures.columns, pd.MultiIndex) or not result.pair_exposures.columns.equals(
+        expected_pair_columns
+    ):
+        raise ValueError("PortfolioResult pair exposure columns are inconsistent.")
+    pair_available: dict[str, pd.Series] = {}
+    for pair_id in pair_ids:
+        available = _validate_boolean_series(
+            result.pair_exposures[(pair_id, "exposure_available")],
+            f"{pair_id} scaled exposure availability",
+            allow_missing=False,
+        )
+        exposure = result.pair_exposures.loc[:, [(pair_id, column) for column in _EXPOSURE_COLUMNS]].copy()
+        exposure.columns = list(_EXPOSURE_COLUMNS)
+        validated_exposure, complete = _validate_exposure_frame(exposure, pair_id)
+        if not available.equals(complete.astype(bool)):
+            raise ValueError(f"{pair_id} scaled exposure availability is inconsistent.")
+        pair_available[pair_id] = available
+        expected_fraction = validated_exposure["gross_exposure"] / result.portfolio_equity.where(
+            result.portfolio_equity > 0.0
+        )
+        _require_numeric_close(
+            result.pair_exposures[(pair_id, "gross_exposure_fraction")],
+            expected_fraction,
+            f"{pair_id} gross exposure fraction",
+        )
+
+    rows_known = pd.Series(True, index=index, dtype=bool)
+    for allocation in allocations:
+        if allocation.weight > 0.0:
+            rows_known &= pair_available[allocation.pair_id]
+    expected_aggregate = pd.DataFrame(np.nan, index=index, columns=(
+        "total_gross_exposure",
+        "total_long_exposure",
+        "total_short_exposure",
+        "total_net_exposure",
+        "gross_exposure_ratio",
+    ))
+    if bool(rows_known.any()):
+        for metric, target in (
+            ("gross_exposure", "total_gross_exposure"),
+            ("long_exposure", "total_long_exposure"),
+            ("short_exposure", "total_short_exposure"),
+            ("net_exposure", "total_net_exposure"),
+        ):
+            expected_aggregate.loc[rows_known, target] = result.pair_exposures.xs(
+                metric,
+                level="metric",
+                axis=1,
+            ).loc[rows_known].sum(axis=1, skipna=False)
+        expected_aggregate.loc[rows_known, "gross_exposure_ratio"] = (
+            expected_aggregate.loc[rows_known, "total_gross_exposure"]
+            / result.portfolio_equity.loc[rows_known].where(
+                result.portfolio_equity.loc[rows_known] > 0.0
+            )
+        )
+    required_aggregate = set(expected_aggregate.columns) | {
+        "largest_symbol_unnetted_sleeve_gross_fraction",
+        "exposure_available",
+    }
+    if not required_aggregate.issubset(result.aggregate_exposures.columns):
+        raise ValueError("PortfolioResult aggregate exposure contract is incomplete.")
+    for column in expected_aggregate:
+        _require_numeric_close(
+            result.aggregate_exposures[column],
+            expected_aggregate[column],
+            f"aggregate exposure {column}",
+        )
+    aggregate_available = _validate_boolean_series(
+        result.aggregate_exposures["exposure_available"],
+        "aggregate exposure availability",
+        allow_missing=False,
+    )
+    if not aggregate_available.equals(rows_known):
+        raise ValueError("Aggregate exposure availability is inconsistent.")
+
+    symbols = tuple(sorted({symbol for item in allocations for symbol in (item.symbol_y, item.symbol_x)}))
+    symbol_metrics = (
+        "net_market_value",
+        "unnetted_sleeve_gross_market_value",
+        "consolidated_gross_market_value",
+        "unnetted_sleeve_gross_fraction",
+    )
+    expected_symbol_columns = pd.MultiIndex.from_product(
+        (symbols, symbol_metrics),
+        names=("symbol", "metric"),
+    )
+    if not isinstance(result.symbol_exposures.columns, pd.MultiIndex) or not result.symbol_exposures.columns.equals(
+        expected_symbol_columns
+    ):
+        raise ValueError("PortfolioResult symbol exposure columns are inconsistent.")
+    expected_symbols = pd.DataFrame(
+        np.nan,
+        index=index,
+        columns=expected_symbol_columns,
+    )
+    for symbol in symbols:
+        legs: list[pd.Series] = []
+        for allocation in allocations:
+            if allocation.symbol_y == symbol:
+                legs.append(result.pair_exposures[(allocation.pair_id, "market_value_y")])
+            if allocation.symbol_x == symbol:
+                legs.append(result.pair_exposures[(allocation.pair_id, "market_value_x")])
+        leg_frame = pd.concat(legs, axis=1)
+        net = leg_frame.loc[rows_known].sum(axis=1, skipna=False)
+        unnetted = leg_frame.loc[rows_known].abs().sum(axis=1, skipna=False)
+        expected_symbols.loc[rows_known, (symbol, "net_market_value")] = net
+        expected_symbols.loc[
+            rows_known,
+            (symbol, "unnetted_sleeve_gross_market_value"),
+        ] = unnetted
+        expected_symbols.loc[
+            rows_known,
+            (symbol, "consolidated_gross_market_value"),
+        ] = net.abs()
+        expected_symbols.loc[
+            rows_known,
+            (symbol, "unnetted_sleeve_gross_fraction"),
+        ] = unnetted / expected_aggregate.loc[
+            rows_known,
+            "total_gross_exposure",
+        ].replace(0.0, np.nan)
+    _require_numeric_close(
+        result.symbol_exposures,
+        expected_symbols,
+        "symbol exposures",
+    )
+    symbol_gross = expected_symbols.xs(
+        "unnetted_sleeve_gross_market_value",
+        level="metric",
+        axis=1,
+    )
+    expected_largest_symbol_fraction = symbol_gross.max(axis=1, skipna=False) / expected_aggregate[
+        "total_gross_exposure"
+    ].replace(0.0, np.nan)
+    _require_numeric_close(
+        result.aggregate_exposures[
+            "largest_symbol_unnetted_sleeve_gross_fraction"
+        ],
+        expected_largest_symbol_fraction,
+        "largest symbol unnetted sleeve gross fraction",
+    )
+    for schedule_column, aggregate_column in (
+        ("total_gross_exposure", "total_gross_exposure"),
+        ("total_long_exposure", "total_long_exposure"),
+        ("total_short_exposure", "total_short_exposure"),
+        ("total_net_exposure", "total_net_exposure"),
+        ("gross_exposure_ratio", "gross_exposure_ratio"),
+    ):
+        _require_numeric_close(
+            result.portfolio_schedule[schedule_column],
+            result.aggregate_exposures[aggregate_column],
+            f"schedule {schedule_column}",
+        )
+
+    expected_source_provenance = tuple(
+        (
+            item.pair_id,
+            item.source_capital_provenance,
+            item.source_return_path_policy,
+        )
+        for item in allocations
+    )
+    if result.source_path_provenance != expected_source_provenance:
+        raise ValueError("PortfolioResult source-path provenance is inconsistent.")
+    expected_synthetic = any(
+        item.source_return_path_policy
+        == SourceReturnPathPolicy.SYNTHETIC_EQUAL_CAPITAL_RESET.value
+        for item in allocations
+    )
+    if type(result.contains_synthetic_reset_sources) is not bool:
+        raise TypeError("contains_synthetic_reset_sources must be a bool.")
+    if result.contains_synthetic_reset_sources != expected_synthetic:
+        raise ValueError("PortfolioResult synthetic-source flag is inconsistent.")
+    expected_interpretation = (
+        "synthetic_static_sleeve_composition_with_reset_based_sources"
+        if expected_synthetic
+        else (
+            "static_unrebalanced_self_financing_pair_sleeves"
+            if all(
+                item.source_return_path_policy
+                == SourceReturnPathPolicy.CONTINUOUS_BACKTEST.value
+                for item in allocations
+            )
+            else "static_unrebalanced_composition_with_caller_supplied_source_paths"
+        )
+    )
+    if result.self_financing_interpretation != expected_interpretation:
+        raise ValueError("PortfolioResult self-financing interpretation is inconsistent.")
 
 
 def run_multi_pair_portfolio(
@@ -1955,7 +2665,7 @@ def run_multi_pair_portfolio(
         == SourceReturnPathPolicy.SYNTHETIC_EQUAL_CAPITAL_RESET.value
         for source in sources
     )
-    return PortfolioResult(
+    result = PortfolioResult(
         pair_ids=tuple(source.pair_id for source in sources),
         allocation_policy=policy,
         pair_allocations=allocations,
@@ -2012,3 +2722,5 @@ def run_multi_pair_portfolio(
         provenance_warnings=provenance_warnings,
         warnings=tuple(warnings),
     )
+    validate_portfolio_result_invariants(result)
+    return result

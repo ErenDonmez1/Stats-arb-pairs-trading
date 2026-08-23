@@ -228,18 +228,20 @@ def test_gross_exposure_below_equal_and_above_limit_boundaries() -> None:
 
 
 def test_missing_gross_exposure_is_unevaluable_not_safe() -> None:
-    portfolio = _portfolio()
-    aggregate = portfolio.aggregate_exposures.copy(deep=True)
-    aggregate.loc[2, "gross_exposure_ratio"] = np.nan
-    changed = replace(portfolio, aggregate_exposures=aggregate)
+    source = _pair_input(
+        "AAA|BBB",
+        [0.0, 0.0],
+        source_capital_basis=None,
+    )
+    changed = run_multi_pair_portfolio({source.pair_id: source}, 1_000.0)
     result = run_portfolio_risk_controls(
         changed,
         PortfolioRiskLimits(max_gross_exposure_ratio=2.0),
     )
-    assert _status(result, "gross_exposure", 2) is RiskControlStatus.UNEVALUABLE
-    assert result.observations[2].unevaluable_control_count == 1
-    assert result.observations[2].overall_status is RiskControlStatus.UNEVALUABLE
-    assert result.policy_state.iloc[2] is RiskState.NORMAL
+    assert _status(result, "gross_exposure", 0) is RiskControlStatus.UNEVALUABLE
+    assert result.observations[0].unevaluable_control_count == 1
+    assert result.observations[0].overall_status is RiskControlStatus.UNEVALUABLE
+    assert result.policy_state.iloc[0] is RiskState.NORMAL
     assert any(
         "does not override an UNEVALUABLE overall status" in warning
         for warning in result.warnings
@@ -337,11 +339,15 @@ def test_symbol_concentration_uses_unnetted_sleeve_gross_over_equity() -> None:
 
 
 def test_missing_any_symbol_exposure_makes_concentration_unevaluable() -> None:
-    portfolio = _portfolio()
-    symbols = portfolio.symbol_exposures.copy(deep=True)
-    symbols.loc[2, ("AAA", "unnetted_sleeve_gross_market_value")] = np.nan
+    source = _pair_input(
+        "AAA|BBB",
+        [0.0, 0.0, 0.0],
+        market_value_y=[0.0, 100.0, np.nan],
+        market_value_x=[0.0, -100.0, -100.0],
+    )
+    portfolio = run_multi_pair_portfolio({source.pair_id: source}, 1_000.0)
     result = run_portfolio_risk_controls(
-        replace(portfolio, symbol_exposures=symbols),
+        portfolio,
         PortfolioRiskLimits(max_symbol_gross_exposure_ratio=1.0),
     )
     assert _status(result, "symbol_concentration", 2) is RiskControlStatus.UNEVALUABLE
@@ -523,10 +529,12 @@ def test_minimum_equity_ratio_equality_and_breach_are_exact() -> None:
 
 
 def test_missing_equity_breaks_all_equity_dependent_controls_permanently() -> None:
-    portfolio = _portfolio()
-    equity = portfolio.portfolio_equity.copy(deep=True)
-    equity.iloc[2] = np.nan
-    changed = replace(portfolio, portfolio_equity=equity)
+    source = _pair_input(
+        "AAA|BBB",
+        [0.0, 0.10, np.nan, 0.0],
+        active=[False, True, True, False],
+    )
+    changed = run_multi_pair_portfolio({source.pair_id: source}, 1_000.0)
     limits = PortfolioRiskLimits(
         max_gross_exposure_ratio=2.0,
         max_abs_net_exposure_ratio=2.0,
@@ -570,11 +578,24 @@ def test_insolvent_sleeve_is_visible_and_optional_limit_breaches() -> None:
 
 
 def test_control_counts_reconcile_on_every_row() -> None:
-    portfolio = _portfolio()
-    symbols = portfolio.symbol_exposures.copy(deep=True)
-    symbols.loc[1, ("AAA", "unnetted_sleeve_gross_market_value")] = np.nan
+    first = _pair_input(
+        "AAA|BBB",
+        [0.0, 0.0, 0.0, 0.0],
+        active=[False, True, True, False],
+        market_value_y=[0.0, 100.0, np.nan, 0.0],
+        market_value_x=[0.0, -100.0, -100.0, 0.0],
+    )
+    second = _pair_input(
+        "CCC|DDD",
+        [0.0] * 4,
+        active=[False, False, True, False],
+    )
+    portfolio = run_multi_pair_portfolio(
+        {first.pair_id: first, second.pair_id: second},
+        1_000.0,
+    )
     result = run_portfolio_risk_controls(
-        replace(portfolio, symbol_exposures=symbols),
+        portfolio,
         PortfolioRiskLimits(
             max_gross_exposure_ratio=1.0,
             max_symbol_gross_exposure_ratio=1.0,
@@ -590,23 +611,35 @@ def test_control_counts_reconcile_on_every_row() -> None:
 
 
 def test_breach_dominates_unevaluable_and_unevaluable_dominates_safe() -> None:
-    portfolio = _portfolio()
-    symbols = portfolio.symbol_exposures.copy(deep=True)
-    symbols.loc[2, ("AAA", "unnetted_sleeve_gross_market_value")] = np.nan
-    changed = replace(portfolio, symbol_exposures=symbols)
+    first = _pair_input(
+        "AAA|BBB",
+        [0.0] * 4,
+        active=[False, True, True, False],
+        market_value_y=[0.0, 100.0, np.nan, 0.0],
+        market_value_x=[0.0, -100.0, -100.0, 0.0],
+    )
+    second = _pair_input(
+        "CCC|DDD",
+        [0.0] * 4,
+        active=[False, False, True, False],
+    )
+    changed = run_multi_pair_portfolio(
+        {first.pair_id: first, second.pair_id: second},
+        1_000.0,
+    )
     breach = run_portfolio_risk_controls(
         changed,
         PortfolioRiskLimits(
-            max_gross_exposure_ratio=1.0,
             max_symbol_gross_exposure_ratio=1.0,
+            max_active_pairs=1,
         ),
     )
     assert breach.observations[2].overall_status is RiskControlStatus.BREACH
     unevaluable = run_portfolio_risk_controls(
         changed,
         PortfolioRiskLimits(
-            max_gross_exposure_ratio=2.0,
             max_symbol_gross_exposure_ratio=1.0,
+            max_active_pairs=2,
         ),
     )
     assert unevaluable.observations[2].overall_status is RiskControlStatus.UNEVALUABLE
@@ -645,11 +678,14 @@ def test_breach_records_and_summary_order_counts_and_extrema_are_exact() -> None
 
 
 def test_never_evaluable_metric_summary_remains_nan() -> None:
-    portfolio = _portfolio()
-    aggregate = portfolio.aggregate_exposures.copy(deep=True)
-    aggregate["gross_exposure_ratio"] = np.nan
+    source = _pair_input(
+        "AAA|BBB",
+        [0.0] * 4,
+        source_capital_basis=None,
+    )
+    portfolio = run_multi_pair_portfolio({source.pair_id: source}, 1_000.0)
     result = run_portfolio_risk_controls(
-        replace(portfolio, aggregate_exposures=aggregate),
+        portfolio,
         PortfolioRiskLimits(max_gross_exposure_ratio=2.0),
     )
     assert np.isnan(result.summary.maximum_observed_gross_exposure_ratio)
@@ -744,11 +780,10 @@ def test_final_row_breach_has_no_future_effective_action() -> None:
             breach_action=RiskAction.HALT_NEW_ENTRIES,
         ),
     )
-    # Equality is within limit, so force a final breach with a zero insolvency cap.
-    insolvency = changed.pair_insolvency_state.copy(deep=True)
-    insolvency.iloc[-1, 0] = True
+    # Equality is within limit. A canonical final-row total loss supplies the
+    # separate final insolvency breach without mutating redundant result fields.
     final = run_portfolio_risk_controls(
-        replace(changed, pair_insolvency_state=insolvency),
+        _single_pair_portfolio([0.0, 0.0, 0.0, -1.0]),
         PortfolioRiskLimits(
             max_insolvent_sleeves=0,
             breach_action=RiskAction.HALT_NEW_ENTRIES,
@@ -862,7 +897,31 @@ def test_portfolio_catastrophe_produces_sticky_terminal_state() -> None:
 
 
 def test_future_returns_exposures_and_missingness_cannot_change_prior_risk() -> None:
-    portfolio = _portfolio()
+    first = _pair_input(
+        "AAA|BBB",
+        [0.0, 0.20, -0.25, 0.0],
+        active=[False, True, True, False],
+        market_value_y=[0.0, 600.0, 900.0, 900.0],
+        market_value_x=[0.0, -400.0, -600.0, -600.0],
+    )
+    second = _pair_input(
+        "CCC|DDD",
+        [0.0, 0.0, 0.0, 0.0],
+        active=[False, False, True, True],
+        market_value_y=[0.0, 500.0, 500.0, 0.0],
+        market_value_x=[0.0, -500.0, -500.0, 0.0],
+    )
+    changed_second = _pair_input(
+        "CCC|DDD",
+        [0.0, 0.0, 0.0, np.nan],
+        active=[False, False, True, True],
+        market_value_y=[0.0, 500.0, 500.0, np.nan],
+        market_value_x=[0.0, -500.0, -500.0, 0.0],
+    )
+    portfolio = run_multi_pair_portfolio(
+        {first.pair_id: first, second.pair_id: second},
+        10_000.0,
+    )
     limits = PortfolioRiskLimits(
         max_gross_exposure_ratio=1.0,
         max_pair_equity_weight=0.54,
@@ -870,17 +929,9 @@ def test_future_returns_exposures_and_missingness_cannot_change_prior_risk() -> 
         breach_action=RiskAction.HALT_NEW_ENTRIES,
     )
     original = run_portfolio_risk_controls(portfolio, limits)
-    equity = portfolio.portfolio_equity.copy(deep=True)
-    equity.iloc[-1] = np.nan
-    aggregate = portfolio.aggregate_exposures.copy(deep=True)
-    aggregate.iloc[-1, aggregate.columns.get_loc("gross_exposure_ratio")] = np.nan
-    weights = portfolio.pair_current_equity_weights.copy(deep=True)
-    weights.iloc[-1] = np.nan
-    changed = replace(
-        portfolio,
-        portfolio_equity=equity,
-        aggregate_exposures=aggregate,
-        pair_current_equity_weights=weights,
+    changed = run_multi_pair_portfolio(
+        {first.pair_id: first, changed_second.pair_id: changed_second},
+        10_000.0,
     )
     modified = run_portfolio_risk_controls(changed, limits)
     pd.testing.assert_frame_equal(
@@ -911,11 +962,11 @@ def test_duplicate_or_misaligned_portfolio_indices_are_rejected() -> None:
     portfolio = _portfolio()
     equity = portfolio.portfolio_equity.copy(deep=True)
     equity.index = pd.Index([0, 0, 2, 3])
-    with pytest.raises(ValueError, match="unique"):
+    with pytest.raises(ValueError, match="exact index"):
         run_portfolio_risk_controls(replace(portfolio, portfolio_equity=equity))
     returns = portfolio.portfolio_returns.copy(deep=True)
     returns.index = pd.RangeIndex(1, 5)
-    with pytest.raises(ValueError, match="align exactly"):
+    with pytest.raises(ValueError, match="exact index"):
         run_portfolio_risk_controls(replace(portfolio, portfolio_returns=returns))
 
 
@@ -941,6 +992,12 @@ def test_invalid_positive_ratio_limits_are_rejected(name: str, value: Any) -> No
 def test_invalid_unit_interval_limits_are_rejected(name: str, value: Any) -> None:
     with pytest.raises((TypeError, ValueError), match=name):
         PortfolioRiskLimits(**{name: value})
+
+
+def test_max_pair_equity_weight_accepts_one_and_rejects_above_one() -> None:
+    assert PortfolioRiskLimits(max_pair_equity_weight=1.0).max_pair_equity_weight == 1.0
+    with pytest.raises(ValueError, match="max_pair_equity_weight"):
+        PortfolioRiskLimits(max_pair_equity_weight=1.01)
 
 
 @pytest.mark.parametrize("value", [0, -1, True, 1.5, "2", np.nan, np.inf])
@@ -1076,6 +1133,250 @@ def test_real_portfolio_integration_has_causal_drift_breach_without_rewrite() ->
     assert result.policy_state.iloc[2] is RiskState.ENTRY_HALTED
     pd.testing.assert_series_equal(portfolio.portfolio_equity, equity_before)
     assert not result.risk_schedule["action_executed"].any()
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "gross-ratio",
+        "long-total",
+        "net-total",
+        "pair-weight",
+        "symbol-gross",
+        "portfolio-pnl",
+        "portfolio-equity",
+        "portfolio-return",
+        "terminal",
+        "sleeve-insolvency",
+    ),
+)
+def test_risk_boundary_rejects_mutated_portfolio_result_invariants(
+    corruption: str,
+) -> None:
+    portfolio = _portfolio()
+    changed = portfolio
+    if corruption in {"gross-ratio", "long-total", "net-total"}:
+        aggregate = portfolio.aggregate_exposures.copy(deep=True)
+        column = {
+            "gross-ratio": "gross_exposure_ratio",
+            "long-total": "total_long_exposure",
+            "net-total": "total_net_exposure",
+        }[corruption]
+        aggregate.iat[1, aggregate.columns.get_loc(column)] += 1.0
+        changed = replace(portfolio, aggregate_exposures=aggregate)
+    elif corruption == "pair-weight":
+        weights = portfolio.pair_current_equity_weights.copy(deep=True)
+        weights.iat[1, 0] += 0.01
+        changed = replace(portfolio, pair_current_equity_weights=weights)
+    elif corruption == "symbol-gross":
+        symbols = portfolio.symbol_exposures.copy(deep=True)
+        symbols.loc[1, ("AAA", "unnetted_sleeve_gross_market_value")] += 1.0
+        changed = replace(portfolio, symbol_exposures=symbols)
+    elif corruption in {"portfolio-pnl", "portfolio-equity", "portfolio-return"}:
+        field_name = {
+            "portfolio-pnl": "portfolio_pnl",
+            "portfolio-equity": "portfolio_equity",
+            "portfolio-return": "portfolio_returns",
+        }[corruption]
+        values = getattr(portfolio, field_name).copy(deep=True)
+        values.iloc[1] += 1.0
+        changed = replace(portfolio, **{field_name: values})
+    elif corruption == "terminal":
+        schedule = portfolio.portfolio_schedule.copy(deep=True)
+        schedule.loc[schedule.index[-1], "portfolio_catastrophic"] = True
+        changed = replace(portfolio, portfolio_schedule=schedule)
+    else:
+        insolvency = portfolio.pair_insolvency_state.copy(deep=True)
+        insolvency.iloc[-1, 0] = True
+        changed = replace(portfolio, pair_insolvency_state=insolvency)
+
+    with pytest.raises(ValueError):
+        run_portfolio_risk_controls(
+            changed,
+            PortfolioRiskLimits(max_gross_exposure_ratio=2.0),
+        )
+
+
+def test_zero_weight_missing_exposure_keeps_symbol_risk_evaluable() -> None:
+    missing = _pair_input(
+        "AAA|BBB",
+        [0.0],
+        market_value_y=[np.nan],
+        market_value_x=[np.nan],
+    )
+    active = _pair_input(
+        "CCC|DDD",
+        [0.0],
+        market_value_y=[50.0],
+        market_value_x=[-50.0],
+    )
+    portfolio = run_multi_pair_portfolio(
+        {missing.pair_id: missing, active.pair_id: active},
+        1_000.0,
+        allocation_method="FIXED_WEIGHT",
+        fixed_weights={missing.pair_id: 0.0, active.pair_id: 1.0},
+    )
+    result = run_portfolio_risk_controls(
+        portfolio,
+        PortfolioRiskLimits(max_symbol_gross_exposure_ratio=1.0),
+    )
+    assert _status(result, "symbol_concentration", 0) is RiskControlStatus.WITHIN_LIMIT
+
+
+def test_9a_and_9b_share_gross_leverage_numerical_tolerance() -> None:
+    source = _pair_input(
+        "AAA|BBB",
+        [0.0, 0.0],
+        market_value_y=[0.0, 600.0],
+        market_value_x=[0.0, -400.0],
+    )
+    exact = run_multi_pair_portfolio(
+        {source.pair_id: source},
+        1_000.0,
+        max_total_gross_exposure_ratio=1.0,
+    )
+    exact_risk = run_portfolio_risk_controls(
+        exact,
+        PortfolioRiskLimits(max_gross_exposure_ratio=1.0),
+    )
+    assert _status(exact_risk, "gross_exposure", 1) is RiskControlStatus.WITHIN_LIMIT
+
+    within_limit = 1.0 - 5e-13
+    within = run_multi_pair_portfolio(
+        {source.pair_id: source},
+        1_000.0,
+        max_total_gross_exposure_ratio=within_limit,
+    )
+    within_risk = run_portfolio_risk_controls(
+        within,
+        PortfolioRiskLimits(max_gross_exposure_ratio=within_limit),
+    )
+    assert _status(within_risk, "gross_exposure", 1) is RiskControlStatus.WITHIN_LIMIT
+
+    breached_limit = 1.0 - 2e-12
+    with pytest.raises(ValueError, match="exceeds max_total_gross"):
+        run_multi_pair_portfolio(
+            {source.pair_id: source},
+            1_000.0,
+            max_total_gross_exposure_ratio=breached_limit,
+        )
+    baseline = run_multi_pair_portfolio({source.pair_id: source}, 1_000.0)
+    breached = run_portfolio_risk_controls(
+        baseline,
+        PortfolioRiskLimits(max_gross_exposure_ratio=breached_limit),
+    )
+    assert _status(breached, "gross_exposure", 1) is RiskControlStatus.BREACH
+
+
+@pytest.mark.parametrize(
+    "record_corruption",
+    ("missing", "extra", "duplicate", "wrong-row", "wrong-control"),
+)
+def test_summary_rejects_breach_record_contradictions(
+    record_corruption: str,
+) -> None:
+    result = run_portfolio_risk_controls(
+        _portfolio(),
+        PortfolioRiskLimits(
+            max_gross_exposure_ratio=1.0,
+            max_pair_equity_weight=0.54,
+        ),
+    )
+    records = list(result.breach_records)
+    assert records
+    if record_corruption == "missing":
+        records = records[:-1]
+    elif record_corruption == "extra":
+        records.append(records[0])
+    elif record_corruption == "duplicate":
+        records[-1] = records[0]
+    elif record_corruption == "wrong-row":
+        records[0] = replace(records[0], row_position=0)
+    else:
+        records[0] = replace(records[0], control_name="drawdown")
+
+    with pytest.raises(ValueError, match="breach|Breach"):
+        summarize_portfolio_risk(
+            result.observed_metrics,
+            result.control_statuses,
+            tuple(records),
+            result.requested_actions,
+            result.summary.configured_controls,
+        )
+
+
+def test_schedule_rejects_observation_status_and_count_mismatch() -> None:
+    result = run_portfolio_risk_controls(
+        _portfolio(),
+        PortfolioRiskLimits(max_gross_exposure_ratio=1.0),
+    )
+    observations = list(result.observations)
+    observations[0] = replace(
+        observations[0],
+        overall_status=RiskControlStatus.BREACH,
+        breach_control_count=observations[0].breach_control_count + 1,
+    )
+    with pytest.raises(ValueError, match="status/count"):
+        build_portfolio_risk_schedule(
+            result.observed_metrics,
+            result.control_statuses,
+            tuple(observations),
+            result.policy_state,
+            result.requested_actions,
+            result.risk_schedule["risk_action_intent"],
+            result.risk_schedule["action_effective_position"],
+            result.risk_schedule["action_effective_label"],
+        )
+
+
+def test_summary_rejects_configured_control_mismatch() -> None:
+    result = run_portfolio_risk_controls(
+        _portfolio(),
+        PortfolioRiskLimits(max_gross_exposure_ratio=1.0),
+    )
+    with pytest.raises(ValueError, match="configured_controls"):
+        summarize_portfolio_risk(
+            result.observed_metrics,
+            result.control_statuses,
+            result.breach_records,
+            result.requested_actions,
+            (),
+        )
+
+
+def test_risk_composers_reject_requested_action_timing_mismatch() -> None:
+    result = run_portfolio_risk_controls(
+        _portfolio(),
+        PortfolioRiskLimits(
+            max_pair_equity_weight=0.54,
+            breach_action=RiskAction.HALT_NEW_ENTRIES,
+        ),
+    )
+    requested = result.requested_actions.copy(deep=True)
+    effective_rows = np.flatnonzero(
+        requested.map(lambda value: value is not RiskAction.NONE).to_numpy()
+    )
+    assert len(effective_rows)
+    requested.iloc[int(effective_rows[0])] = RiskAction.NONE
+    with pytest.raises(ValueError, match="Requested action"):
+        build_portfolio_risk_schedule(
+            result.observed_metrics,
+            result.control_statuses,
+            result.observations,
+            result.policy_state,
+            requested,
+            result.risk_schedule["risk_action_intent"],
+            result.risk_schedule["action_effective_position"],
+            result.risk_schedule["action_effective_label"],
+        )
+    with pytest.raises(ValueError, match="action"):
+        summarize_portfolio_risk(
+            result.observed_metrics,
+            result.control_statuses,
+            result.breach_records,
+            requested,
+            result.summary.configured_controls,
+        )
 
 
 def test_direct_evaluation_and_policy_functions_preserve_contracts() -> None:

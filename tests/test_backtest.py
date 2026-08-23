@@ -4300,6 +4300,56 @@ def test_invariant_validator_rejects_corrupted_accounting_identity(
 
 
 @pytest.mark.parametrize(
+    "column",
+    (
+        "cumulative_net_pnl_after_carry",
+        "net_equity_after_carry",
+        "net_return_after_carry",
+    ),
+)
+def test_validator_rejects_corrupted_post_carry_wealth_chain(column: str) -> None:
+    _, result = _integrated_case()
+    corrupted = result.accounting.copy(deep=True)
+    corrupted.iat[3, corrupted.columns.get_loc(column)] += 1.0
+
+    with pytest.raises(ValueError, match="invariant failed"):
+        validate_backtest_invariants(replace(result, accounting=corrupted))
+
+
+def test_validator_enforces_first_and_later_return_denominators() -> None:
+    _, result = _integrated_case()
+    accounting = result.accounting
+    initial_capital = float(
+        accounting["net_equity_after_carry"].iat[0]
+        - accounting["cumulative_net_pnl_after_carry"].iat[0]
+    )
+    assert accounting["net_return_after_carry"].iat[0] == pytest.approx(
+        accounting["net_pnl_after_carry"].iat[0] / initial_capital
+    )
+    for row_position in range(1, len(accounting)):
+        if pd.isna(accounting["net_return_after_carry"].iat[row_position]):
+            continue
+        assert accounting["net_return_after_carry"].iat[row_position] == pytest.approx(
+            accounting["net_pnl_after_carry"].iat[row_position]
+            / accounting["net_equity_after_carry"].iat[row_position - 1]
+        )
+    validate_backtest_invariants(result)
+
+
+def test_validator_enforces_post_carry_unknown_wealth_masks() -> None:
+    _, result = _integrated_case(missing_price_row=3)
+    validate_backtest_invariants(result)
+    corrupted = result.accounting.copy(deep=True)
+    corrupted.loc[
+        corrupted.index[-1],
+        "net_return_after_carry",
+    ] = 0.0
+
+    with pytest.raises(ValueError, match="inconsistent NaNs"):
+        validate_backtest_invariants(replace(result, accounting=corrupted))
+
+
+@pytest.mark.parametrize(
     "corruption",
     ["decreasing_cost", "negative_exposure", "flat_units", "ledger_net"],
 )

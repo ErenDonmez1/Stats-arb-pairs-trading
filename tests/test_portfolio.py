@@ -22,10 +22,14 @@ from pairs_trading.portfolio import (
     SourceCapitalProvenance,
     SourceReturnPathPolicy,
     allocate_pair_capital,
+    build_portfolio_schedule,
+    calculate_portfolio_exposure_metrics,
     calculate_portfolio_returns,
     normalize_pair_weights,
     run_multi_pair_portfolio,
+    validate_pair_allocations,
     validate_pair_results,
+    validate_portfolio_result_invariants,
 )
 from pairs_trading.walkforward import (
     WalkForwardAnalyticsStatus,
@@ -865,7 +869,7 @@ def test_backtest_source_capital_is_inferred_verified_and_mismatch_rejected() ->
     inconsistent_accounting = backtest.accounting.copy(deep=True)
     inconsistent_accounting.loc[inconsistent_accounting.index[2], "net_equity_after_carry"] += 1.0
     inconsistent = replace(backtest, accounting=inconsistent_accounting)
-    with pytest.raises(ValueError, match="inconsistent across accounting rows"):
+    with pytest.raises(ValueError, match="constant initial capital"):
         run_multi_pair_portfolio({"AAA|BBB": inconsistent}, 5_000.0)
 
 
@@ -1136,6 +1140,239 @@ def test_new_result_pandas_outputs_are_defensively_owned() -> None:
     pair.calendar_returns.iloc[:] = 99.0
     for name, snapshot in snapshots.items():
         pd.testing.assert_frame_equal(getattr(result, name), snapshot)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    (
+        ("weight", -0.1),
+        ("weight", np.inf),
+        ("weight", True),
+        ("allocated_capital", -1.0),
+        ("allocated_capital", np.inf),
+    ),
+)
+def test_direct_allocation_rejects_invalid_numeric_fields(
+    field_name: str,
+    invalid_value: Any,
+) -> None:
+    source = _pair_input(returns=[0.10])
+    allocation = allocate_pair_capital([source], 1_000.0)[0]
+    malformed = replace(allocation, **{field_name: invalid_value})
+
+    with pytest.raises((TypeError, ValueError)):
+        calculate_portfolio_returns(
+            [source],
+            [malformed],
+            portfolio_initial_capital=1_000.0,
+        )
+
+
+def test_direct_allocation_cannot_create_capital() -> None:
+    source = _pair_input(returns=[0.10])
+    allocation = allocate_pair_capital([source], 1_000.0)[0]
+    malformed = replace(allocation, allocated_capital=2_000.0)
+
+    with pytest.raises(ValueError, match="allocated_capital"):
+        calculate_portfolio_returns(
+            [source],
+            [malformed],
+            portfolio_initial_capital=1_000.0,
+        )
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    (
+        "scale",
+        "symbols",
+        "source-capital",
+    ),
+)
+def test_direct_allocation_rejects_source_and_scaling_mismatch(
+    malformed: str,
+) -> None:
+    source = _pair_input(returns=[0.0])
+    allocation = allocate_pair_capital([source], 1_000.0)[0]
+    if malformed == "scale":
+        changed = replace(allocation, exposure_scaling_factor=2.0)
+    elif malformed == "symbols":
+        changed = replace(allocation, symbol_y="ZZZ")
+    else:
+        changed = replace(allocation, source_capital_basis=2_000.0)
+
+    with pytest.raises(ValueError):
+        validate_pair_allocations([source], [changed], 1_000.0)
+
+
+def test_allocator_generated_objects_pass_every_public_allocation_consumer() -> None:
+    sources = validate_pair_results(_two_pairs())
+    allocations = allocate_pair_capital(sources, 10_000.0)
+    validate_pair_allocations(sources, allocations, 10_000.0)
+    full = run_multi_pair_portfolio(_two_pairs(), 10_000.0)
+    _, returns, cash, unavailable = calculate_portfolio_returns(
+        sources,
+        allocations,
+        portfolio_initial_capital=10_000.0,
+    )
+    _, aggregate, _, _, execution = calculate_portfolio_exposure_metrics(
+        sources,
+        allocations,
+        full.portfolio_equity,
+    )
+    schedule = build_portfolio_schedule(
+        returns,
+        full.portfolio_equity,
+        cash,
+        sources,
+        allocations,
+        aggregate,
+        unavailable,
+        portfolio_pnl=full.portfolio_pnl,
+        portfolio_catastrophic_state=full.portfolio_schedule[
+            "portfolio_catastrophic"
+        ],
+        execution_rows=execution,
+    )
+    assert schedule.index.equals(full.portfolio_schedule.index)
+    validate_portfolio_result_invariants(full)
+
+
+@pytest.mark.parametrize(
+    "pair_items",
+    (
+        ("AAA|BBB", "BBB|AAA"),
+        ("AAA|BBB", "AAA|BBB"),
+    ),
+)
+def test_duplicate_underlying_pair_or_exact_pair_is_rejected(
+    pair_items: tuple[str, str],
+) -> None:
+    first = _pair_input(pair_items[0], returns=[0.0])
+    second = _pair_input(pair_items[1], returns=[0.0])
+    with pytest.raises(ValueError, match="Duplicate"):
+        validate_pair_results([(pair_items[0], first), (pair_items[1], second)])
+
+
+def test_distinct_shared_symbol_pairs_are_allowed_and_orientation_is_preserved() -> None:
+    first = _pair_input("AAA|BBB", returns=[0.0])
+    second = _pair_input("AAA|CCC", returns=[0.0])
+    sources = validate_pair_results(
+        {first.pair_id: first, second.pair_id: second}
+    )
+    assert tuple(item.pair_id for item in sources) == ("AAA|BBB", "AAA|CCC")
+    assert (sources[0].symbol_y, sources[0].symbol_x) == ("AAA", "BBB")
+
+
+def test_direct_input_cannot_self_assert_trusted_provenance() -> None:
+    direct = replace(
+        _pair_input(returns=[0.0], point_in_time_validated=True),
+        source_capital_provenance=SourceCapitalProvenance.INFERRED_AND_VERIFIED.value,
+        source_return_path_policy=SourceReturnPathPolicy.CONTINUOUS_BACKTEST.value,
+    )
+    result = run_multi_pair_portfolio({direct.pair_id: direct}, 1_000.0)
+
+    assert not result.all_pair_universes_point_in_time_validated
+    assert result.source_path_provenance == (
+        (
+            direct.pair_id,
+            SourceCapitalProvenance.CALLER_SUPPLIED_UNVERIFIED.value,
+            SourceReturnPathPolicy.CALLER_SUPPLIED.value,
+        ),
+    )
+    assert "caller_supplied" in result.self_financing_interpretation
+    assert any("caller supplied and unverified" in item for item in result.provenance_warnings)
+
+
+def test_mutated_backtest_wealth_chain_is_rejected_before_trusted_provenance() -> None:
+    backtest = _real_backtest(
+        [100.0, 101.0, 103.0, 102.0, 101.0],
+        [100.0] * 5,
+        [-1.5, -1.2, -0.8, 0.0, 0.0],
+        initial_capital=10_000.0,
+        target_notional=2_000.0,
+    )
+    for column in (
+        "net_return_after_carry",
+        "net_equity_after_carry",
+        "cumulative_net_pnl_after_carry",
+    ):
+        accounting = backtest.accounting.copy(deep=True)
+        accounting.iat[2, accounting.columns.get_loc(column)] += 1.0
+        with pytest.raises(ValueError, match="Backtest invariant failed"):
+            run_multi_pair_portfolio(
+                {"AAA|BBB": replace(backtest, accounting=accounting)},
+                5_000.0,
+            )
+
+    valid = run_multi_pair_portfolio({"AAA|BBB": backtest}, 5_000.0)
+    assert valid.source_path_provenance[0][1:] == (
+        SourceCapitalProvenance.INFERRED_AND_VERIFIED.value,
+        SourceReturnPathPolicy.CONTINUOUS_BACKTEST.value,
+    )
+
+
+def test_zero_weight_missing_exposure_contributes_zero_to_every_symbol() -> None:
+    missing = _pair_input(
+        "AAA|BBB",
+        returns=[0.0],
+        market_value_y=[np.nan],
+        market_value_x=[np.nan],
+    )
+    active = _pair_input(
+        "CCC|DDD",
+        returns=[0.0],
+        market_value_y=[50.0],
+        market_value_x=[-50.0],
+    )
+    result = run_multi_pair_portfolio(
+        {missing.pair_id: missing, active.pair_id: active},
+        1_000.0,
+        allocation_method=AllocationMethod.FIXED_WEIGHT,
+        fixed_weights={missing.pair_id: 0.0, active.pair_id: 1.0},
+    )
+    gross = result.symbol_exposures.xs(
+        "unnetted_sleeve_gross_market_value",
+        level="metric",
+        axis=1,
+    )
+    assert gross.loc[0, ["AAA", "BBB"]].eq(0.0).all()
+    assert bool(result.aggregate_exposures.loc[0, "exposure_available"])
+
+
+def test_exact_floating_underflow_latches_sleeve_insolvency_without_resurrection() -> None:
+    source = _pair_input(
+        "AAA|BBB",
+        returns=[-0.9999999999999999] * 25,
+    )
+    result = run_multi_pair_portfolio({source.pair_id: source}, 1_000.0)
+    zero_rows = np.flatnonzero(
+        result.pair_sleeve_equity[source.pair_id].to_numpy() == 0.0
+    )
+    assert len(zero_rows)
+    first_zero = int(zero_rows[0])
+    assert result.pair_insolvency_state[source.pair_id].iloc[first_zero:].all()
+    assert result.pair_sleeve_equity[source.pair_id].iloc[first_zero:].eq(0.0).all()
+
+
+@pytest.mark.parametrize("numeric_active", (0, 1))
+def test_direct_numeric_active_state_is_rejected(numeric_active: int) -> None:
+    source = _pair_input(returns=[0.0])
+    with pytest.raises(TypeError, match="actual Boolean"):
+        replace(
+            source,
+            active_state=pd.Series(
+                [numeric_active],
+                index=source.calendar_returns.index,
+                dtype="int64",
+            ),
+        )
+
+
+def test_actual_boolean_active_state_remains_accepted() -> None:
+    source = _pair_input(returns=[0.0], active=[True])
+    validated = validate_pair_results({source.pair_id: source})
+    assert validated[0].active_state.iloc[0] == np.bool_(True)
 
 
 def test_no_optimizer_or_strategy_promotion_api_exists() -> None:

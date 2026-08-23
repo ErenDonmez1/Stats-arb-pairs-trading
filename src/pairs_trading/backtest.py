@@ -3707,6 +3707,8 @@ def _assert_accounting_identity(
     """Raise when an accounting identity differs, including its NaN mask."""
     actual_values = actual.to_numpy(dtype=float)
     expected_values = expected.to_numpy(dtype=float)
+    if np.isinf(actual_values).any() or np.isinf(expected_values).any():
+        raise ValueError(f"Backtest invariant failed: {name} contains infinity.")
     if not np.array_equal(np.isnan(actual_values), np.isnan(expected_values)):
         raise ValueError(f"Backtest invariant failed: {name} has inconsistent NaNs.")
     known = np.isfinite(actual_values) & np.isfinite(expected_values)
@@ -3800,6 +3802,9 @@ def validate_backtest_invariants(
         "carry_cost",
         "cumulative_carry_cost",
         "net_pnl_after_carry",
+        "cumulative_net_pnl_after_carry",
+        "net_equity_after_carry",
+        "net_return_after_carry",
         "gross_exposure",
         "long_exposure",
         "short_exposure",
@@ -3858,6 +3863,78 @@ def validate_backtest_invariants(
             - accounting["carry_cost"]
         ),
         "net_pnl_after_carry = gross_pnl - transaction_cost - carry_cost",
+        rtol=relative_tolerance,
+        atol=absolute_tolerance,
+    )
+    expected_cumulative_net_pnl = pd.Series(
+        _causal_cumulative(
+            accounting["net_pnl_after_carry"].to_numpy(dtype=float),
+            "Backtest invariant cumulative net P&L after carry",
+        ),
+        index=accounting.index,
+    )
+    _assert_accounting_identity(
+        accounting["cumulative_net_pnl_after_carry"],
+        expected_cumulative_net_pnl,
+        (
+            "cumulative_net_pnl_after_carry = causal cumulative sum of "
+            "net_pnl_after_carry"
+        ),
+        rtol=relative_tolerance,
+        atol=absolute_tolerance,
+    )
+
+    equity = accounting["net_equity_after_carry"]
+    cumulative = accounting["cumulative_net_pnl_after_carry"]
+    equity_values = equity.to_numpy(dtype=float)
+    cumulative_values = cumulative.to_numpy(dtype=float)
+    if not np.array_equal(np.isnan(equity_values), np.isnan(cumulative_values)):
+        raise ValueError(
+            "Backtest invariant failed: net equity and cumulative net P&L "
+            "after carry have inconsistent NaNs."
+        )
+    known_wealth = np.isfinite(equity_values) & np.isfinite(cumulative_values)
+    if not bool(known_wealth.any()):
+        raise ValueError(
+            "Backtest invariant failed: source initial capital cannot be inferred "
+            "because post-carry wealth is never available."
+        )
+    inferred_capital = equity_values[known_wealth] - cumulative_values[known_wealth]
+    initial_capital = float(inferred_capital[0])
+    if not np.isfinite(initial_capital) or initial_capital <= 0.0:
+        raise ValueError(
+            "Backtest invariant failed: inferred initial capital must be finite "
+            "and positive."
+        )
+    if not np.allclose(
+        inferred_capital,
+        initial_capital,
+        rtol=relative_tolerance,
+        atol=absolute_tolerance * max(1.0, abs(initial_capital)),
+    ):
+        raise ValueError(
+            "Backtest invariant failed: net_equity_after_carry - "
+            "cumulative_net_pnl_after_carry is not a constant initial capital."
+        )
+    (
+        _expected_cumulative,
+        expected_equity_values,
+        expected_return_values,
+    ) = _equity_and_returns_after_carry(
+        accounting["net_pnl_after_carry"].to_numpy(dtype=float),
+        initial_capital,
+    )
+    _assert_accounting_identity(
+        equity,
+        pd.Series(expected_equity_values, index=accounting.index),
+        "net_equity_after_carry = initial capital + cumulative net P&L",
+        rtol=relative_tolerance,
+        atol=absolute_tolerance,
+    )
+    _assert_accounting_identity(
+        accounting["net_return_after_carry"],
+        pd.Series(expected_return_values, index=accounting.index),
+        "net_return_after_carry uses initial then prior net equity",
         rtol=relative_tolerance,
         atol=absolute_tolerance,
     )

@@ -78,6 +78,31 @@ Interactive OpenAPI documentation is available at `/docs`. The API persists
 summary metrics and provenance, but not equity curves, drawdown series, trade
 ledgers, bootstrap replicates, or other detailed time-series artifacts.
 
+## React dashboard
+
+The `frontend/` application is a responsive React and TypeScript dashboard for
+the read-only research API. It presents experiment identity, screening,
+in-sample diagnostics, calendar walk-forward OOS metrics, validation status,
+and provenance without fabricating unavailable time-series data.
+
+Start the backend from the repository root:
+
+```bash
+uvicorn pairs_trading.api:app --reload
+```
+
+Then start the frontend:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+The local dashboard is available at `http://localhost:5173`. It calls
+`http://localhost:8000` by default; set `VITE_API_BASE_URL` in a frontend `.env`
+file to use another API origin. See `frontend/.env.example`.
+
 ## Development setup
 
 Python 3.10 or newer is required.

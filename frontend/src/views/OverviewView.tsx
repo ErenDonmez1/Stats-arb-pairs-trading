@@ -30,6 +30,7 @@ interface OverviewViewProps {
   metadata: MetaResponse | null
   experimentCount: number | null
   experimentsUnavailable: boolean
+  demoMode: boolean
 }
 
 export function OverviewView({
@@ -37,7 +38,10 @@ export function OverviewView({
   metadata,
   experimentCount,
   experimentsUnavailable,
+  demoMode,
 }: OverviewViewProps) {
+  const presentationState = demoMode ? 'online' : backendState
+
   return (
     <div className="content-wrap">
       <section className="hero-panel" aria-labelledby="overview-title">
@@ -45,8 +49,8 @@ export function OverviewView({
           <p className="section-eyebrow">Research platform / Overview</p>
           <h1 id="overview-title">Stat-Arb Research Platform</h1>
           <p>
-            Research infrastructure for causal pairs-trading experiments,
-            walk-forward validation, robustness analysis and portfolio risk.
+            Causal pairs-trading research, validation and portfolio-risk
+            infrastructure.
           </p>
         </div>
         <div className="hero-index" aria-label="Platform classification">
@@ -58,21 +62,29 @@ export function OverviewView({
 
       <section className="metric-strip" aria-label="Platform metadata">
         <article className="metric-card">
-          <p>Backend status</p>
+          <p>{demoMode ? 'Data mode' : 'Backend status'}</p>
           <strong className="metric-status">
-            <span className={`status-dot status-${backendState}`} aria-hidden="true" />
-            {backendState === 'online'
-              ? 'Operational'
-              : backendState === 'checking'
-                ? 'Checking'
-                : 'Unavailable'}
+            <span className={`status-dot status-${presentationState}`} aria-hidden="true" />
+            {demoMode
+              ? 'Synthetic demo'
+              : backendState === 'online'
+                ? 'Operational'
+                : backendState === 'checking'
+                  ? 'Checking'
+                  : 'Unavailable'}
           </strong>
-          <span>FastAPI read layer</span>
+          <span>{demoMode ? 'Deterministic local fixtures' : 'FastAPI read layer'}</span>
         </article>
         <article className="metric-card">
-          <p>Persisted experiments</p>
+          <p>{demoMode ? 'Demo experiments' : 'Persisted experiments'}</p>
           <strong>{experimentsUnavailable ? '—' : experimentCount ?? '—'}</strong>
-          <span>{experimentsUnavailable ? 'Registry unavailable' : 'Canonical summaries'}</span>
+          <span>
+            {experimentsUnavailable
+              ? 'Registry unavailable'
+              : demoMode
+                ? 'Synthetic UI examples'
+                : 'Canonical summaries'}
+          </span>
         </article>
         <article className="metric-card">
           <p>Experiment schema</p>

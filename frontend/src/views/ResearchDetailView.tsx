@@ -28,6 +28,7 @@ interface ResearchDetailViewProps {
   error: string | null
   onChooseExperiment: () => void
   onRetry: () => void
+  demoMode: boolean
 }
 
 function StageCard({
@@ -67,6 +68,7 @@ export function ResearchDetailView({
   error,
   onChooseExperiment,
   onRetry,
+  demoMode,
 }: ResearchDetailViewProps) {
   if (state === 'idle') {
     return (
@@ -130,10 +132,13 @@ export function ResearchDetailView({
 
       <header className="detail-identity">
         <div>
-          <p className="section-eyebrow">Research detail / Persisted experiment</p>
+          <p className="section-eyebrow">
+            Research detail / {demoMode ? 'Synthetic demo experiment' : 'Persisted experiment'}
+          </p>
           <div className="detail-title-line">
             <h1>{experiment.experiment_name}</h1>
             <StatusBadge status={experiment.pipeline_status} />
+            {demoMode && <span className="demo-chip">Synthetic demo</span>}
           </div>
           <p className="detail-run-id">{experiment.run_id}</p>
         </div>

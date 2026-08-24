@@ -12,7 +12,9 @@ import {
   getExperiments,
   getHealth,
   getMeta,
+  IS_DEMO_MODE,
 } from './api/client'
+import { DEMO_NOTICE } from './data/demo'
 import type {
   ExperimentPage,
   ExperimentSummary,
@@ -123,11 +125,14 @@ function App() {
   }, [])
 
   const backendLabel =
-    backendState === 'online'
-      ? 'API Online'
-      : backendState === 'checking'
-        ? 'Connecting'
-        : 'API Unavailable'
+    IS_DEMO_MODE
+      ? 'Synthetic demo'
+      : backendState === 'online'
+        ? 'API Online'
+        : backendState === 'checking'
+          ? 'Connecting'
+          : 'API Unavailable'
+  const presentationState = IS_DEMO_MODE ? 'online' : backendState
 
   const viewLabel = navigation.find((item) => item.id === view)?.shortLabel ?? 'Overview'
 
@@ -139,8 +144,8 @@ function App() {
             <Radio size={19} strokeWidth={1.8} />
           </div>
           <div>
-            <p className="brand-name">Pairs Research</p>
-            <p className="brand-caption">Quantitative systems</p>
+            <p className="brand-name">Stat-Arb Research</p>
+            <p className="brand-caption">Causal research systems</p>
           </div>
         </div>
 
@@ -163,10 +168,10 @@ function App() {
         </nav>
 
         <div className="sidebar-foot">
-          <div className={`status-dot status-${backendState}`} aria-hidden="true" />
+          <div className={`status-dot status-${presentationState}`} aria-hidden="true" />
           <div>
             <p>{backendLabel}</p>
-            <span>Read-only research access</span>
+            <span>{IS_DEMO_MODE ? 'Local synthetic fixtures' : 'Read-only research access'}</span>
           </div>
         </div>
       </aside>
@@ -175,16 +180,24 @@ function App() {
         <header className="topbar">
           <div>
             <p className="topbar-kicker">Research environment / {viewLabel}</p>
-            <p className="topbar-title">Statistical Arbitrage</p>
+            <p className="topbar-title">Stat-Arb Research Platform</p>
           </div>
           <div className="topbar-meta">
             <span>Pipeline {metadata?.research_pipeline_version ?? '—'}</span>
-            <span className={`health-pill health-${backendState}`}>
+            <span className={`health-pill health-${presentationState}`}>
               <span aria-hidden="true" />
               {backendLabel}
             </span>
           </div>
         </header>
+
+        {IS_DEMO_MODE && (
+          <div className="demo-banner" role="status">
+            <FlaskConical size={15} aria-hidden="true" />
+            <strong>Synthetic demo</strong>
+            <span>{DEMO_NOTICE}</span>
+          </div>
+        )}
 
         {view === 'overview' && (
           <OverviewView
@@ -192,6 +205,7 @@ function App() {
             metadata={metadata}
             experimentCount={experimentPage?.total ?? null}
             experimentsUnavailable={listState === 'error'}
+            demoMode={IS_DEMO_MODE}
           />
         )}
         {view === 'experiments' && (
@@ -202,6 +216,7 @@ function App() {
             onRetry={() => void loadExperiments(experimentPage?.offset ?? 0)}
             onPage={(offset) => void loadExperiments(offset)}
             onSelect={(runId) => void loadDetail(runId)}
+            demoMode={IS_DEMO_MODE}
           />
         )}
         {view === 'detail' && (
@@ -211,6 +226,7 @@ function App() {
             error={detailError}
             onChooseExperiment={() => setView('experiments')}
             onRetry={() => selectedRunId && void loadDetail(selectedRunId)}
+            demoMode={IS_DEMO_MODE}
           />
         )}
         {view === 'methodology' && <MethodologyView />}

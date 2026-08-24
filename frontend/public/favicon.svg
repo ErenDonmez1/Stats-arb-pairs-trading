@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Stat-Arb Research Platform">
+  <rect width="64" height="64" rx="13" fill="#090e13"/>
+  <path d="M12 42h10l7-22 8 27 6-18h9" fill="none" stroke="#d7aa51" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="12" cy="42" r="3" fill="#f1f4f6"/>
+  <circle cx="52" cy="29" r="3" fill="#f1f4f6"/>
+</svg>

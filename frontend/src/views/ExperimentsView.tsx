@@ -12,6 +12,7 @@ interface ExperimentsViewProps {
   onRetry: () => void
   onPage: (offset: number) => void
   onSelect: (runId: string) => void
+  demoMode: boolean
 }
 
 export function ExperimentsView({
@@ -21,6 +22,7 @@ export function ExperimentsView({
   onRetry,
   onPage,
   onSelect,
+  demoMode,
 }: ExperimentsViewProps) {
   const limit = page?.limit ?? 10
   const offset = page?.offset ?? 0
@@ -32,8 +34,12 @@ export function ExperimentsView({
       <header className="page-heading">
         <div>
           <p className="section-eyebrow">Experiment registry</p>
-          <h1>Persisted research</h1>
-          <p>Canonical summaries ordered newest first by the research database.</p>
+          <h1>{demoMode ? 'Synthetic research examples' : 'Persisted research'}</h1>
+          <p>
+            {demoMode
+              ? 'Fixed local fixtures that exercise the real experiment-summary interface.'
+              : 'Canonical summaries ordered newest first by the research database.'}
+          </p>
         </div>
         <button className="secondary-button" type="button" onClick={onRetry}>
           <RefreshCw size={15} aria-hidden="true" />
@@ -65,8 +71,9 @@ export function ExperimentsView({
           <DatabaseZap size={27} aria-hidden="true" />
           <h2>No persisted experiments</h2>
           <p>
-            Run the research pipeline from Python and persist its canonical summary;
-            this dashboard never fabricates example performance.
+            {demoMode
+              ? 'No synthetic demo fixtures are available in this build.'
+              : 'Run the research pipeline from Python and persist its canonical summary; unavailable evidence is never fabricated.'}
           </p>
         </section>
       )}
@@ -97,7 +104,10 @@ export function ExperimentsView({
                           type="button"
                           onClick={() => onSelect(experiment.run_id)}
                         >
-                          <strong>{experiment.experiment_name}</strong>
+                          <strong>
+                            {experiment.experiment_name}
+                            {demoMode && <small>Synthetic demo</small>}
+                          </strong>
                           <span>{experiment.run_id}</span>
                         </button>
                       </td>

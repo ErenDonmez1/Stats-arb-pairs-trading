@@ -4,9 +4,16 @@ import type {
   HealthResponse,
   MetaResponse,
 } from '../types/api'
+import {
+  DEMO_HEALTH,
+  DEMO_META,
+  getDemoExperiment,
+  getDemoExperimentPage,
+} from '../data/demo'
 
 const configuredBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim()
 export const API_BASE_URL = (configuredBaseUrl || 'http://localhost:8000').replace(/\/$/, '')
+export const IS_DEMO_MODE = import.meta.env.VITE_DEMO_MODE?.trim().toLowerCase() === 'true'
 
 export class ApiError extends Error {
   readonly status: number | null
@@ -44,10 +51,12 @@ async function requestJson<T>(path: string): Promise<T> {
 }
 
 export function getHealth(): Promise<HealthResponse> {
+  if (IS_DEMO_MODE) return Promise.resolve(structuredClone(DEMO_HEALTH))
   return requestJson<HealthResponse>('/health')
 }
 
 export function getMeta(): Promise<MetaResponse> {
+  if (IS_DEMO_MODE) return Promise.resolve(structuredClone(DEMO_META))
   return requestJson<MetaResponse>('/api/v1/meta')
 }
 
@@ -58,6 +67,8 @@ export function getExperiments({
   limit: number
   offset: number
 }): Promise<ExperimentPage> {
+  if (IS_DEMO_MODE) return Promise.resolve(getDemoExperimentPage(limit, offset))
+
   const query = new URLSearchParams({
     limit: String(limit),
     offset: String(offset),
@@ -66,6 +77,13 @@ export function getExperiments({
 }
 
 export function getExperiment(runId: string): Promise<ExperimentSummary> {
+  if (IS_DEMO_MODE) {
+    const experiment = getDemoExperiment(runId)
+    return experiment
+      ? Promise.resolve(experiment)
+      : Promise.reject(new ApiError('Synthetic demo experiment was not found.', 404))
+  }
+
   return requestJson<ExperimentSummary>(
     `/api/v1/experiments/${encodeURIComponent(runId)}`,
   )

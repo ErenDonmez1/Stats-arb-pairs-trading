@@ -214,6 +214,33 @@ button:focus-visible {
   background: var(--negative);
 }
 
+.demo-banner {
+  min-height: 42px;
+  padding: 8px 32px;
+  border-bottom: 1px solid var(--accent-border);
+  color: #e5ca96;
+  background: rgba(215, 170, 81, 0.075);
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 0.7rem;
+  line-height: 1.45;
+}
+
+.demo-banner svg {
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
+.demo-banner strong {
+  color: #f1dfba;
+  white-space: nowrap;
+}
+
+.demo-banner span {
+  color: var(--text-muted);
+}
+
 .content-wrap {
   width: min(100%, 1500px);
   padding: 38px 32px 54px;
@@ -622,6 +649,34 @@ tbody tr:hover {
   color: var(--text-strong);
   font-size: 0.76rem;
   font-weight: 610;
+}
+
+.experiment-link small,
+.demo-chip {
+  width: max-content;
+  min-height: 19px;
+  padding: 0 6px;
+  border: 1px solid var(--accent-border);
+  border-radius: 999px;
+  color: #e3c487;
+  background: var(--accent-muted);
+  align-items: center;
+  font-size: 0.54rem;
+  font-style: normal;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 17px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.experiment-link small {
+  margin-top: 5px;
+  display: flex;
+}
+
+.demo-chip {
+  display: inline-flex;
 }
 
 .experiment-link span {
@@ -1455,6 +1510,10 @@ tbody tr:hover {
     padding: 0 18px;
   }
 
+  .demo-banner {
+    padding-inline: 18px;
+  }
+
   .topbar-meta > span:first-child {
     display: none;
   }
@@ -1608,6 +1667,10 @@ tbody tr:hover {
   .health-pill {
     padding-inline: 8px;
     font-size: 0.6rem;
+  }
+
+  .demo-banner strong {
+    display: none;
   }
 
   .hero-copy h1,

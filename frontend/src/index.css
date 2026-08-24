@@ -1,23 +1,27 @@
 :root {
-  --canvas: #090e13;
-  --canvas-raised: #0d141b;
-  --sidebar: #080d12;
-  --panel: #10171f;
-  --panel-hover: #121b24;
-  --border: #26323d;
-  --border-subtle: #1b2731;
-  --text-strong: #f1f4f6;
-  --text: #cbd3d9;
-  --text-muted: #84919c;
-  --text-dim: #5c6873;
-  --accent: #d7aa51;
-  --accent-muted: rgba(215, 170, 81, 0.09);
-  --accent-border: rgba(215, 170, 81, 0.38);
-  --positive: #56b894;
-  --negative: #d56d6d;
-  --status-neutral: #77838d;
+  --canvas: #070c11;
+  --canvas-raised: #0a1219;
+  --sidebar: #060a0f;
+  --panel: #0d161e;
+  --panel-hover: #111e27;
+  --panel-inset: #091119;
+  --border: #263945;
+  --border-subtle: #182832;
+  --text-strong: #edf2f5;
+  --text: #c7d0d6;
+  --text-muted: #8e9ca7;
+  --text-dim: #62717c;
+  --accent: #5ebdcd;
+  --accent-muted: rgba(86, 183, 200, 0.09);
+  --accent-border: rgba(86, 183, 200, 0.36);
+  --positive: #58b896;
+  --negative: #d36d72;
+  --warning: #d1a75c;
+  --status-neutral: #74818a;
   --sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --panel-radius: 4px;
+  --panel-shadow: 0 16px 42px rgba(0, 0, 0, 0.18);
   font-family: var(--sans);
   color: var(--text);
   background: var(--canvas);
@@ -40,6 +44,7 @@ body {
   min-width: 320px;
   min-height: 100vh;
   margin: 0;
+  background: var(--canvas);
 }
 
 button,
@@ -55,5 +60,5 @@ button {
 
 ::selection {
   color: var(--text-strong);
-  background: rgba(215, 170, 81, 0.28);
+  background: rgba(86, 183, 200, 0.28);
 }

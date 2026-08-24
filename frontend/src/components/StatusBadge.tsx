@@ -3,8 +3,16 @@ import { formatLabel } from '../utils/format'
 
 function statusTone(status: string | null | undefined) {
   const normalized = status?.toUpperCase() ?? ''
-  if (normalized === 'COMPLETED' || normalized === 'AVAILABLE') return 'positive'
-  if (normalized.includes('FAIL') || normalized.includes('ERROR')) return 'negative'
+  if (
+    normalized === 'COMPLETED' ||
+    normalized === 'AVAILABLE' ||
+    normalized === 'SELECTED'
+  ) return 'positive'
+  if (
+    normalized === 'REJECTED' ||
+    normalized.includes('FAIL') ||
+    normalized.includes('ERROR')
+  ) return 'negative'
   if (
     normalized.includes('UNAVAILABLE') ||
     normalized.includes('NOT_REQUESTED') ||

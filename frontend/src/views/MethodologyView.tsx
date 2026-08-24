@@ -1,4 +1,5 @@
 import {
+  Activity,
   BarChart3,
   Database,
   GitBranch,
@@ -6,88 +7,101 @@ import {
   Scale,
   Server,
   ShieldCheck,
-  Workflow,
 } from 'lucide-react'
 
-const capabilities = [
+const researchPath = [
+  {
+    icon: Database,
+    title: 'Observed market data',
+    text: 'Request-aware ingestion, explicit cleaning and observed-versus-imputed provenance.',
+  },
   {
     icon: Network,
-    title: 'Relationship research',
-    text: 'Economic-group screening, Engle–Granger cointegration, FDR correction, half-life and Hurst diagnostics.',
+    title: 'Formation-only screening',
+    text: 'Economic groups, correlation pre-screening, Engle–Granger tests and FDR control.',
   },
   {
-    icon: Workflow,
-    title: 'Dynamic estimation',
-    text: 'Static and rolling OLS plus transparent Kalman-filter hedge estimation on validated log prices.',
-  },
-  {
-    icon: GitBranch,
-    title: 'Causal signals',
-    text: 'Prior-window z-scores, explicit state transitions, cooldowns, stops and lagged execution decisions.',
+    icon: Activity,
+    title: 'Causal signal formation',
+    text: 'Prior-window estimation, stateful thresholds and future-invariance checks.',
   },
   {
     icon: Scale,
-    title: 'Execution accounting',
-    text: 'Position sizing, marked-to-market P&L, commissions, slippage, borrow, financing and trade ledgers.',
+    title: 'Execution-aware accounting',
+    text: 'Lagged decisions, costs, financing, borrow, rebalancing and reconciled ledgers.',
+  },
+  {
+    icon: GitBranch,
+    title: 'Walk-forward separation',
+    text: 'Formation and trading windows remain explicit, including no-selection cash periods.',
   },
   {
     icon: BarChart3,
-    title: 'OOS evidence',
-    text: 'Formation-only selection, calendar walk-forward returns, robustness grids and statistical uncertainty diagnostics.',
+    title: 'Robustness diagnostics',
+    text: 'Predefined scenario grids and uncertainty estimates without automatic OOS promotion.',
   },
   {
     icon: ShieldCheck,
-    title: 'Portfolio controls',
-    text: 'Static sleeve allocation, exposure aggregation, concentration analysis and deterministic portfolio risk states.',
-  },
-  {
-    icon: Database,
-    title: 'Reproducibility',
-    text: 'DuckDB persistence, content digests, configuration snapshots, immutable experiment summaries and provenance.',
+    title: 'Portfolio risk controls',
+    text: 'Static sleeves, exposure aggregation and causal risk-policy intent states.',
   },
   {
     icon: Server,
-    title: 'Presentation layer',
-    text: 'A read-only FastAPI contract and typed React client expose evidence without triggering research computations.',
+    title: 'Reproducible presentation',
+    text: 'Immutable summaries, content digests, DuckDB persistence and a read-only API.',
   },
 ]
 
 export function MethodologyView() {
   return (
-    <div className="content-wrap page-content">
-      <header className="page-heading methodology-heading">
+    <div className="content-wrap page-content methodology-page">
+      <header className="research-page-heading methodology-heading">
         <div>
-          <p className="section-eyebrow">About / Methodology</p>
+          <p className="section-eyebrow">Research methodology</p>
           <h1>Evidence before narrative</h1>
           <p>
-            A modular research system for studying relative-value behavior while
-            keeping diagnostic, out-of-sample and provenance claims explicit.
+            A modular path from observed prices to explicitly scoped diagnostic,
+            out-of-sample, and portfolio-risk evidence.
           </p>
+        </div>
+        <div className="methodology-principles">
+          <span>Causal</span>
+          <span>Reconciled</span>
+          <span>Reproducible</span>
         </div>
       </header>
 
-      <section className="methodology-grid" aria-label="Research capabilities">
-        {capabilities.map(({ icon: Icon, title, text }, index) => (
-          <article className="method-card" key={title}>
-            <div>
-              <span>{String(index + 1).padStart(2, '0')}</span>
-              <Icon size={20} strokeWidth={1.7} aria-hidden="true" />
-            </div>
+      <section className="methodology-ledger" aria-label="Research workflow">
+        {researchPath.map(({ icon: Icon, title, text }, index) => (
+          <article key={title}>
+            <span className="method-index">{String(index + 1).padStart(2, '0')}</span>
+            <Icon size={18} strokeWidth={1.7} aria-hidden="true" />
             <h2>{title}</h2>
             <p>{text}</p>
           </article>
         ))}
       </section>
 
-      <section className="disclaimer-panel">
-        <p className="section-eyebrow">Scope</p>
-        <h2>Research software, not a trading product</h2>
-        <p>
-          This project is research software and does not represent investment advice
-          or a production trading system. Historical diagnostics and walk-forward
-          results are not live performance and do not imply future profitability.
-        </p>
-      </section>
+      <div className="methodology-notes-grid">
+        <section>
+          <p className="section-eyebrow">Interpretation discipline</p>
+          <h2>Diagnostic and OOS evidence stay distinct</h2>
+          <p>
+            Full-sample diagnostics are retained for research context. Calendar
+            walk-forward results receive primary visual emphasis and preserve
+            unavailable observations rather than selectively dropping them.
+          </p>
+        </section>
+        <section>
+          <p className="section-eyebrow">Scope</p>
+          <h2>Research software, not a trading product</h2>
+          <p>
+            The system does not provide live execution, investment advice, or a
+            claim of future profitability. Demo-mode results are fixed synthetic
+            fixtures used only to demonstrate the interface.
+          </p>
+        </section>
+      </div>
     </div>
   )
 }

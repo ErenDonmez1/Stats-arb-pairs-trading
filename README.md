@@ -74,74 +74,27 @@ notebooks/              # Colab/exploratory orchestration
 reports/                # Generated research outputs
 ```
 
-## Quick start
+## Research Dashboard
 
-Python 3.10 or newer is required. The ordinary test suite mocks market-provider
-requests and does not require internet access.
+A React/TypeScript research interface visualizes pair screening, spread and
+z-score diagnostics, calendar walk-forward out-of-sample performance,
+drawdowns, fold consistency, and parameter-robustness analysis.
 
-### A. Install and test the research engine
+The dashboard supports both persisted research summaries exposed through the
+read-only FastAPI service and a deterministic synthetic interface demonstration.
+Synthetic content is visibly labelled and remains separate from real research
+provenance.
 
-```powershell
-python -m venv .venv
-.venv\Scripts\python.exe -m pip install -e ".[dev]"
-.venv\Scripts\python.exe -m pytest -q
-```
-
-On macOS or Linux, replace `.venv\Scripts\python.exe` with
-`.venv/bin/python`.
-
-### B. Run the full local application
-
-Start the API from the repository root:
-
-```powershell
-.venv\Scripts\python.exe -m uvicorn pairs_trading.api:app --reload
-```
-
-The API reads `data/research.duckdb` by default. Set
-`PAIRS_TRADING_DB_PATH` to a different server-controlled DuckDB file when
-needed. A populated experiment registry is required to display real experiment
-summaries.
-
-In another terminal, start the dashboard:
-
-```powershell
-cd frontend
-npm install
-npm run dev
-```
-
-The dashboard opens at `http://localhost:5173` and uses
-`http://localhost:8000` by default. Copy `frontend/.env.example` to a local
-`.env` file to configure another API origin.
-
-### C. Run the backend-free portfolio demo
-
-PowerShell:
-
-```powershell
-cd frontend
-$env:VITE_DEMO_MODE="true"
-npm run dev
-```
-
-Bash:
-
-```bash
-cd frontend
-VITE_DEMO_MODE=true npm run dev
-```
-
-Demo mode uses local fixed fixtures and makes no API requests. Every demo view
-is visibly marked **Synthetic demo**, including the banner:
-“Demo data — synthetic research output for interface demonstration.”
+Any dashboard screenshots added to this README will use deterministic synthetic
+demo data for interface demonstration only and will not represent investment
+performance.
 
 ## Demo data versus real research
 
-| Mode | Data source | Backend required | Interpretation |
-|---|---|---:|---|
-| `VITE_DEMO_MODE=true` | Two fixed TypeScript experiment fixtures | No | UI demonstration only; values are synthetic and are not investment performance. |
-| `VITE_DEMO_MODE=false` | FastAPI responses loaded from DuckDB | Yes | Persisted outputs created by the Python research pipeline, subject to their recorded provenance and limitations. |
+| Mode | Data source | Interpretation |
+|---|---|---|
+| Synthetic demonstration | Fixed deterministic TypeScript fixtures | Interface demonstration only; values are synthetic and are not investment performance. |
+| Persisted research | Read-only FastAPI summaries loaded from DuckDB | Outputs created by the Python research pipeline, subject to their recorded provenance and limitations. |
 
 The demo uses the same frontend interfaces as the API. It includes selected
 pairs, diagnostic and calendar OOS metrics, robustness/validation states,
@@ -196,45 +149,12 @@ ledgers, or bootstrap replicate time series.
 
 ## Testing
 
-```powershell
-.venv\Scripts\python.exe -m pytest -q
-cd frontend
-npm run lint
-npm run build
-```
-
 Python coverage spans configuration, data quality, statistics, screening,
 signals, execution and accounting, analytics, walk-forward evaluation,
 robustness, validation, portfolio/risk, persistence, the research pipeline, and
 the API. Frontend verification currently consists of strict TypeScript
 compilation, the Vite production build, and Oxlint; no separate frontend unit
 test command is configured.
-
-## Static demo deployment
-
-The Vite app is configured with relative production asset paths, so the demo
-build can be served from a standard static host without Python or DuckDB.
-
-PowerShell:
-
-```powershell
-cd frontend
-$env:VITE_DEMO_MODE="true"
-npm run build
-```
-
-Bash:
-
-```bash
-cd frontend
-VITE_DEMO_MODE=true npm run build
-```
-
-Publish the generated `frontend/dist/` directory as static files. No deployment
-account or paid service is required by the repository. A real-data deployment
-must instead set `VITE_API_BASE_URL` at build time, deploy the FastAPI service
-and DuckDB file separately, and include the public frontend origin in
-`PAIRS_TRADING_CORS_ORIGINS`.
 
 ## Limitations
 

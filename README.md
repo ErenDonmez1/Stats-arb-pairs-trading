@@ -58,9 +58,25 @@ the entire frame supplied to it. A historical simulation must therefore make
 universe-eligibility decisions from formation-only data; cleaning a
 future-inclusive horizon before selection can introduce look-ahead.
 
-DuckDB is mutable research storage with deterministic validated upserts, not an
-immutable experiment registry. Dataset snapshots, content hashes, and
-concurrent-writer coordination remain future work.
+DuckDB uses deterministic validated upserts for market and screening data and
+an immutable registry for canonical experiment summaries. Full raw-dataset
+snapshots and concurrent-writer coordination remain outside the current scope.
+
+## Read-only research API
+
+The FastAPI presentation layer exposes persisted experiment summaries without
+running research or accepting SQL. It reads `data/research.duckdb` by default;
+set `PAIRS_TRADING_DB_PATH` to select another server-controlled database. Local
+React development at `http://localhost:5173` is allowed by default. Override
+that allowlist with a comma-separated `PAIRS_TRADING_CORS_ORIGINS` value.
+
+```bash
+uvicorn pairs_trading.api:app --reload
+```
+
+Interactive OpenAPI documentation is available at `/docs`. The API persists
+summary metrics and provenance, but not equity curves, drawdown series, trade
+ledgers, bootstrap replicates, or other detailed time-series artifacts.
 
 ## Development setup
 

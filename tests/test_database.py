@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from importlib import resources
 import json
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import duckdb
@@ -15,21 +16,33 @@ import pandas as pd
 import pytest
 
 import pairs_trading.database as database_module
+import pairs_trading.pipeline as pipeline_module
 from pairs_trading.backtest import build_position_schedule
 from pairs_trading.database import (
+    EXPERIMENT_LIST_COLUMNS,
     QUALITY_COLUMNS,
     SCREENING_RESULT_COLUMNS,
     SCREENING_SUMMARY_COLUMNS,
+    ResearchExperimentSummary,
     connect_database,
     initialise_database,
     load_data_quality_report,
     load_pair_screening_results,
     load_prices,
+    load_research_experiment_summary,
     load_selected_pairs,
+    list_research_experiments,
     store_data_quality_report,
     store_pair_screening_results,
     store_prices,
+    store_research_experiment,
     summarise_screening_runs,
+)
+from pairs_trading.config import (
+    ResearchConfig,
+    ScreeningConfig,
+    StrategyConfig,
+    WalkForwardConfig,
 )
 from pairs_trading.data import (
     OBSERVED_PRICE_MASK_ATTR,
@@ -37,6 +50,14 @@ from pairs_trading.data import (
     make_synthetic_universe,
 )
 from pairs_trading.screening import PairScreeningResult, screen_pairs
+from pairs_trading.pipeline import (
+    PipelineStageStatus,
+    ResearchExperimentRequest,
+    ResearchExperimentResult,
+    ResearchPipelineStatus,
+    StatisticalValidationSettings,
+    run_research_pipeline,
+)
 
 
 PRICE_COLUMNS = ["ZZZ", "AAA"]
@@ -177,6 +198,54 @@ def _screening_batch() -> tuple[PairScreeningResult, ...]:
     )
 
 
+def _experiment_request() -> ResearchExperimentRequest:
+    prices, groups = make_synthetic_universe(n_days=330, seed=73)
+    config = ResearchConfig(
+        universe=MappingProxyType(
+            {group: tuple(symbols) for group, symbols in groups.items()}
+        ),
+        screening=ScreeningConfig(
+            formation_days=150,
+            min_observations=60,
+            fdr_threshold=0.20,
+            max_half_life=120.0,
+            hurst_threshold=0.80,
+        ),
+        strategy=StrategyConfig(
+            hedge_lookback=50,
+            zscore_lookback=25,
+            entry_z=2.0,
+            exit_z=0.5,
+            stop_z=4.0,
+            max_holding_days=30,
+            target_annual_vol=0.10,
+            max_gross_leverage=1.5,
+        ),
+        walk_forward=WalkForwardConfig(trading_days=45, min_selected_pairs=1),
+        random_seed=23,
+    )
+    return ResearchExperimentRequest(
+        "database-integration",
+        prices,
+        config,
+        initial_capital=100_000.0,
+        target_gross_notional=20_000.0,
+        run_robustness=True,
+        run_statistical_validation=True,
+        validation_settings=StatisticalValidationSettings(
+            block_length=5,
+            n_bootstrap=20,
+            random_seed=19,
+        ),
+        metadata={"owner": "database-test", "tags": ["offline"]},
+    )
+
+
+@pytest.fixture(scope="module")
+def research_experiment_result() -> ResearchExperimentResult:
+    return run_research_pipeline(_experiment_request())
+
+
 def _replace_screening_table_with_observation_limit(
     connection: duckdb.DuckDBPyConnection,
 ) -> None:
@@ -238,7 +307,13 @@ def test_schema_has_required_tables_columns_and_unique_keys() -> None:
         initialise_database(connection)
         assert {
             row[0] for row in connection.execute("SHOW TABLES").fetchall()
-        } == {"prices", "data_quality_reports", "pair_screening_results"}
+        } == {
+            "prices",
+            "data_quality_reports",
+            "pair_screening_results",
+            "research_experiments",
+            "research_experiment_summaries",
+        }
 
         price_info = connection.execute("PRAGMA table_info('prices')").fetchall()
         quality_info = connection.execute(
@@ -1313,7 +1388,13 @@ def test_sql_values_are_parameterised(tmp_path: Path) -> None:
     try:
         assert {
             row[0] for row in connection.execute("SHOW TABLES").fetchall()
-        } == {"prices", "data_quality_reports", "pair_screening_results"}
+        } == {
+            "prices",
+            "data_quality_reports",
+            "pair_screening_results",
+            "research_experiments",
+            "research_experiment_summaries",
+        }
     finally:
         connection.close()
 
@@ -2148,6 +2229,453 @@ def test_failed_screening_batch_rolls_back_without_partial_updates() -> None:
         assert connection.execute("SELECT 1").fetchone() == (1,)
     finally:
         connection.close()
+
+
+def test_experiment_schema_is_additively_migrated_without_losing_core_data() -> None:
+    connection = duckdb.connect(":memory:")
+    try:
+        schema = resources.files("pairs_trading").joinpath("sql", "schema.sql").read_text(
+            encoding="utf-8"
+        )
+        legacy_schema = schema.split(
+            "CREATE TABLE IF NOT EXISTS research_experiments", maxsplit=1
+        )[0]
+        connection.execute(legacy_schema)
+        connection.execute(
+            """
+            INSERT INTO prices VALUES
+            (DATE '2024-01-01', 'AAA', 100.0, TRUE, 'legacy',
+             TIMESTAMP '2024-02-01')
+            """
+        )
+
+        initialise_database(connection)
+
+        assert connection.execute("SELECT COUNT(*) FROM prices").fetchone() == (1,)
+        tables = {
+            row[0] for row in connection.execute("SHOW TABLES").fetchall()
+        }
+        assert {
+            "research_experiments",
+            "research_experiment_summaries",
+        }.issubset(tables)
+    finally:
+        connection.close()
+
+
+def test_experiment_schema_has_required_keys_and_summary_shape() -> None:
+    connection = duckdb.connect(":memory:")
+    try:
+        initialise_database(connection)
+        experiment = connection.execute(
+            "PRAGMA table_info('research_experiments')"
+        ).fetchall()
+        summary = connection.execute(
+            "PRAGMA table_info('research_experiment_summaries')"
+        ).fetchall()
+
+        assert [row[1] for row in experiment] == [
+            "run_id",
+            "research_content_digest",
+            "price_content_digest",
+            "configuration_digest",
+            "research_pipeline_version",
+            "configuration_snapshot_version",
+            "experiment_schema_version",
+            "experiment_name",
+            "created_at",
+            "pipeline_status",
+            "configuration_snapshot",
+            "metadata",
+            "provenance",
+            "warnings",
+        ]
+        assert next(row for row in experiment if row[1] == "run_id")[5]
+        assert len(summary) == 92
+        assert next(row for row in summary if row[1] == "run_id")[5]
+    finally:
+        connection.close()
+
+
+def test_research_experiment_save_and_complete_summary_round_trip(
+    tmp_path: Path,
+    research_experiment_result: ResearchExperimentResult,
+) -> None:
+    path = tmp_path / "experiments.duckdb"
+    result = research_experiment_result
+    before_snapshot = dict(result.configuration_snapshot)
+
+    store_research_experiment(path, result)
+    loaded = load_research_experiment_summary(path, result.run_id)
+
+    assert isinstance(loaded, ResearchExperimentSummary)
+    assert loaded.run_id == result.run_id
+    assert loaded.experiment_id == result.run_id
+    assert loaded.research_content_digest == result.research_content_digest
+    assert loaded.price_content_digest == result.price_content_digest
+    assert loaded.research_pipeline_version == result.research_pipeline_version
+    assert loaded.configuration_snapshot_version == (
+        result.configuration_snapshot_version
+    )
+    assert loaded.experiment_schema_version == result.experiment_schema_version
+    assert loaded.experiment_name == result.experiment_name
+    assert loaded.configuration_digest == result.configuration_digest
+    assert loaded.pipeline_status == result.status.value
+    assert loaded.configuration_snapshot == result.configuration_snapshot
+    assert loaded.metadata == result.metadata
+    assert loaded.provenance == result.provenance
+    assert loaded.warnings == result.warnings
+    assert loaded.selected_pair is not None
+    assert result.selected_pair is not None
+    assert loaded.selected_pair["pair_id"] == (
+        f"{result.selected_pair.symbol_y}|{result.selected_pair.symbol_x}"
+    )
+    assert loaded.selected_pair["rank"] == 1
+    assert loaded.screening["candidate_count"] == len(result.screening_results)
+    assert loaded.screening["selected_count"] == sum(
+        item.selected for item in result.screening_results
+    )
+    assert result.performance_report is not None
+    assert loaded.diagnostic["total_return"] == pytest.approx(
+        result.performance_report.core.total_return
+    )
+    assert loaded.diagnostic["sharpe_ratio"] == pytest.approx(
+        result.performance_report.core.sharpe_ratio
+    )
+    assert loaded.diagnostic["maximum_drawdown"] == pytest.approx(
+        result.performance_report.drawdown.maximum_drawdown
+    )
+    assert loaded.diagnostic["trade_count"] == result.performance_report.trades.trades
+    assert loaded.diagnostic["scope"] == "full_sample_in_sample_diagnostic"
+    assert result.walk_forward_result is not None
+    assert loaded.walk_forward["selection_coverage"] == pytest.approx(
+        result.walk_forward_result.selection_coverage
+    )
+    assert loaded.walk_forward["calendar_oos_total_return"] == pytest.approx(
+        result.walk_forward_result.calendar_performance_report.core.total_return
+    )
+    assert loaded.diagnostic["total_return"] != pytest.approx(
+        loaded.walk_forward["calendar_oos_total_return"]
+    )
+    assert result.robustness_result is not None
+    assert loaded.robustness["scenario_count"] == (
+        result.robustness_result.summary.scenario_count
+    )
+    assert result.statistical_validation_result is not None
+    assert loaded.validation["primary_availability"] == (
+        result.statistical_validation_result.primary_inference_availability.value
+    )
+    assert loaded.validation["multiple_testing_total_configurations"] == (
+        result.statistical_validation_result.multiple_testing.total_tested_configurations
+    )
+    assert dict(result.configuration_snapshot) == before_snapshot
+
+
+def test_experiment_list_has_deterministic_newest_first_order(
+    tmp_path: Path,
+    research_experiment_result: ResearchExperimentResult,
+) -> None:
+    path = tmp_path / "ordered-experiments.duckdb"
+    first = replace(
+        research_experiment_result,
+        run_id="run_11111111111111111111111111111111",
+        created_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+    )
+    second = replace(
+        research_experiment_result,
+        run_id="run_22222222222222222222222222222222",
+        created_at=datetime(2025, 1, 2, tzinfo=timezone.utc),
+    )
+    tied = replace(
+        research_experiment_result,
+        run_id="run_00000000000000000000000000000000",
+        created_at=datetime(2025, 1, 2, tzinfo=timezone.utc),
+    )
+    for result in (first, second, tied):
+        store_research_experiment(path, result)
+
+    listed = list_research_experiments(path)
+
+    assert tuple(listed.columns) == EXPERIMENT_LIST_COLUMNS
+    assert listed["run_id"].tolist() == [
+        "run_00000000000000000000000000000000",
+        "run_22222222222222222222222222222222",
+        "run_11111111111111111111111111111111",
+    ]
+
+
+def test_duplicate_run_id_is_rejected_without_duplicate_rows(
+    tmp_path: Path,
+    research_experiment_result: ResearchExperimentResult,
+) -> None:
+    path = tmp_path / "duplicate-experiment.duckdb"
+    store_research_experiment(path, research_experiment_result)
+
+    with pytest.raises(ValueError, match="already exists"):
+        store_research_experiment(path, research_experiment_result)
+
+    connection = duckdb.connect(str(path), read_only=True)
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM research_experiments"
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM research_experiment_summaries"
+        ).fetchone() == (1,)
+    finally:
+        connection.close()
+
+
+def test_failed_multitable_experiment_save_rolls_back_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+    research_experiment_result: ResearchExperimentResult,
+) -> None:
+    connection = duckdb.connect(":memory:")
+    try:
+        initialise_database(connection)
+        monkeypatch.setattr(
+            database_module,
+            "_insert_research_experiment_summary",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("deliberate summary failure")
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="deliberate summary failure"):
+            store_research_experiment(connection, research_experiment_result)
+
+        assert connection.execute(
+            "SELECT COUNT(*) FROM research_experiments"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM research_experiment_summaries"
+        ).fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+def test_experiment_reads_do_not_create_missing_database(tmp_path: Path) -> None:
+    path = tmp_path / "missing-experiment.duckdb"
+
+    with pytest.raises(FileNotFoundError):
+        list_research_experiments(path)
+    with pytest.raises(FileNotFoundError):
+        load_research_experiment_summary(path, "research_missing")
+    assert not path.exists()
+
+
+def test_experiment_tampered_undefined_diagnostic_metrics_are_rejected(
+    research_experiment_result: ResearchExperimentResult,
+) -> None:
+    assert research_experiment_result.performance_report is not None
+    changed_core = replace(
+        research_experiment_result.performance_report.core,
+        sharpe_ratio=float("nan"),
+        sortino_ratio=float("inf"),
+    )
+    changed_report = replace(
+        research_experiment_result.performance_report,
+        core=changed_core,
+    )
+    changed = replace(
+        research_experiment_result,
+        performance_report=changed_report,
+    )
+    connection = duckdb.connect(":memory:")
+    try:
+        with pytest.raises(ValueError, match="inconsistent with backtest"):
+            store_research_experiment(connection, changed)
+        assert connection.execute("SHOW TABLES").fetchall() == []
+    finally:
+        connection.close()
+
+
+def test_experiment_store_rejects_stale_configuration_digest(
+    research_experiment_result: ResearchExperimentResult,
+) -> None:
+    changed = replace(
+        research_experiment_result,
+        configuration_digest="0" * 64,
+    )
+    connection = duckdb.connect(":memory:")
+    try:
+        with pytest.raises(ValueError, match="does not match"):
+            store_research_experiment(connection, changed)
+        assert connection.execute("SHOW TABLES").fetchall() == []
+    finally:
+        connection.close()
+
+
+def test_experiment_schema_with_correct_columns_but_no_constraints_is_rejected() -> None:
+    connection = duckdb.connect(":memory:")
+    try:
+        initialise_database(connection)
+        table_definitions: dict[str, str] = {}
+        for table in ("research_experiment_summaries", "research_experiments"):
+            info = connection.execute(f"PRAGMA table_info('{table}')").fetchall()
+            table_definitions[table] = ", ".join(
+                f'"{row[1]}" {row[2]}' + (" NOT NULL" if bool(row[3]) else "")
+                for row in info
+            )
+        connection.execute("DROP TABLE research_experiment_summaries")
+        connection.execute("DROP TABLE research_experiments")
+        connection.execute(
+            f"CREATE TABLE research_experiments ({table_definitions['research_experiments']})"
+        )
+        connection.execute(
+            "CREATE TABLE research_experiment_summaries "
+            f"({table_definitions['research_experiment_summaries']})"
+        )
+
+        with pytest.raises(RuntimeError, match="primary key"):
+            initialise_database(connection)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_experiment_json_reads_reject_non_finite_constants(
+    constant: str,
+    research_experiment_result: ResearchExperimentResult,
+) -> None:
+    connection = duckdb.connect(":memory:")
+    try:
+        store_research_experiment(connection, research_experiment_result)
+        connection.execute(
+            "UPDATE research_experiments SET metadata = ? WHERE run_id = ?",
+            [f'{{"corrupted":{constant}}}', research_experiment_result.run_id],
+        )
+        with pytest.raises(RuntimeError, match="not valid JSON"):
+            load_research_experiment_summary(
+                connection, research_experiment_result.run_id
+            )
+    finally:
+        connection.close()
+
+
+def test_summary_to_dict_is_strict_json_compatible_for_complete_result(
+    research_experiment_result: ResearchExperimentResult,
+) -> None:
+    connection = duckdb.connect(":memory:")
+    try:
+        store_research_experiment(connection, research_experiment_result)
+        loaded = load_research_experiment_summary(
+            connection, research_experiment_result.run_id
+        )
+        payload = loaded.to_dict()
+
+        assert isinstance(payload, dict)
+        assert payload["run_id"] == research_experiment_result.run_id
+        assert isinstance(payload["configuration_snapshot"], dict)
+        assert isinstance(payload["warnings"], list)
+        json.dumps(payload, allow_nan=False)
+    finally:
+        connection.close()
+
+
+def test_no_diagnostic_pair_with_real_walk_forward_persists_and_serializes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = replace(
+        _experiment_request(),
+        run_robustness=False,
+        run_statistical_validation=False,
+    )
+    rejected = replace(
+        _screening_result("TECH_A", "TECH_B"),
+        selected=False,
+        rank=None,
+        rejection_reasons=("full_sample_not_selected",),
+    )
+    monkeypatch.setattr(
+        pipeline_module, "screen_pairs", lambda *args, **kwargs: (rejected,)
+    )
+    result = run_research_pipeline(request)
+    assert result.selected_pair is None
+    assert result.walk_forward_result is not None
+    assert result.walk_forward_result.completed_fold_count > 0
+    connection = duckdb.connect(":memory:")
+    try:
+        store_research_experiment(connection, result)
+        loaded = load_research_experiment_summary(connection, result.run_id)
+
+        assert loaded.selected_pair is None
+        assert loaded.diagnostic["stage"] == PipelineStageStatus.UNAVAILABLE.value
+        assert loaded.diagnostic["total_return"] is None
+        assert loaded.walk_forward["stage"] == PipelineStageStatus.COMPLETED.value
+        assert loaded.walk_forward["selected_oos_observations"] > 0
+        assert loaded.robustness["stage"] == PipelineStageStatus.NOT_REQUESTED.value
+        assert loaded.validation["stage"] == PipelineStageStatus.NOT_REQUESTED.value
+        json.dumps(loaded.to_dict(), allow_nan=False)
+    finally:
+        connection.close()
+
+
+def test_persistence_rejects_tampered_stage_count_and_identity_states_before_write(
+    research_experiment_result: ResearchExperimentResult,
+) -> None:
+    result = research_experiment_result
+    assert result.performance_report is not None
+    assert result.walk_forward_result is not None
+    assert result.robustness_result is not None
+    assert result.statistical_validation_result is not None
+    corrupted_report = replace(
+        result.performance_report,
+        core=replace(
+            result.performance_report.core,
+            total_return=result.performance_report.core.total_return + 0.01,
+        ),
+    )
+    stale_walk_forward_count = replace(
+        result.walk_forward_result,
+        scheduled_oos_observations=(
+            result.walk_forward_result.scheduled_oos_observations + 1
+        ),
+    )
+    stale_walk_forward_coverage = replace(
+        result.walk_forward_result,
+        selection_coverage=0.123456,
+    )
+    stale_robustness = replace(
+        result.robustness_result,
+        summary=replace(
+            result.robustness_result.summary,
+            scenario_count=result.robustness_result.summary.scenario_count + 1,
+        ),
+    )
+    stale_multiple = replace(
+        result.statistical_validation_result.multiple_testing,
+        total_tested_configurations=(
+            result.statistical_validation_result.multiple_testing.total_tested_configurations
+            + 1
+        ),
+    )
+    stale_validation = replace(
+        result.statistical_validation_result,
+        multiple_testing=stale_multiple,
+    )
+    mutations = (
+        replace(result, status="UNKNOWN"),  # type: ignore[arg-type]
+        replace(result, analytics_stage="UNKNOWN"),  # type: ignore[arg-type]
+        replace(result, analytics_stage=PipelineStageStatus.UNAVAILABLE),
+        replace(result, walk_forward_stage=PipelineStageStatus.UNAVAILABLE),
+        replace(result, performance_report=corrupted_report),
+        replace(result, walk_forward_result=stale_walk_forward_count),
+        replace(result, walk_forward_result=stale_walk_forward_coverage),
+        replace(result, robustness_result=stale_robustness),
+        replace(result, statistical_validation_result=stale_validation),
+        replace(result, run_id="malformed"),
+        replace(result, research_content_digest="0" * 64),
+    )
+
+    for changed in mutations:
+        connection = duckdb.connect(":memory:")
+        try:
+            with pytest.raises((TypeError, ValueError)):
+                store_research_experiment(connection, changed)
+            assert connection.execute("SHOW TABLES").fetchall() == []
+        finally:
+            connection.close()
 
 
 def test_unknown_screening_run_returns_typed_empty_frame(tmp_path: Path) -> None:

@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from datetime import date, datetime
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from importlib import resources
 import json
 import os
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, TypeAlias
 
 import duckdb
@@ -82,6 +84,24 @@ SCREENING_SUMMARY_COLUMNS = (
     "mean_hurst",
     "latest_loaded_at",
 )
+EXPERIMENT_LIST_COLUMNS = (
+    "run_id",
+    "research_content_digest",
+    "experiment_name",
+    "created_at",
+    "pipeline_status",
+    "selected_pair_id",
+    "diagnostic_in_sample_total_return",
+    "diagnostic_in_sample_sharpe_ratio",
+    "diagnostic_in_sample_maximum_drawdown",
+    "diagnostic_in_sample_trade_count",
+    "walk_forward_calendar_oos_total_return",
+    "walk_forward_calendar_oos_sharpe_ratio",
+    "walk_forward_calendar_oos_maximum_drawdown",
+    "walk_forward_stage",
+    "robustness_stage",
+    "validation_stage",
+)
 _SCREENING_FLOAT_COLUMNS = (
     "alpha",
     "beta",
@@ -143,6 +163,166 @@ _REQUIRED_SCHEMA_COLUMNS = {
         "loaded_at": "TIMESTAMP",
         "half_life_was_infinite": "BOOLEAN",
     },
+    "research_experiments": {
+        "run_id": "VARCHAR",
+        "research_content_digest": "VARCHAR",
+        "price_content_digest": "VARCHAR",
+        "configuration_digest": "VARCHAR",
+        "research_pipeline_version": "VARCHAR",
+        "configuration_snapshot_version": "BIGINT",
+        "experiment_schema_version": "BIGINT",
+        "experiment_name": "VARCHAR",
+        "created_at": "TIMESTAMP",
+        "pipeline_status": "VARCHAR",
+        "configuration_snapshot": "VARCHAR",
+        "metadata": "VARCHAR",
+        "provenance": "VARCHAR",
+        "warnings": "VARCHAR",
+    },
+    "research_experiment_summaries": {
+        "run_id": "VARCHAR",
+        "selected_pair_id": "VARCHAR",
+        "symbol_y": "VARCHAR",
+        "symbol_x": "VARCHAR",
+        "selected_rank": "BIGINT",
+        "screening_candidate_count": "BIGINT",
+        "screening_selected_count": "BIGINT",
+        "screening_selection_scope": "VARCHAR",
+        "screening_ranking_policy": "VARCHAR",
+        "alpha": "DOUBLE",
+        "beta": "DOUBLE",
+        "cointegration_statistic": "DOUBLE",
+        "cointegration_pvalue": "DOUBLE",
+        "corrected_pvalue": "DOUBLE",
+        "half_life": "DOUBLE",
+        "hurst": "DOUBLE",
+        "analytics_stage": "VARCHAR",
+        "diagnostic_in_sample_total_return": "DOUBLE",
+        "diagnostic_in_sample_annualized_return": "DOUBLE",
+        "diagnostic_in_sample_annualized_volatility": "DOUBLE",
+        "diagnostic_in_sample_sharpe_ratio": "DOUBLE",
+        "diagnostic_in_sample_sortino_ratio": "DOUBLE",
+        "diagnostic_in_sample_maximum_drawdown": "DOUBLE",
+        "diagnostic_in_sample_calmar_ratio": "DOUBLE",
+        "diagnostic_in_sample_trade_count": "BIGINT",
+        "diagnostic_total_rows": "BIGINT",
+        "diagnostic_finite_beta_rows": "BIGINT",
+        "diagnostic_positive_execution_beta_rows": "BIGINT",
+        "diagnostic_non_positive_execution_beta_rows": "BIGINT",
+        "diagnostic_finite_signal_rows": "BIGINT",
+        "diagnostic_entry_execution_unavailable_rows_due_to_beta": "BIGINT",
+        "diagnostic_signal_observation_coverage": "DOUBLE",
+        "diagnostic_beta_execution_policy": "VARCHAR",
+        "walk_forward_stage": "VARCHAR",
+        "walk_forward_calendar_analytics_status": "VARCHAR",
+        "walk_forward_fold_count": "BIGINT",
+        "walk_forward_completed_fold_count": "BIGINT",
+        "walk_forward_no_selection_fold_count": "BIGINT",
+        "walk_forward_insufficient_data_fold_count": "BIGINT",
+        "walk_forward_scheduled_oos_observations": "BIGINT",
+        "walk_forward_scheduled_eligible_oos_observations": "BIGINT",
+        "walk_forward_selected_oos_observations": "BIGINT",
+        "walk_forward_no_selection_oos_observations": "BIGINT",
+        "walk_forward_unavailable_oos_observations": "BIGINT",
+        "walk_forward_selection_coverage": "DOUBLE",
+        "walk_forward_evaluated_start_label": "VARCHAR",
+        "walk_forward_evaluated_end_label": "VARCHAR",
+        "walk_forward_capital_policy": "VARCHAR",
+        "walk_forward_aggregate_return_policy": "VARCHAR",
+        "walk_forward_inactive_capital_policy": "VARCHAR",
+        "walk_forward_selection_coverage_denominator": "VARCHAR",
+        "walk_forward_aggregate_dollar_pnl_available": "BOOLEAN",
+        "walk_forward_aggregate_trade_dollar_metrics_available": "BOOLEAN",
+        "walk_forward_calendar_oos_total_return": "DOUBLE",
+        "walk_forward_calendar_oos_annualized_return": "DOUBLE",
+        "walk_forward_calendar_oos_annualized_volatility": "DOUBLE",
+        "walk_forward_calendar_oos_sharpe_ratio": "DOUBLE",
+        "walk_forward_calendar_oos_sortino_ratio": "DOUBLE",
+        "walk_forward_calendar_oos_maximum_drawdown": "DOUBLE",
+        "walk_forward_calendar_oos_calmar_ratio": "DOUBLE",
+        "walk_forward_calendar_oos_report_observations": "BIGINT",
+        "robustness_stage": "VARCHAR",
+        "robustness_baseline_scenario_id": "VARCHAR",
+        "robustness_scenario_count": "BIGINT",
+        "robustness_completed_scenarios": "BIGINT",
+        "robustness_analytically_unavailable_scenarios": "BIGINT",
+        "robustness_invalid_scenarios": "BIGINT",
+        "robustness_failed_scenarios": "BIGINT",
+        "robustness_common_horizon_structurally_available": "BOOLEAN",
+        "robustness_common_horizon_fully_observed": "BOOLEAN",
+        "robustness_common_horizon_analytics_available": "BOOLEAN",
+        "robustness_common_horizon_analytics_status": "VARCHAR",
+        "robustness_common_horizon_observations": "BIGINT",
+        "robustness_common_horizon_eligible_scenario_count": "BIGINT",
+        "robustness_headline_metric_basis": "VARCHAR",
+        "robustness_distribution_policy": "VARCHAR",
+        "robustness_tested_dimensions": "VARCHAR",
+        "robustness_untested_material_dimensions": "VARCHAR",
+        "robustness_provenance_warning_summary": "VARCHAR",
+        "validation_stage": "VARCHAR",
+        "validation_primary_availability": "VARCHAR",
+        "validation_overall_availability": "VARCHAR",
+        "probabilistic_sharpe_probability": "DOUBLE",
+        "minimum_track_record_observations": "BIGINT",
+        "fold_consistency_availability": "VARCHAR",
+        "multiple_testing_total_configurations": "BIGINT",
+        "multiple_testing_valid_comparable_configurations": "BIGINT",
+        "multiple_testing_valid_pvalue_count": "BIGINT",
+        "multiple_testing_unavailable_pvalue_count": "BIGINT",
+        "multiple_testing_eligible_hypothesis_count": "BIGINT",
+        "validation_purpose": "VARCHAR",
+        "validation_provenance_warning_summary": "VARCHAR",
+    },
+}
+
+_BASE_SCHEMA_TABLES = frozenset(
+    {"prices", "data_quality_reports", "pair_screening_results"}
+)
+_EXPERIMENT_NOT_NULL_COLUMNS = {
+    "research_experiments": frozenset(_REQUIRED_SCHEMA_COLUMNS["research_experiments"]),
+    "research_experiment_summaries": frozenset(
+        {
+            "run_id",
+            "screening_candidate_count",
+            "screening_selected_count",
+            "screening_selection_scope",
+            "screening_ranking_policy",
+            "analytics_stage",
+            "walk_forward_stage",
+            "robustness_stage",
+            "validation_stage",
+        }
+    ),
+}
+_EXPERIMENT_PRIMARY_KEYS = {
+    "research_experiments": ("run_id",),
+    "research_experiment_summaries": ("run_id",),
+}
+_EXPERIMENT_CHECK_TOKEN_SETS = {
+    "research_experiments": (
+        frozenset({"research_content_digest", "price_content_digest", "length"}),
+        frozenset({"configuration_snapshot_version", "experiment_schema_version"}),
+        frozenset({"pipeline_status", "completed"}),
+    ),
+    "research_experiment_summaries": (
+        frozenset({"selected_pair_id", "selected_rank"}),
+        frozenset({"screening_candidate_count", "screening_selected_count"}),
+        frozenset({"analytics_stage", "walk_forward_stage", "robustness_stage"}),
+        frozenset(
+            {
+                "walk_forward_fold_count",
+                "walk_forward_completed_fold_count",
+                "walk_forward_scheduled_oos_observations",
+            }
+        ),
+        frozenset({"robustness_scenario_count", "robustness_completed_scenarios"}),
+        frozenset(
+            {
+                "multiple_testing_total_configurations",
+                "multiple_testing_valid_pvalue_count",
+            }
+        ),
+    ),
 }
 
 __all__ = [
@@ -156,7 +336,130 @@ __all__ = [
     "load_pair_screening_results",
     "load_selected_pairs",
     "summarise_screening_runs",
+    "ResearchExperimentSummary",
+    "EXPERIMENT_LIST_COLUMNS",
+    "store_research_experiment",
+    "list_research_experiments",
+    "load_research_experiment_summary",
 ]
+
+
+def _freeze_summary_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_summary_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_summary_value(item) for item in value)
+    return value
+
+
+def _summary_api_value(value: Any, field: str = "summary") -> Any:
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, datetime):
+        moment = value
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        number = float(value)
+        if not np.isfinite(number):
+            raise ValueError(f"{field} contains NaN or infinity.")
+        return number
+    if isinstance(value, Mapping):
+        return {
+            str(key): _summary_api_value(item, f"{field}.{key}")
+            for key, item in value.items()
+        }
+    if isinstance(value, (tuple, list)):
+        return [_summary_api_value(item, f"{field}[]") for item in value]
+    raise TypeError(f"{field} contains a non-JSON-compatible value.")
+
+
+@dataclass(frozen=True)
+class ResearchExperimentSummary:
+    """Immutable persisted experiment summary for API/UI retrieval."""
+
+    run_id: str
+    research_content_digest: str
+    price_content_digest: str
+    research_pipeline_version: str
+    configuration_snapshot_version: int
+    experiment_schema_version: int
+    experiment_name: str
+    created_at: datetime
+    configuration_digest: str
+    pipeline_status: str
+    selected_pair: Mapping[str, Any] | None
+    screening: Mapping[str, Any]
+    diagnostic: Mapping[str, Any]
+    walk_forward: Mapping[str, Any]
+    robustness: Mapping[str, Any]
+    validation: Mapping[str, Any]
+    configuration_snapshot: Mapping[str, Any]
+    metadata: Mapping[str, Any]
+    provenance: Mapping[str, Any]
+    warnings: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for name in (
+            "screening",
+            "diagnostic",
+            "walk_forward",
+            "robustness",
+            "validation",
+            "configuration_snapshot",
+            "metadata",
+            "provenance",
+        ):
+            object.__setattr__(
+                self, name, _freeze_summary_value(getattr(self, name))
+            )
+        if self.selected_pair is not None:
+            object.__setattr__(
+                self, "selected_pair", _freeze_summary_value(self.selected_pair)
+            )
+        object.__setattr__(self, "warnings", tuple(self.warnings))
+
+    @property
+    def experiment_id(self) -> str:
+        """Backward-compatible read alias for ``run_id``."""
+        return self.run_id
+
+    @property
+    def performance(self) -> Mapping[str, Any]:
+        """Backward-compatible read alias for explicit diagnostic metrics."""
+        return self.diagnostic
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a normal, strict JSON-compatible API representation."""
+        return _summary_api_value(
+            {
+                "run_id": self.run_id,
+                "research_content_digest": self.research_content_digest,
+                "price_content_digest": self.price_content_digest,
+                "research_pipeline_version": self.research_pipeline_version,
+                "configuration_snapshot_version": self.configuration_snapshot_version,
+                "experiment_schema_version": self.experiment_schema_version,
+                "experiment_name": self.experiment_name,
+                "created_at": self.created_at,
+                "configuration_digest": self.configuration_digest,
+                "pipeline_status": self.pipeline_status,
+                "selected_pair": self.selected_pair,
+                "screening": self.screening,
+                "diagnostic": self.diagnostic,
+                "walk_forward": self.walk_forward,
+                "robustness": self.robustness,
+                "validation": self.validation,
+                "configuration_snapshot": self.configuration_snapshot,
+                "metadata": self.metadata,
+                "provenance": self.provenance,
+                "warnings": self.warnings,
+            }
+        )
 
 
 def connect_database(
@@ -255,20 +558,26 @@ def _load_schema() -> str:
 
 
 def _ensure_schema(connection: duckdb.DuckDBPyConnection) -> None:
-    existing_count = connection.execute(
-        """
-        SELECT COUNT(*)
-        FROM information_schema.tables
-        WHERE table_schema = current_schema()
-          AND table_name IN (
-              'prices', 'data_quality_reports', 'pair_screening_results'
-          )
-        """
-    ).fetchone()[0]
-    if existing_count == 0:
+    required_tables = frozenset(_REQUIRED_SCHEMA_COLUMNS)
+    existing_tables = {
+        row[0]
+        for row in connection.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = current_schema()"
+        ).fetchall()
+        if row[0] in required_tables
+    }
+    if not existing_tables:
         with _transaction(connection):
             connection.execute(_load_schema())
-    elif existing_count != len(_REQUIRED_SCHEMA_COLUMNS):
+    elif existing_tables == _BASE_SCHEMA_TABLES:
+        # Milestone 10A is an additive migration from the established market,
+        # quality, and screening schema.  CREATE TABLE IF NOT EXISTS preserves
+        # all earlier data while adding only experiment-history tables.
+        _validate_schema_tables(connection, _BASE_SCHEMA_TABLES)
+        with _transaction(connection):
+            connection.execute(_load_schema())
+    elif existing_tables != required_tables:
         raise RuntimeError(
             "Database contains a partial research schema; explicit migration or "
             "recreation is required."
@@ -278,6 +587,14 @@ def _ensure_schema(connection: duckdb.DuckDBPyConnection) -> None:
 
 def _validate_schema(connection: duckdb.DuckDBPyConnection) -> None:
     """Reject missing or legacy schema shapes without inventing provenance."""
+    _validate_schema_tables(connection, frozenset(_REQUIRED_SCHEMA_COLUMNS))
+
+
+def _validate_schema_tables(
+    connection: duckdb.DuckDBPyConnection,
+    required_tables: frozenset[str],
+) -> None:
+    """Validate an explicit trusted subset before any additive migration."""
     existing_tables = {
         row[0]
         for row in connection.execute(
@@ -285,16 +602,15 @@ def _validate_schema(connection: duckdb.DuckDBPyConnection) -> None:
             "WHERE table_schema = current_schema()"
         ).fetchall()
     }
-    missing_tables = sorted(set(_REQUIRED_SCHEMA_COLUMNS) - existing_tables)
+    missing_tables = sorted(set(required_tables) - existing_tables)
     if missing_tables:
         raise RuntimeError(
             f"Database schema is missing required tables: {missing_tables}."
         )
-    for table, required in _REQUIRED_SCHEMA_COLUMNS.items():
-        actual = {
-            row[1]: str(row[2]).upper()
-            for row in connection.execute(f"PRAGMA table_info('{table}')").fetchall()
-        }
+    for table in sorted(required_tables):
+        required = _REQUIRED_SCHEMA_COLUMNS[table]
+        table_info = connection.execute(f"PRAGMA table_info('{table}')").fetchall()
+        actual = {row[1]: str(row[2]).upper() for row in table_info}
         missing_columns = sorted(set(required) - set(actual))
         if missing_columns:
             raise RuntimeError(
@@ -311,6 +627,63 @@ def _validate_schema(connection: duckdb.DuckDBPyConnection) -> None:
                 f"Database table {table!r} has incompatible column types: "
                 f"{incompatible}."
             )
+        if table in _EXPERIMENT_NOT_NULL_COLUMNS:
+            not_null = {row[1] for row in table_info if bool(row[3])}
+            missing_not_null = sorted(
+                _EXPERIMENT_NOT_NULL_COLUMNS[table] - not_null
+            )
+            if missing_not_null:
+                raise RuntimeError(
+                    f"Database table {table!r} is missing required NOT NULL "
+                    f"constraints on {missing_not_null}."
+                )
+
+    experiment_tables = required_tables.intersection(_EXPERIMENT_PRIMARY_KEYS)
+    if not experiment_tables:
+        return
+    rows = connection.execute(
+        """
+        SELECT table_name, constraint_type, constraint_column_names,
+               referenced_table, referenced_column_names, expression
+        FROM duckdb_constraints()
+        WHERE schema_name = current_schema()
+        """
+    ).fetchall()
+    by_table: dict[str, list[tuple[Any, ...]]] = {}
+    for row in rows:
+        by_table.setdefault(str(row[0]), []).append(row)
+    for table in sorted(experiment_tables):
+        constraints = by_table.get(table, [])
+        primary_keys = {
+            tuple(row[2]) for row in constraints if row[1] == "PRIMARY KEY"
+        }
+        if _EXPERIMENT_PRIMARY_KEYS[table] not in primary_keys:
+            raise RuntimeError(
+                f"Database table {table!r} is missing its required primary key."
+            )
+        expressions = [
+            str(row[5]).casefold()
+            for row in constraints
+            if row[1] == "CHECK" and row[5] is not None
+        ]
+        for required_tokens in _EXPERIMENT_CHECK_TOKEN_SETS[table]:
+            if not any(all(token in expression for token in required_tokens) for expression in expressions):
+                raise RuntimeError(
+                    f"Database table {table!r} is missing a material CHECK constraint."
+                )
+    summary_constraints = by_table.get("research_experiment_summaries", [])
+    required_fk = any(
+        row[1] == "FOREIGN KEY"
+        and tuple(row[2]) == ("run_id",)
+        and row[3] == "research_experiments"
+        and tuple(row[4]) == ("run_id",)
+        for row in summary_constraints
+    )
+    if "research_experiment_summaries" in experiment_tables and not required_fk:
+        raise RuntimeError(
+            "Database research_experiment_summaries is missing the required "
+            "run_id foreign key."
+        )
 
 
 def initialise_database(database: DatabaseTarget) -> None:
@@ -1515,3 +1888,1023 @@ def summarise_screening_runs(database: DatabaseTarget) -> pd.DataFrame:
     ):
         result[column] = result[column].astype(float)
     return result.loc[:, list(SCREENING_SUMMARY_COLUMNS)]
+
+
+def _plain_json_value(value: Any, field: str) -> Any:
+    """Return safe JSON primitives for experiment metadata persistence."""
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, (int, np.integer)) and not isinstance(
+        value, (bool, np.bool_)
+    ):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        number = float(value)
+        if not np.isfinite(number):
+            raise ValueError(f"{field} must not contain NaN or infinity.")
+        return number
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, nested in value.items():
+            if not isinstance(key, str) or not key:
+                raise TypeError(f"{field} keys must be non-empty strings.")
+            result[key] = _plain_json_value(nested, f"{field}.{key}")
+        return result
+    if isinstance(value, (tuple, list)):
+        return [
+            _plain_json_value(nested, f"{field}[]") for nested in value
+        ]
+    raise TypeError(f"{field} contains an unsupported JSON value.")
+
+
+def _encode_json_value(value: Any, field: str) -> str:
+    return json.dumps(
+        _plain_json_value(value, field),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+
+
+def _decode_json_mapping(value: Any, field: str) -> dict[str, Any]:
+    def reject_constant(constant: str) -> None:
+        raise ValueError(f"Non-finite JSON constant {constant!r} is forbidden.")
+
+    try:
+        decoded = json.loads(value, parse_constant=reject_constant)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Stored {field} is not valid JSON.") from exc
+    if not isinstance(decoded, dict):
+        raise RuntimeError(f"Stored {field} must be a JSON object.")
+    return _plain_json_value(decoded, field)
+
+
+def _decode_json_strings(value: Any, field: str) -> tuple[str, ...]:
+    def reject_constant(constant: str) -> None:
+        raise ValueError(f"Non-finite JSON constant {constant!r} is forbidden.")
+
+    try:
+        decoded = json.loads(value, parse_constant=reject_constant)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Stored {field} is not valid JSON.") from exc
+    if not isinstance(decoded, list) or any(
+        not isinstance(item, str) for item in decoded
+    ):
+        raise RuntimeError(f"Stored {field} must be a JSON string array.")
+    return tuple(decoded)
+
+
+def _optional_summary_float(value: Any, field: str) -> float | None:
+    """Persist undefined/non-finite canonical metrics as SQL NULL."""
+    if value is None or _is_missing_scalar(value):
+        return None
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError(f"{field} must be numeric or missing.")
+    number = float(value)
+    return number if np.isfinite(number) else None
+
+
+def _optional_summary_integer(value: Any, field: str) -> int | None:
+    if value is None or _is_missing_scalar(value):
+        return None
+    return _strict_non_negative_integer(value, field)
+
+
+def _enum_value(value: Any, enum_type: type, field: str) -> str:
+    if not isinstance(value, enum_type):
+        raise TypeError(f"{field} must be a declared {enum_type.__name__} member.")
+    return str(value.value)
+
+
+def _strict_bool(value: Any, field: str) -> bool:
+    if type(value) is not bool:
+        raise TypeError(f"{field} must be Boolean.")
+    return value
+
+
+def _persisted_label(value: Any, field: str) -> str:
+    if isinstance(value, (pd.Timestamp, datetime, date, np.datetime64)):
+        timestamp = pd.Timestamp(value)
+        if pd.isna(timestamp):
+            raise ValueError(f"{field} must not be missing.")
+        return timestamp.isoformat()
+    normalized = _plain_json_value(value, field)
+    if isinstance(normalized, (dict, list)):
+        raise TypeError(f"{field} must be a scalar label.")
+    return json.dumps(normalized, ensure_ascii=True, allow_nan=False)
+
+
+def _normalise_experiment_rows(result: Any) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    """Validate a pipeline result and materialize both normalized table rows."""
+    from .pipeline import (
+        DiagnosticExecutionCoverage,
+        PipelineStageStatus,
+        ResearchExperimentResult,
+        ResearchPipelineStatus,
+        validate_research_experiment_result,
+    )
+    from .robustness import MetricAvailabilityStatus
+    from .validation import ValidationAvailability
+    from .walkforward import WalkForwardAnalyticsStatus
+
+    if not isinstance(result, ResearchExperimentResult):
+        raise TypeError("result must be a ResearchExperimentResult.")
+    validate_research_experiment_result(result)
+    run_id = _normalise_non_empty_string(result.run_id, "run_id")
+    experiment_name = _normalise_non_empty_string(
+        result.experiment_name, "experiment_name"
+    )
+    created_at = _normalise_timestamp(result.created_at, "created_at")
+    assert created_at is not None
+
+    configuration_json = _encode_json_value(
+        result.configuration_snapshot, "configuration_snapshot"
+    )
+    metadata_json = _encode_json_value(result.metadata, "metadata")
+    provenance_json = _encode_json_value(result.provenance, "provenance")
+    warnings_json = _encode_json_value(result.warnings, "warnings")
+    experiment_row = (
+        run_id,
+        result.research_content_digest,
+        result.price_content_digest,
+        result.configuration_digest,
+        result.research_pipeline_version,
+        result.configuration_snapshot_version,
+        result.experiment_schema_version,
+        experiment_name,
+        created_at,
+        _enum_value(result.status, ResearchPipelineStatus, "pipeline_status"),
+        configuration_json,
+        metadata_json,
+        provenance_json,
+        warnings_json,
+    )
+
+    selected = result.selected_pair
+    selected_pair_id = None
+    symbol_y = None
+    symbol_x = None
+    selected_rank = None
+    alpha = beta = cointegration_statistic = cointegration_pvalue = None
+    corrected_pvalue = half_life = hurst = None
+    if selected is not None:
+        if not selected.selected or selected.rank is None:
+            raise ValueError("selected_pair must be a canonically selected ranked result.")
+        symbol_y = _normalise_symbol(selected.symbol_y, "selected_pair.symbol_y")
+        symbol_x = _normalise_symbol(selected.symbol_x, "selected_pair.symbol_x")
+        selected_pair_id = f"{symbol_y}|{symbol_x}"
+        selected_rank = _strict_non_negative_integer(
+            selected.rank, "selected_pair.rank"
+        )
+        if selected_rank < 1:
+            raise ValueError("selected_pair.rank must be positive.")
+        alpha = _optional_summary_float(selected.alpha, "selected_pair.alpha")
+        beta = _optional_summary_float(selected.beta, "selected_pair.beta")
+        cointegration_statistic = _optional_summary_float(
+            selected.cointegration_statistic,
+            "selected_pair.cointegration_statistic",
+        )
+        cointegration_pvalue = _optional_summary_float(
+            selected.cointegration_pvalue, "selected_pair.cointegration_pvalue"
+        )
+        corrected_pvalue = _optional_summary_float(
+            selected.corrected_pvalue, "selected_pair.corrected_pvalue"
+        )
+        half_life = _optional_summary_float(
+            selected.half_life, "selected_pair.half_life"
+        )
+        hurst = _optional_summary_float(selected.hurst, "selected_pair.hurst")
+
+    performance = result.performance_report
+    diagnostic_performance_values: tuple[Any, ...]
+    if performance is None:
+        diagnostic_performance_values = (None,) * 8
+    else:
+        diagnostic_performance_values = (
+            _optional_summary_float(
+                performance.core.total_return,
+                "diagnostic_in_sample_total_return",
+            ),
+            _optional_summary_float(
+                performance.core.annualized_return,
+                "diagnostic_in_sample_annualized_return",
+            ),
+            _optional_summary_float(
+                performance.core.annualized_volatility,
+                "diagnostic_in_sample_annualized_volatility",
+            ),
+            _optional_summary_float(
+                performance.core.sharpe_ratio,
+                "diagnostic_in_sample_sharpe_ratio",
+            ),
+            _optional_summary_float(
+                performance.core.sortino_ratio,
+                "diagnostic_in_sample_sortino_ratio",
+            ),
+            _optional_summary_float(
+                performance.drawdown.maximum_drawdown,
+                "diagnostic_in_sample_maximum_drawdown",
+            ),
+            _optional_summary_float(
+                performance.drawdown.calmar_ratio,
+                "diagnostic_in_sample_calmar_ratio",
+            ),
+            _strict_non_negative_integer(
+                performance.trades.trades,
+                "diagnostic_in_sample_trade_count",
+            ),
+        )
+
+    coverage = result.diagnostic_execution_coverage
+    diagnostic_coverage_values: tuple[Any, ...]
+    if coverage is None:
+        diagnostic_coverage_values = (None,) * 8
+    else:
+        if not isinstance(coverage, DiagnosticExecutionCoverage):
+            raise TypeError("diagnostic_execution_coverage has an invalid type.")
+        diagnostic_coverage_values = (
+            coverage.total_rows,
+            coverage.finite_beta_rows,
+            coverage.positive_execution_beta_rows,
+            coverage.non_positive_execution_beta_rows,
+            coverage.finite_signal_rows,
+            coverage.entry_execution_unavailable_rows_due_to_beta,
+            coverage.signal_observation_coverage,
+            coverage.beta_execution_policy,
+        )
+
+    walk_forward = result.walk_forward_result
+    if walk_forward is None:
+        walk_forward_values: tuple[Any, ...] = (None,) * 27
+    else:
+        calendar_report = walk_forward.calendar_performance_report
+        if calendar_report is None:
+            calendar_metrics: tuple[Any, ...] = (None,) * 8
+        else:
+            calendar_metrics = (
+                _optional_summary_float(
+                    calendar_report.core.total_return,
+                    "walk_forward_calendar_oos_total_return",
+                ),
+                _optional_summary_float(
+                    calendar_report.core.annualized_return,
+                    "walk_forward_calendar_oos_annualized_return",
+                ),
+                _optional_summary_float(
+                    calendar_report.core.annualized_volatility,
+                    "walk_forward_calendar_oos_annualized_volatility",
+                ),
+                _optional_summary_float(
+                    calendar_report.core.sharpe_ratio,
+                    "walk_forward_calendar_oos_sharpe_ratio",
+                ),
+                _optional_summary_float(
+                    calendar_report.core.sortino_ratio,
+                    "walk_forward_calendar_oos_sortino_ratio",
+                ),
+                _optional_summary_float(
+                    calendar_report.drawdown.maximum_drawdown,
+                    "walk_forward_calendar_oos_maximum_drawdown",
+                ),
+                _optional_summary_float(
+                    calendar_report.drawdown.calmar_ratio,
+                    "walk_forward_calendar_oos_calmar_ratio",
+                ),
+                _strict_non_negative_integer(
+                    calendar_report.report_observations,
+                    "walk_forward_calendar_oos_report_observations",
+                ),
+            )
+        walk_forward_values = (
+            _enum_value(
+                walk_forward.calendar_analytics_status,
+                WalkForwardAnalyticsStatus,
+                "walk_forward_analytics_status",
+            ),
+            _strict_non_negative_integer(walk_forward.fold_count, "walk_forward.fold_count"),
+            _strict_non_negative_integer(
+                walk_forward.completed_fold_count,
+                "walk_forward.completed_fold_count",
+            ),
+            _strict_non_negative_integer(
+                walk_forward.no_selection_fold_count,
+                "walk_forward.no_selection_fold_count",
+            ),
+            _strict_non_negative_integer(
+                walk_forward.insufficient_data_fold_count,
+                "walk_forward.insufficient_data_fold_count",
+            ),
+            _strict_non_negative_integer(
+                walk_forward.scheduled_oos_observations,
+                "walk_forward.scheduled_oos_observations",
+            ),
+            _strict_non_negative_integer(
+                walk_forward.scheduled_eligible_oos_observations,
+                "walk_forward.scheduled_eligible_oos_observations",
+            ),
+            _strict_non_negative_integer(
+                walk_forward.selected_oos_observations,
+                "walk_forward.selected_oos_observations",
+            ),
+            _strict_non_negative_integer(
+                walk_forward.no_selection_oos_observations,
+                "walk_forward.no_selection_oos_observations",
+            ),
+            _strict_non_negative_integer(
+                walk_forward.unavailable_oos_observations,
+                "walk_forward.unavailable_oos_observations",
+            ),
+            _optional_summary_float(
+                walk_forward.selection_coverage,
+                "walk_forward.selection_coverage",
+            ),
+            _persisted_label(
+                walk_forward.evaluated_start_label,
+                "walk_forward.evaluated_start_label",
+            ),
+            _persisted_label(
+                walk_forward.evaluated_end_label,
+                "walk_forward.evaluated_end_label",
+            ),
+            walk_forward.capital_policy,
+            walk_forward.aggregate_return_policy,
+            walk_forward.inactive_capital_policy,
+            walk_forward.selection_coverage_denominator,
+            _strict_bool(
+                walk_forward.aggregate_dollar_pnl_available,
+                "walk_forward.aggregate_dollar_pnl_available",
+            ),
+            _strict_bool(
+                walk_forward.aggregate_trade_dollar_metrics_available,
+                "walk_forward.aggregate_trade_dollar_metrics_available",
+            ),
+            *calendar_metrics,
+        )
+
+    robustness = result.robustness_result
+    if robustness is None:
+        robustness_values: tuple[Any, ...] = (None,) * 17
+    else:
+        summary = robustness.summary
+        robustness_values = (
+            _normalise_non_empty_string(
+                robustness.baseline_scenario_id, "robustness.baseline_scenario_id"
+            ),
+            _strict_non_negative_integer(summary.scenario_count, "robustness.scenario_count"),
+            _strict_non_negative_integer(
+                summary.completed_scenarios, "robustness.completed_scenarios"
+            ),
+            _strict_non_negative_integer(
+                summary.unavailable_scenarios, "robustness.unavailable_scenarios"
+            ),
+            _strict_non_negative_integer(
+                summary.invalid_scenarios, "robustness.invalid_scenarios"
+            ),
+            _strict_non_negative_integer(
+                summary.failed_scenarios, "robustness.failed_scenarios"
+            ),
+            _strict_bool(
+                robustness.common_horizon_structurally_available,
+                "robustness.common_horizon_structurally_available",
+            ),
+            _strict_bool(
+                robustness.common_horizon_fully_observed,
+                "robustness.common_horizon_fully_observed",
+            ),
+            _strict_bool(
+                robustness.common_horizon_analytics_available,
+                "robustness.common_horizon_analytics_available",
+            ),
+            _enum_value(
+                robustness.common_horizon_analytics_status,
+                MetricAvailabilityStatus,
+                "robustness.common_horizon_analytics_status",
+            ),
+            _strict_non_negative_integer(
+                robustness.common_horizon_observations,
+                "robustness.common_horizon_observations",
+            ),
+            _strict_non_negative_integer(
+                robustness.common_horizon_scenario_count,
+                "robustness.common_horizon_scenario_count",
+            ),
+            _normalise_non_empty_string(
+                summary.headline_metric_basis,
+                "robustness.headline_metric_basis",
+            ),
+            _normalise_non_empty_string(
+                robustness.distribution_policy,
+                "robustness.distribution_policy",
+            ),
+            _encode_json_value(
+                robustness.tested_dimensions,
+                "robustness.tested_dimensions",
+            ),
+            _encode_json_value(
+                robustness.untested_material_dimensions,
+                "robustness.untested_material_dimensions",
+            ),
+            _encode_json_value(
+                robustness.provenance_warnings,
+                "robustness.provenance_warnings",
+            ),
+        )
+
+    validation = result.statistical_validation_result
+    if validation is None:
+        validation_values: tuple[Any, ...] = (None,) * 12
+    else:
+        validation_values = (
+            _enum_value(
+                validation.primary_inference_availability,
+                ValidationAvailability,
+                "validation.primary_inference_availability",
+            ),
+            _enum_value(
+                validation.overall_availability,
+                ValidationAvailability,
+                "validation.overall_availability",
+            ),
+            _optional_summary_float(
+                validation.probabilistic_sharpe.probability,
+                "validation.probabilistic_sharpe_probability",
+            ),
+            _optional_summary_integer(
+                validation.minimum_track_record.estimated_required_observations,
+                "validation.minimum_track_record_observations",
+            ),
+            _enum_value(
+                validation.fold_consistency.status,
+                ValidationAvailability,
+                "validation.fold_consistency_availability",
+            ),
+            _strict_non_negative_integer(
+                validation.multiple_testing.total_tested_configurations,
+                "validation.multiple_testing.total_tested_configurations",
+            ),
+            _strict_non_negative_integer(
+                validation.multiple_testing.valid_comparable_configurations,
+                "validation.multiple_testing.valid_comparable_configurations",
+            ),
+            _strict_non_negative_integer(
+                validation.multiple_testing.valid_pvalue_count,
+                "validation.multiple_testing.valid_pvalue_count",
+            ),
+            _strict_non_negative_integer(
+                validation.multiple_testing.unavailable_pvalue_count,
+                "validation.multiple_testing.unavailable_pvalue_count",
+            ),
+            _strict_non_negative_integer(
+                validation.multiple_testing.eligible_hypothesis_count,
+                "validation.multiple_testing.eligible_hypothesis_count",
+            ),
+            _normalise_non_empty_string(validation.purpose, "validation.purpose"),
+            _encode_json_value(
+                validation.provenance_warnings,
+                "validation.provenance_warnings",
+            ),
+        )
+
+    summary_row = (
+        run_id,
+        selected_pair_id,
+        symbol_y,
+        symbol_x,
+        selected_rank,
+        len(result.screening_results),
+        sum(item.selected for item in result.screening_results),
+        "full_sample_in_sample_diagnostic",
+        "canonical_screen_pairs_selected_rank_ascending",
+        alpha,
+        beta,
+        cointegration_statistic,
+        cointegration_pvalue,
+        corrected_pvalue,
+        half_life,
+        hurst,
+        _enum_value(result.analytics_stage, PipelineStageStatus, "analytics_stage"),
+        *diagnostic_performance_values,
+        *diagnostic_coverage_values,
+        _enum_value(
+            result.walk_forward_stage,
+            PipelineStageStatus,
+            "walk_forward_stage",
+        ),
+        *walk_forward_values,
+        _enum_value(
+            result.robustness_stage,
+            PipelineStageStatus,
+            "robustness_stage",
+        ),
+        *robustness_values,
+        _enum_value(
+            result.validation_stage,
+            PipelineStageStatus,
+            "validation_stage",
+        ),
+        *validation_values,
+    )
+    return experiment_row, summary_row
+
+
+_EXPERIMENT_INSERT_SQL = """
+    INSERT INTO research_experiments (
+        run_id, research_content_digest, price_content_digest,
+        configuration_digest, research_pipeline_version,
+        configuration_snapshot_version, experiment_schema_version,
+        experiment_name, created_at, pipeline_status, configuration_snapshot,
+        metadata, provenance, warnings
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+_EXPERIMENT_SUMMARY_COLUMNS = tuple(
+    _REQUIRED_SCHEMA_COLUMNS["research_experiment_summaries"]
+)
+_EXPERIMENT_SUMMARY_INSERT_SQL = (
+    "INSERT INTO research_experiment_summaries ("
+    + ", ".join(_EXPERIMENT_SUMMARY_COLUMNS)
+    + ") VALUES ("
+    + ", ".join("?" for _ in _EXPERIMENT_SUMMARY_COLUMNS)
+    + ")"
+)
+
+
+def _insert_research_experiment_summary(
+    connection: duckdb.DuckDBPyConnection,
+    summary_row: tuple[Any, ...],
+) -> None:
+    """Internal second-table insert kept separate for transactional testing."""
+    connection.execute(_EXPERIMENT_SUMMARY_INSERT_SQL, summary_row)
+
+
+def store_research_experiment(database: DatabaseTarget, result: Any) -> None:
+    """Atomically persist one immutable experiment summary.
+
+    Duplicate run identifiers are rejected explicitly.  Undefined or
+    non-finite canonical metrics are stored as SQL NULL; they are never changed
+    to zero.  Full paths, ledgers, and bootstrap samples remain in memory.
+    """
+    experiment_row, summary_row = _normalise_experiment_rows(result)
+    run_id = experiment_row[0]
+    with _connection_scope(database) as connection:
+        _ensure_schema(connection)
+        duplicate = connection.execute(
+            "SELECT 1 FROM research_experiments WHERE run_id = ?",
+            [run_id],
+        ).fetchone()
+        if duplicate is not None:
+            raise ValueError(f"Experiment run {run_id!r} already exists.")
+        with _transaction(connection):
+            connection.execute(_EXPERIMENT_INSERT_SQL, experiment_row)
+            _insert_research_experiment_summary(connection, summary_row)
+
+
+def _empty_experiment_list() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "run_id": pd.Series(dtype="object"),
+            "research_content_digest": pd.Series(dtype="object"),
+            "experiment_name": pd.Series(dtype="object"),
+            "created_at": pd.Series(dtype="datetime64[ns, UTC]"),
+            "pipeline_status": pd.Series(dtype="object"),
+            "selected_pair_id": pd.Series(dtype="object"),
+            "diagnostic_in_sample_total_return": pd.Series(dtype="float64"),
+            "diagnostic_in_sample_sharpe_ratio": pd.Series(dtype="float64"),
+            "diagnostic_in_sample_maximum_drawdown": pd.Series(dtype="float64"),
+            "diagnostic_in_sample_trade_count": pd.Series(dtype="Int64"),
+            "walk_forward_calendar_oos_total_return": pd.Series(dtype="float64"),
+            "walk_forward_calendar_oos_sharpe_ratio": pd.Series(dtype="float64"),
+            "walk_forward_calendar_oos_maximum_drawdown": pd.Series(dtype="float64"),
+            "walk_forward_stage": pd.Series(dtype="object"),
+            "robustness_stage": pd.Series(dtype="object"),
+            "validation_stage": pd.Series(dtype="object"),
+        }
+    ).loc[:, list(EXPERIMENT_LIST_COLUMNS)]
+
+
+def list_research_experiments(database: DatabaseTarget) -> pd.DataFrame:
+    """List persisted experiments newest-first with deterministic ID tie-breaks."""
+    query = """
+        SELECT
+            run_id, research_content_digest, experiment_name, created_at,
+            pipeline_status, selected_pair_id,
+            diagnostic_in_sample_total_return,
+            diagnostic_in_sample_sharpe_ratio,
+            diagnostic_in_sample_maximum_drawdown,
+            diagnostic_in_sample_trade_count,
+            walk_forward_calendar_oos_total_return,
+            walk_forward_calendar_oos_sharpe_ratio,
+            walk_forward_calendar_oos_maximum_drawdown,
+            walk_forward_stage, robustness_stage, validation_stage
+        FROM research_experiments
+        JOIN research_experiment_summaries USING (run_id)
+        ORDER BY created_at DESC, run_id ASC
+    """
+    with _read_connection_scope(database) as connection:
+        _validate_schema(connection)
+        frame = connection.execute(query).fetchdf()
+    if frame.empty:
+        return _empty_experiment_list()
+    frame["created_at"] = pd.to_datetime(frame["created_at"], utc=True)
+    frame["diagnostic_in_sample_trade_count"] = frame[
+        "diagnostic_in_sample_trade_count"
+    ].astype("Int64")
+    for column in (
+        "diagnostic_in_sample_total_return",
+        "diagnostic_in_sample_sharpe_ratio",
+        "diagnostic_in_sample_maximum_drawdown",
+        "walk_forward_calendar_oos_total_return",
+        "walk_forward_calendar_oos_sharpe_ratio",
+        "walk_forward_calendar_oos_maximum_drawdown",
+    ):
+        frame[column] = frame[column].astype(float)
+    return frame.loc[:, list(EXPERIMENT_LIST_COLUMNS)]
+
+
+def _loaded_optional(value: Any) -> Any | None:
+    if _is_missing_scalar(value):
+        return None
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def load_research_experiment_summary(
+    database: DatabaseTarget,
+    run_id: str,
+) -> ResearchExperimentSummary:
+    """Load one persisted experiment without creating a missing database path."""
+    from .pipeline import PipelineStageStatus, ResearchPipelineStatus
+    from .robustness import MetricAvailabilityStatus
+    from .validation import ValidationAvailability
+    from .walkforward import WalkForwardAnalyticsStatus
+
+    def loaded_enum(value: Any, enum_type: type, field: str) -> str | None:
+        raw = _loaded_optional(value)
+        if raw is None:
+            return None
+        try:
+            return str(enum_type(str(raw)).value)
+        except ValueError as exc:
+            raise RuntimeError(f"Stored {field} has an unknown enum value.") from exc
+
+    normalized_id = _normalise_non_empty_string(run_id, "run_id")
+    query = """
+        SELECT e.*, s.* EXCLUDE (run_id)
+        FROM research_experiments e
+        JOIN research_experiment_summaries s USING (run_id)
+        WHERE run_id = ?
+    """
+    with _read_connection_scope(database) as connection:
+        _validate_schema(connection)
+        frame = connection.execute(query, [normalized_id]).fetchdf()
+    if frame.empty:
+        raise KeyError(f"Experiment {normalized_id!r} was not found.")
+    if len(frame) != 1:
+        raise RuntimeError("Experiment persistence contains duplicate summary rows.")
+    row = frame.iloc[0]
+    selected_pair = None
+    if not _is_missing_scalar(row["selected_pair_id"]):
+        selected_pair = {
+            "pair_id": row["selected_pair_id"],
+            "symbol_y": row["symbol_y"],
+            "symbol_x": row["symbol_x"],
+            "rank": int(row["selected_rank"]),
+            "alpha": _loaded_optional(row["alpha"]),
+            "beta": _loaded_optional(row["beta"]),
+            "cointegration_statistic": _loaded_optional(
+                row["cointegration_statistic"]
+            ),
+            "cointegration_pvalue": _loaded_optional(row["cointegration_pvalue"]),
+            "corrected_pvalue": _loaded_optional(row["corrected_pvalue"]),
+            "half_life": _loaded_optional(row["half_life"]),
+            "hurst": _loaded_optional(row["hurst"]),
+        }
+    screening = {
+        "candidate_count": int(row["screening_candidate_count"]),
+        "selected_count": int(row["screening_selected_count"]),
+        "selection_scope": str(row["screening_selection_scope"]),
+        "ranking_policy": str(row["screening_ranking_policy"]),
+    }
+    diagnostic = {
+        "stage": loaded_enum(
+            row["analytics_stage"], PipelineStageStatus, "analytics_stage"
+        ),
+        "scope": "full_sample_in_sample_diagnostic",
+        "total_return": _loaded_optional(
+            row["diagnostic_in_sample_total_return"]
+        ),
+        "annualized_return": _loaded_optional(
+            row["diagnostic_in_sample_annualized_return"]
+        ),
+        "annualized_volatility": _loaded_optional(
+            row["diagnostic_in_sample_annualized_volatility"]
+        ),
+        "sharpe_ratio": _loaded_optional(
+            row["diagnostic_in_sample_sharpe_ratio"]
+        ),
+        "sortino_ratio": _loaded_optional(
+            row["diagnostic_in_sample_sortino_ratio"]
+        ),
+        "maximum_drawdown": _loaded_optional(
+            row["diagnostic_in_sample_maximum_drawdown"]
+        ),
+        "calmar_ratio": _loaded_optional(
+            row["diagnostic_in_sample_calmar_ratio"]
+        ),
+        "trade_count": (
+            None
+            if _is_missing_scalar(row["diagnostic_in_sample_trade_count"])
+            else int(row["diagnostic_in_sample_trade_count"])
+        ),
+        "total_rows": _loaded_optional(row["diagnostic_total_rows"]),
+        "finite_beta_rows": _loaded_optional(row["diagnostic_finite_beta_rows"]),
+        "positive_execution_beta_rows": _loaded_optional(
+            row["diagnostic_positive_execution_beta_rows"]
+        ),
+        "non_positive_execution_beta_rows": _loaded_optional(
+            row["diagnostic_non_positive_execution_beta_rows"]
+        ),
+        "finite_signal_rows": _loaded_optional(
+            row["diagnostic_finite_signal_rows"]
+        ),
+        "entry_execution_unavailable_rows_due_to_beta": _loaded_optional(
+            row["diagnostic_entry_execution_unavailable_rows_due_to_beta"]
+        ),
+        "signal_observation_coverage": _loaded_optional(
+            row["diagnostic_signal_observation_coverage"]
+        ),
+        "beta_execution_policy": _loaded_optional(
+            row["diagnostic_beta_execution_policy"]
+        ),
+    }
+    for key in (
+        "total_rows",
+        "finite_beta_rows",
+        "positive_execution_beta_rows",
+        "non_positive_execution_beta_rows",
+        "finite_signal_rows",
+        "entry_execution_unavailable_rows_due_to_beta",
+    ):
+        if diagnostic[key] is not None:
+            diagnostic[key] = int(diagnostic[key])
+    walk_forward = {
+        "stage": loaded_enum(
+            row["walk_forward_stage"], PipelineStageStatus, "walk_forward_stage"
+        ),
+        "calendar_analytics_status": loaded_enum(
+            row["walk_forward_calendar_analytics_status"],
+            WalkForwardAnalyticsStatus,
+            "walk_forward_calendar_analytics_status",
+        ),
+        "fold_count": _loaded_optional(row["walk_forward_fold_count"]),
+        "completed_fold_count": _loaded_optional(
+            row["walk_forward_completed_fold_count"]
+        ),
+        "no_selection_fold_count": _loaded_optional(
+            row["walk_forward_no_selection_fold_count"]
+        ),
+        "insufficient_data_fold_count": _loaded_optional(
+            row["walk_forward_insufficient_data_fold_count"]
+        ),
+        "scheduled_oos_observations": _loaded_optional(
+            row["walk_forward_scheduled_oos_observations"]
+        ),
+        "scheduled_eligible_oos_observations": _loaded_optional(
+            row["walk_forward_scheduled_eligible_oos_observations"]
+        ),
+        "selected_oos_observations": _loaded_optional(
+            row["walk_forward_selected_oos_observations"]
+        ),
+        "no_selection_oos_observations": _loaded_optional(
+            row["walk_forward_no_selection_oos_observations"]
+        ),
+        "unavailable_oos_observations": _loaded_optional(
+            row["walk_forward_unavailable_oos_observations"]
+        ),
+        "selection_coverage": _loaded_optional(
+            row["walk_forward_selection_coverage"]
+        ),
+        "evaluated_start_label": _loaded_optional(
+            row["walk_forward_evaluated_start_label"]
+        ),
+        "evaluated_end_label": _loaded_optional(
+            row["walk_forward_evaluated_end_label"]
+        ),
+        "capital_policy": _loaded_optional(row["walk_forward_capital_policy"]),
+        "aggregate_return_policy": _loaded_optional(
+            row["walk_forward_aggregate_return_policy"]
+        ),
+        "inactive_capital_policy": _loaded_optional(
+            row["walk_forward_inactive_capital_policy"]
+        ),
+        "selection_coverage_denominator": _loaded_optional(
+            row["walk_forward_selection_coverage_denominator"]
+        ),
+        "aggregate_dollar_pnl_available": _loaded_optional(
+            row["walk_forward_aggregate_dollar_pnl_available"]
+        ),
+        "aggregate_trade_dollar_metrics_available": _loaded_optional(
+            row["walk_forward_aggregate_trade_dollar_metrics_available"]
+        ),
+        "calendar_oos_total_return": _loaded_optional(
+            row["walk_forward_calendar_oos_total_return"]
+        ),
+        "calendar_oos_annualized_return": _loaded_optional(
+            row["walk_forward_calendar_oos_annualized_return"]
+        ),
+        "calendar_oos_annualized_volatility": _loaded_optional(
+            row["walk_forward_calendar_oos_annualized_volatility"]
+        ),
+        "calendar_oos_sharpe_ratio": _loaded_optional(
+            row["walk_forward_calendar_oos_sharpe_ratio"]
+        ),
+        "calendar_oos_sortino_ratio": _loaded_optional(
+            row["walk_forward_calendar_oos_sortino_ratio"]
+        ),
+        "calendar_oos_maximum_drawdown": _loaded_optional(
+            row["walk_forward_calendar_oos_maximum_drawdown"]
+        ),
+        "calendar_oos_calmar_ratio": _loaded_optional(
+            row["walk_forward_calendar_oos_calmar_ratio"]
+        ),
+        "calendar_oos_report_observations": _loaded_optional(
+            row["walk_forward_calendar_oos_report_observations"]
+        ),
+    }
+    for key in tuple(walk_forward):
+        if key.endswith("count") or key.endswith("observations"):
+            if walk_forward[key] is not None:
+                walk_forward[key] = int(walk_forward[key])
+    robustness = {
+        "stage": loaded_enum(
+            row["robustness_stage"], PipelineStageStatus, "robustness_stage"
+        ),
+        "baseline_scenario_id": _loaded_optional(
+            row["robustness_baseline_scenario_id"]
+        ),
+        "scenario_count": _loaded_optional(row["robustness_scenario_count"]),
+        "completed_scenarios": _loaded_optional(
+            row["robustness_completed_scenarios"]
+        ),
+        "analytically_unavailable_scenarios": _loaded_optional(
+            row["robustness_analytically_unavailable_scenarios"]
+        ),
+        "invalid_scenarios": _loaded_optional(row["robustness_invalid_scenarios"]),
+        "failed_scenarios": _loaded_optional(row["robustness_failed_scenarios"]),
+        "common_horizon_structurally_available": _loaded_optional(
+            row["robustness_common_horizon_structurally_available"]
+        ),
+        "common_horizon_fully_observed": _loaded_optional(
+            row["robustness_common_horizon_fully_observed"]
+        ),
+        "common_horizon_analytics_available": _loaded_optional(
+            row["robustness_common_horizon_analytics_available"]
+        ),
+        "common_horizon_analytics_status": loaded_enum(
+            row["robustness_common_horizon_analytics_status"],
+            MetricAvailabilityStatus,
+            "robustness_common_horizon_analytics_status",
+        ),
+        "common_horizon_observations": _loaded_optional(
+            row["robustness_common_horizon_observations"]
+        ),
+        "common_horizon_eligible_scenario_count": _loaded_optional(
+            row["robustness_common_horizon_eligible_scenario_count"]
+        ),
+        "headline_metric_basis": _loaded_optional(
+            row["robustness_headline_metric_basis"]
+        ),
+        "distribution_policy": _loaded_optional(
+            row["robustness_distribution_policy"]
+        ),
+        "tested_dimensions": (
+            ()
+            if _is_missing_scalar(row["robustness_tested_dimensions"])
+            else _decode_json_strings(
+                row["robustness_tested_dimensions"],
+                "robustness_tested_dimensions",
+            )
+        ),
+        "untested_material_dimensions": (
+            ()
+            if _is_missing_scalar(row["robustness_untested_material_dimensions"])
+            else _decode_json_strings(
+                row["robustness_untested_material_dimensions"],
+                "robustness_untested_material_dimensions",
+            )
+        ),
+        "provenance_warnings": (
+            ()
+            if _is_missing_scalar(row["robustness_provenance_warning_summary"])
+            else _decode_json_strings(
+                row["robustness_provenance_warning_summary"],
+                "robustness_provenance_warning_summary",
+            )
+        ),
+    }
+    for key in (
+        "scenario_count",
+        "completed_scenarios",
+        "analytically_unavailable_scenarios",
+        "invalid_scenarios",
+        "failed_scenarios",
+        "common_horizon_observations",
+        "common_horizon_eligible_scenario_count",
+    ):
+        if robustness[key] is not None:
+            robustness[key] = int(robustness[key])
+    validation = {
+        "stage": loaded_enum(
+            row["validation_stage"], PipelineStageStatus, "validation_stage"
+        ),
+        "primary_availability": loaded_enum(
+            row["validation_primary_availability"],
+            ValidationAvailability,
+            "validation_primary_availability",
+        ),
+        "overall_availability": loaded_enum(
+            row["validation_overall_availability"],
+            ValidationAvailability,
+            "validation_overall_availability",
+        ),
+        "probabilistic_sharpe_probability": _loaded_optional(
+            row["probabilistic_sharpe_probability"]
+        ),
+        "minimum_track_record_observations": _loaded_optional(
+            row["minimum_track_record_observations"]
+        ),
+        "fold_consistency_availability": loaded_enum(
+            row["fold_consistency_availability"],
+            ValidationAvailability,
+            "fold_consistency_availability",
+        ),
+        "multiple_testing_total_configurations": _loaded_optional(
+            row["multiple_testing_total_configurations"]
+        ),
+        "multiple_testing_valid_comparable_configurations": _loaded_optional(
+            row["multiple_testing_valid_comparable_configurations"]
+        ),
+        "multiple_testing_valid_pvalue_count": _loaded_optional(
+            row["multiple_testing_valid_pvalue_count"]
+        ),
+        "multiple_testing_unavailable_pvalue_count": _loaded_optional(
+            row["multiple_testing_unavailable_pvalue_count"]
+        ),
+        "multiple_testing_eligible_hypothesis_count": _loaded_optional(
+            row["multiple_testing_eligible_hypothesis_count"]
+        ),
+        "purpose": _loaded_optional(row["validation_purpose"]),
+        "provenance_warnings": (
+            ()
+            if _is_missing_scalar(row["validation_provenance_warning_summary"])
+            else _decode_json_strings(
+                row["validation_provenance_warning_summary"],
+                "validation_provenance_warning_summary",
+            )
+        ),
+    }
+    for key in (
+        "minimum_track_record_observations",
+        "multiple_testing_total_configurations",
+        "multiple_testing_valid_comparable_configurations",
+        "multiple_testing_valid_pvalue_count",
+        "multiple_testing_unavailable_pvalue_count",
+        "multiple_testing_eligible_hypothesis_count",
+    ):
+        if validation[key] is not None:
+            validation[key] = int(validation[key])
+    created_at = pd.Timestamp(row["created_at"])
+    if created_at.tzinfo is None:
+        created_at = created_at.tz_localize("UTC")
+    else:
+        created_at = created_at.tz_convert("UTC")
+    return ResearchExperimentSummary(
+        run_id=str(row["run_id"]),
+        research_content_digest=str(row["research_content_digest"]),
+        price_content_digest=str(row["price_content_digest"]),
+        research_pipeline_version=str(row["research_pipeline_version"]),
+        configuration_snapshot_version=int(row["configuration_snapshot_version"]),
+        experiment_schema_version=int(row["experiment_schema_version"]),
+        experiment_name=str(row["experiment_name"]),
+        created_at=created_at.to_pydatetime(),
+        configuration_digest=str(row["configuration_digest"]),
+        pipeline_status=loaded_enum(
+            row["pipeline_status"], ResearchPipelineStatus, "pipeline_status"
+        ),
+        selected_pair=selected_pair,
+        screening=screening,
+        diagnostic=diagnostic,
+        walk_forward=walk_forward,
+        robustness=robustness,
+        validation=validation,
+        configuration_snapshot=_decode_json_mapping(
+            row["configuration_snapshot"], "configuration_snapshot"
+        ),
+        metadata=_decode_json_mapping(row["metadata"], "metadata"),
+        provenance=_decode_json_mapping(row["provenance"], "provenance"),
+        warnings=_decode_json_strings(row["warnings"], "warnings"),
+    )
